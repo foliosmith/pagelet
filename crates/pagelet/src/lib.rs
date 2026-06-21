@@ -12,7 +12,8 @@ pub mod engine;
 mod epub;
 mod ffi;
 mod layout;
-pub mod testkit;
+#[cfg(test)]
+mod testkit;
 pub mod text;
 mod wire;
 

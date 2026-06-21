@@ -1,0 +1,17 @@
+schema_version = 1
+
+[[requirements]]
+id = "REQ-EPUB-PKG-001"
+area = "package"
+summary = "Discover the package document from META-INF/container.xml."
+source = "EPUB Open Container Format"
+tests = ["fixture:minimal-epub3", "golden:minimal-epub3"]
+gates = ["cargo test --workspace", "cargo xtask manifests lint"]
+
+[[requirements]]
+id = "REQ-EPUB-SEC-001"
+area = "security"
+summary = "Resource-limit and malformed-input cases are explicit diagnostics, not silent loss."
+source = "pagelet security model"
+tests = ["fixture:zip-bomb-like", "fixture:malformed-xhtml"]
+gates = ["cargo xtask corpus --profile robustness"]

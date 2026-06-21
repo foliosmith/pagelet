@@ -4,10 +4,14 @@
 pub mod fixtures;
 pub mod golden;
 pub mod random;
+pub mod text;
 
-pub use fixtures::{Fixture, FixtureBuilder, FixtureEntry};
-pub use golden::{GoldenDocument, GoldenEntry, GoldenSection};
+pub use fixtures::{
+    EpubMutation, EpubMutator, Fixture, FixtureEntry, FixtureKind, RawEpubBuilder, ValidEpubBuilder,
+};
+pub use golden::{GoldenDocument, GoldenEntry, GoldenSection, GoldenSectionName};
 pub use random::DeterministicRng;
+pub use text::{DeterministicTextBackend, DeterministicTextMetrics};
 
 /// Return the pagelet crate version this testkit was built against.
 #[must_use]

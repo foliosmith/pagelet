@@ -1,0 +1,17 @@
+schema_version = 1
+
+[[differences]]
+id = "DART-COMPAT-001"
+area = "package"
+rust_field = "book.package.unique_identifier"
+dart_field = "BookInfo.id"
+expected = "Rust keeps stable content identifiers; Dart may expose app-specific IDs."
+status = "documented"
+
+[[differences]]
+id = "DART-COMPAT-002"
+area = "layout"
+rust_field = "page_scene.break_token"
+dart_field = "PagePosition"
+expected = "Rust break tokens are opaque and versioned."
+status = "documented"

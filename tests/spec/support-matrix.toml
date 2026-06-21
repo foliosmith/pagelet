@@ -1,0 +1,25 @@
+schema_version = 1
+
+[[features]]
+id = "EPUB-PKG-CONTAINER"
+profile = "EPUB 2.0.1"
+status = "SupportedWithLimitations"
+notes = "Initial fixture coverage only."
+
+[[features]]
+id = "EPUB-PKG-CONTAINER"
+profile = "EPUB 3.0-3.3"
+status = "SupportedWithLimitations"
+notes = "Initial fixture coverage only."
+
+[[features]]
+id = "EPUB-PKG-CONTAINER"
+profile = "EPUB 3.4"
+status = "UnsupportedDiagnosed"
+notes = "Tracked as experimental until test suite is pinned."
+
+[[features]]
+id = "EPUB-RESOURCE-LIMITS"
+profile = "EPUB 3.0-3.3"
+status = "RejectedForSecurity"
+notes = "Zip bomb-like fixtures exercise the policy surface."

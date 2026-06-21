@@ -9,7 +9,7 @@ pub fn public_pagelet_facade_is_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pagelet_testkit::{FixtureBuilder, GoldenDocument, GoldenSection};
+    use pagelet_testkit::{GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
     use super::*;
 
@@ -20,14 +20,18 @@ mod tests {
 
     #[test]
     fn integration_crate_uses_private_testkit() {
-        let fixture = FixtureBuilder::minimal_epub3("contract-smoke").build();
-        let golden = GoldenDocument::empty().section(
-            GoldenSection::new("fixture")
-                .entry("id", fixture.id.clone())
-                .entry("entry_count", fixture.entries.len().to_string()),
-        );
+        let fixture = ValidEpubBuilder::epub3("contract-smoke")
+            .xhtml("EPUB/chapter-1.xhtml", "Chapter 1", "<p>smoke</p>")
+            .build();
+        let golden = GoldenDocument::empty()
+            .entry(GoldenSectionName::BookSummary, "id", fixture.id.clone())
+            .entry(
+                GoldenSectionName::Manifest,
+                "entry_count",
+                fixture.entries.len().to_string(),
+            );
 
-        assert!(fixture.to_bytes().starts_with(b"PAGELET-FIXTURE"));
-        assert!(golden.to_normalized_text().contains("entry_count=4"));
+        assert!(fixture.bytes().starts_with(b"PK\x03\x04"));
+        assert!(golden.to_json().contains(r#""entry_count""#));
     }
 }
