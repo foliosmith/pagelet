@@ -12,9 +12,8 @@ pub mod engine;
 mod epub;
 mod ffi;
 mod layout;
-#[cfg(test)]
-mod testkit;
-mod text;
+pub mod testkit;
+pub mod text;
 mod wire;
 
 /// Static build metadata for the pagelet crate.

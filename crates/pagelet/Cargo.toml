@@ -14,5 +14,9 @@ categories = ["parser-implementations", "rendering", "text-processing"]
 default = []
 native-shaping = []
 
+[[bench]]
+name = "fixture_generation"
+harness = false
+
 [lints]
 workspace = true
