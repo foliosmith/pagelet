@@ -1,0 +1,36 @@
+name: Conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/conformance.yml"
+      - "crates/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  generated-fixtures:
+    name: Generated fixtures
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features
+
+      - name: Check pagelet conformance hooks
+        run: cargo test -p pagelet --all-features

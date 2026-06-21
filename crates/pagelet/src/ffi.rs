@@ -1,0 +1,1 @@
+//! Internal FFI adapter boundary.

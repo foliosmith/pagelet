@@ -1,0 +1,18 @@
+[package]
+name = "pagelet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic EPUB parsing and pagination engine."
+readme = "README.md"
+documentation = "https://docs.rs/pagelet"
+keywords = ["epub", "pagination", "layout", "reader"]
+categories = ["parser-implementations", "rendering", "text-processing"]
+
+[features]
+default = []
+native-shaping = []
+
+[lints]
+workspace = true
