@@ -8,8 +8,8 @@ publish = false
 description = "Private integration-test crate for pagelet."
 
 [dependencies]
-pagelet = { path = "../../crates/pagelet" }
-pagelet-testkit = { path = "../pagelet-testkit" }
+pagelet = { path = "../../crates/pagelet", version = "0.1.0" }
+pagelet-testkit = { path = "../pagelet-testkit", version = "0.1.0" }
 
 [lints]
 workspace = true

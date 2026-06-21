@@ -8,7 +8,7 @@ publish = false
 description = "Private test fixture, golden, and generator helpers for pagelet."
 
 [dependencies]
-pagelet = { path = "../../crates/pagelet" }
+pagelet = { path = "../../crates/pagelet", version = "0.1.0" }
 
 [lints]
 workspace = true
