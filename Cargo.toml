@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "crates/pagelet",
+    "tools/pagelet-integration-tests",
+    "tools/pagelet-testkit",
+    "tools/xtask",
 ]
 resolver = "2"
 

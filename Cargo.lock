@@ -5,3 +5,22 @@ version = 3
 [[package]]
 name = "pagelet"
 version = "0.1.0"
+
+[[package]]
+name = "pagelet-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "pagelet",
+ "pagelet-testkit",
+]
+
+[[package]]
+name = "pagelet-testkit"
+version = "0.1.0"
+dependencies = [
+ "pagelet",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"

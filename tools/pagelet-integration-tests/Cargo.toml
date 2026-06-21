@@ -1,0 +1,15 @@
+[package]
+name = "pagelet-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Private integration-test crate for pagelet."
+
+[dependencies]
+pagelet = { path = "../../crates/pagelet" }
+pagelet-testkit = { path = "../pagelet-testkit" }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "pagelet-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Private test fixture, golden, and generator helpers for pagelet."
+
+[dependencies]
+pagelet = { path = "../../crates/pagelet" }
+
+[lints]
+workspace = true
