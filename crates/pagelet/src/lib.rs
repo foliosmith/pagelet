@@ -6,7 +6,7 @@
 //! APIs are ready to be stabilized.
 
 mod cli;
-mod core;
+pub mod core;
 mod document;
 pub mod engine;
 mod epub;
