@@ -1,0 +1,106 @@
+schema_version = 1
+
+[runner_fingerprint]
+id = "local-generated-fixture-smoke"
+description = "Local generated fixture smoke runner; not a hard pinned performance gate."
+os = "any"
+arch = "any"
+rust_toolchain = "stable"
+fixture_source = "tools/pagelet-testkit generated EPUB fixtures"
+cache_policy = "warm process, generated inputs, no external corpus"
+
+[[budgets]]
+case = "fixture_generation/minimal-epub3"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/epub2-with-ncx"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/fallback-chain"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/footnote-collision"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/path-case-collision"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/css-cascade"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/malformed-xhtml"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/huge-image"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 100
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/rtl"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/data-uri"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/duplicate-ids"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 50
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
+
+[[budgets]]
+case = "fixture_generation/zip-bomb-like"
+runner = "local-generated-fixture-smoke"
+absolute_p95_ms = 150
+relative_regression_pct = 25
+minimum_effect_ms = 5
+policy = "warn"
