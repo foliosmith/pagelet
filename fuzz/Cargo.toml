@@ -1,0 +1,21 @@
+[package]
+name = "pagelet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pagelet = { path = "../crates/pagelet" }
+
+[[bin]]
+name = "smoke"
+path = "fuzz_targets/smoke.rs"
+test = false
+doc = false
+bench = false

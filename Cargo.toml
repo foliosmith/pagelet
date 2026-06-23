@@ -5,6 +5,7 @@ members = [
     "tools/pagelet-testkit",
     "tools/xtask",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

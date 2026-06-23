@@ -29,5 +29,11 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: List registered fuzz targets
+        run: cargo fuzz list
+
       - name: Build fuzz-adjacent modules
         run: cargo test -p pagelet --all-features
