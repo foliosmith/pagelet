@@ -27,6 +27,19 @@ impl DeterministicRng {
         assert!(upper > 0, "upper bound must be non-zero");
         self.next_u64() % upper
     }
+
+    /// Return a value in `0..upper`.
+    #[must_use]
+    pub fn bounded_usize(&mut self, upper: usize) -> usize {
+        assert!(upper > 0, "upper bound must be non-zero");
+        self.bounded(upper as u64) as usize
+    }
+
+    /// Return a deterministic pseudo-random boolean.
+    #[must_use]
+    pub fn next_bool(&mut self) -> bool {
+        self.bounded(2) == 1
+    }
 }
 
 #[cfg(test)]
@@ -40,6 +53,21 @@ mod tests {
 
         for _ in 0..16 {
             assert_eq!(first.next_u64(), second.next_u64());
+        }
+    }
+
+    #[test]
+    fn deterministic_rng_supports_bounded_usize_and_bool() {
+        let mut rng = DeterministicRng::new(7);
+
+        for _ in 0..16 {
+            assert!(rng.bounded_usize(3) < 3);
+        }
+
+        let mut first = DeterministicRng::new(9);
+        let mut second = DeterministicRng::new(9);
+        for _ in 0..8 {
+            assert_eq!(first.next_bool(), second.next_bool());
         }
     }
 }
