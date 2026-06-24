@@ -19,3 +19,17 @@ path = "fuzz_targets/smoke.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ocf_decode"
+path = "fuzz_targets/ocf_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocf_paths"
+path = "fuzz_targets/ocf_paths.rs"
+test = false
+doc = false
+bench = false

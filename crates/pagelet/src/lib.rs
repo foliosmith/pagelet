@@ -5,11 +5,11 @@
 //! Implementation boundaries are kept as internal modules until their public
 //! APIs are ready to be stabilized.
 
-mod cli;
+pub mod cli;
 pub mod core;
 mod document;
 pub mod engine;
-mod epub;
+pub mod epub;
 mod ffi;
 mod layout;
 #[cfg(test)]
