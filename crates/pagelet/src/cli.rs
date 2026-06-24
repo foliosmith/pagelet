@@ -4,6 +4,7 @@ use std::{fs, path::Path};
 
 use crate::{
     core::{Diagnostic, Severity},
+    document::{ChapterIr, DocumentNode},
     epub::{
         BookSummary, CapabilityStatus, CompatibilityMode, NavigationItem, NavigationSource,
         OpenOptions,
@@ -12,8 +13,7 @@ use crate::{
 
 /// Inspect EPUB bytes and return a deterministic JSON document.
 pub fn inspect_bytes_json(bytes: impl Into<Vec<u8>>) -> Result<String, crate::core::PageletError> {
-    let book = crate::epub::open_book(bytes)?;
-    Ok(book_summary_json(&book))
+    inspect_bytes_json_with_options(bytes, OpenOptions::default())
 }
 
 /// Inspect an EPUB path and return a deterministic JSON document.
@@ -26,13 +26,21 @@ pub fn inspect_bytes_json_with_options(
     bytes: impl Into<Vec<u8>>,
     options: OpenOptions,
 ) -> Result<String, crate::core::PageletError> {
-    let book = crate::epub::open_book_with_options(bytes, options)?;
-    Ok(book_summary_json(&book))
+    let bytes = bytes.into();
+    let book = crate::epub::open_book_with_options(bytes.clone(), options)?;
+    let chapter = crate::epub::open_spine_item_chapter_ir_with_options(bytes, 0, options).ok();
+    Ok(book_summary_json_with_chapter(&book, chapter.as_ref()))
 }
 
 /// Serialize a book summary for `pagelet inspect`.
 #[must_use]
 pub fn book_summary_json(book: &BookSummary) -> String {
+    book_summary_json_with_chapter(book, None)
+}
+
+/// Serialize a book summary and optional first ChapterIR for `pagelet inspect`.
+#[must_use]
+pub fn book_summary_json_with_chapter(book: &BookSummary, chapter: Option<&ChapterIr>) -> String {
     let mut out = String::new();
     out.push_str("{\n");
     push_field(&mut out, 1, "rootfile", &book.package.rootfile_path, true);
@@ -115,6 +123,8 @@ pub fn book_summary_json(book: &BookSummary) -> String {
     indent(&mut out, 1);
     out.push_str("},\n");
 
+    push_chapter_ir(&mut out, chapter);
+    out.push_str(",\n");
     push_diagnostics(&mut out, &book.diagnostics);
     out.push_str(",\n");
     push_capabilities(&mut out, book);
@@ -140,6 +150,95 @@ fn push_diagnostics(out: &mut String, diagnostics: &[Diagnostic]) {
     }
     indent(out, 1);
     out.push(']');
+}
+
+fn push_chapter_ir(out: &mut String, chapter: Option<&ChapterIr>) {
+    indent(out, 1);
+    out.push_str("\"chapter_ir\": ");
+    let Some(chapter) = chapter else {
+        out.push_str("null");
+        return;
+    };
+    out.push_str("{\n");
+    push_field(out, 2, "href", &chapter.href, true);
+    push_field(out, 2, "title", &chapter.title, true);
+    indent(out, 2);
+    out.push_str("\"document_id\": ");
+    out.push_str(&chapter.document_id.get().to_string());
+    out.push_str(",\n");
+    indent(out, 2);
+    out.push_str("\"root\": ");
+    out.push_str(&chapter.root.get().to_string());
+    out.push_str(",\n");
+    indent(out, 2);
+    out.push_str("\"node_count\": ");
+    out.push_str(&chapter.nodes.len().to_string());
+    out.push_str(",\n");
+    push_field(out, 2, "visible_text", &chapter.visible_text(), true);
+
+    indent(out, 2);
+    out.push_str("\"nodes\": [\n");
+    for (index, (node_id, node)) in chapter.nodes.iter_with_ids().enumerate() {
+        indent(out, 3);
+        out.push('{');
+        out.push_str("\"id\": ");
+        out.push_str(&node_id.get().to_string());
+        out.push_str(", ");
+        push_inline_field(out, "kind", document_node_kind(node), false);
+        out.push('}');
+        if index + 1 < chapter.nodes.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, 2);
+    out.push_str("],\n");
+
+    indent(out, 2);
+    out.push_str("\"anchors\": [\n");
+    for (index, anchor) in chapter.anchors.anchors.values().enumerate() {
+        indent(out, 3);
+        out.push('{');
+        push_inline_field(out, "key", &anchor.key, true);
+        out.push_str("\"node_id\": ");
+        out.push_str(&anchor.node_id.get().to_string());
+        out.push('}');
+        if index + 1 < chapter.anchors.anchors.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, 2);
+    out.push_str("],\n");
+
+    indent(out, 2);
+    out.push_str("\"links\": [\n");
+    for (index, link) in chapter.links.iter().enumerate() {
+        indent(out, 3);
+        out.push('{');
+        push_inline_field(out, "href", &link.href, true);
+        push_inline_field(
+            out,
+            "resolved_document",
+            link.resolved_document.as_deref().unwrap_or(""),
+            true,
+        );
+        push_inline_field(
+            out,
+            "fragment",
+            link.fragment.as_deref().unwrap_or(""),
+            false,
+        );
+        out.push('}');
+        if index + 1 < chapter.links.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, 2);
+    out.push_str("]\n");
+    indent(out, 1);
+    out.push('}');
 }
 
 fn push_capabilities(out: &mut String, book: &BookSummary) {
@@ -175,6 +274,24 @@ fn push_capabilities(out: &mut String, book: &BookSummary) {
     out.push_str("]\n");
     indent(out, 1);
     out.push('}');
+}
+
+fn document_node_kind(node: &DocumentNode) -> &'static str {
+    match node {
+        DocumentNode::Paragraph(_) => "paragraph",
+        DocumentNode::Heading(_) => "heading",
+        DocumentNode::List(_) => "list",
+        DocumentNode::ListItem(_) => "list-item",
+        DocumentNode::BlockQuote(_) => "blockquote",
+        DocumentNode::Image(_) => "image",
+        DocumentNode::Figure(_) => "figure",
+        DocumentNode::Table(_) => "table",
+        DocumentNode::Divider => "divider",
+        DocumentNode::ForcedBreak => "forced-break",
+        DocumentNode::Footnote(_) => "footnote",
+        DocumentNode::Container(_) => "container",
+        DocumentNode::Unsupported(_) => "unsupported",
+    }
 }
 
 fn push_nav_array(out: &mut String, name: &str, items: &[NavigationItem], trailing: bool) {
@@ -310,6 +427,8 @@ mod tests {
         assert!(json.contains(r#""manifest""#));
         assert!(json.contains(r#""spine""#));
         assert!(json.contains(r#""navigation""#));
+        assert!(json.contains(r#""chapter_ir""#));
+        assert!(json.contains(r#""visible_text": "Hello pagelet.""#));
         assert!(json.contains(r#""capability_report""#));
     }
 }

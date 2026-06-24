@@ -7,7 +7,7 @@
 
 pub mod cli;
 pub mod core;
-mod document;
+pub mod document;
 pub mod engine;
 pub mod epub;
 mod ffi;

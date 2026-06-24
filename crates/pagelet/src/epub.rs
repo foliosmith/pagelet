@@ -11,9 +11,11 @@ use std::{
 
 pub use crate::core::ResourceId;
 use crate::core::{
-    Diagnostic, DiagnosticCode, PackageError, PageletError, ParseError, ResourceLimitError,
-    ResourceLimitKind, ResourceLimits, Severity, UnsupportedFeature,
+    ContentHash, Diagnostic, DiagnosticCode, DocumentId, NodeId, PackageError, PageletError,
+    ParseError, ResourceLimitError, ResourceLimitKind, ResourceLimits, Severity, SourceRange,
+    StyleId, UnsupportedFeature,
 };
+use crate::document;
 
 /// EPUB compatibility mode used while opening a book.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
@@ -472,6 +474,11 @@ impl CapabilityReport {
             CapabilityStatus::SupportedWithLimitations,
             "metadata, manifest, spine, nav, NCX and guide are parsed for M1",
         );
+        report.push(
+            "epub/xhtml-chapter-ir",
+            CapabilityStatus::SupportedWithLimitations,
+            "spine XHTML can be tokenized and mapped to ChapterIR for M2-supported nodes",
+        );
         report
     }
 
@@ -496,6 +503,11 @@ pub struct BookSummary {
     pub store_stats: StoreStats,
 }
 
+struct OpenedBook {
+    summary: BookSummary,
+    store: ZipPublicationStore,
+}
+
 /// Open an EPUB and parse metadata/navigation with compatible defaults.
 pub fn open_book(bytes: impl Into<Vec<u8>>) -> Result<BookSummary, PageletError> {
     open_book_with_options(bytes, OpenOptions::default())
@@ -506,6 +518,70 @@ pub fn open_book_with_options(
     bytes: impl Into<Vec<u8>>,
     options: OpenOptions,
 ) -> Result<BookSummary, PageletError> {
+    Ok(open_book_context(bytes, options)?.summary)
+}
+
+/// Open an EPUB and return package-level [`document::BookIr`].
+pub fn open_book_ir(bytes: impl Into<Vec<u8>>) -> Result<document::BookIr, PageletError> {
+    open_book_ir_with_options(bytes, OpenOptions::default())
+}
+
+/// Open an EPUB and return package-level [`document::BookIr`] with explicit options.
+pub fn open_book_ir_with_options(
+    bytes: impl Into<Vec<u8>>,
+    options: OpenOptions,
+) -> Result<document::BookIr, PageletError> {
+    Ok(book_ir_from_summary(&open_book_with_options(
+        bytes, options,
+    )?))
+}
+
+/// Parse the first readable spine item into ChapterIR.
+pub fn open_first_chapter_ir(
+    bytes: impl Into<Vec<u8>>,
+) -> Result<document::ChapterIr, PageletError> {
+    open_spine_item_chapter_ir_with_options(bytes, 0, OpenOptions::default())
+}
+
+/// Parse one spine item into ChapterIR.
+pub fn open_spine_item_chapter_ir(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+) -> Result<document::ChapterIr, PageletError> {
+    open_spine_item_chapter_ir_with_options(bytes, spine_index, OpenOptions::default())
+}
+
+/// Parse one spine item into ChapterIR with explicit options.
+pub fn open_spine_item_chapter_ir_with_options(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+    options: OpenOptions,
+) -> Result<document::ChapterIr, PageletError> {
+    let opened = open_book_context(bytes, options)?;
+    let book_ir = book_ir_from_summary(&opened.summary);
+    let manifest_item = spine_manifest_item(&opened.summary.package, spine_index)?;
+    let bytes = opened
+        .store
+        .read_path(&manifest_item.resolved_path, options.compatibility_mode)?;
+    let xhtml = resource_text(&bytes)?;
+    let title = text_of_first(&xhtml, &["title"]).unwrap_or_else(|| {
+        navigation_title_for_href(&opened.summary.navigation, &manifest_item.resolved_path)
+            .unwrap_or_else(|| manifest_item.id.clone())
+    });
+    chapter_ir_from_xhtml(
+        DocumentId::new(u32::try_from(spine_index).unwrap_or(u32::MAX)),
+        &manifest_item.resolved_path,
+        &title,
+        &xhtml,
+        &book_ir.resources,
+        options,
+    )
+}
+
+fn open_book_context(
+    bytes: impl Into<Vec<u8>>,
+    options: OpenOptions,
+) -> Result<OpenedBook, PageletError> {
     let mut diagnostics = DiagnosticCollector::new(options.limits.max_diagnostics);
     let capability_report = CapabilityReport::new(options.compatibility_mode);
     let store = ZipPublicationStore::from_bytes(bytes, options)?;
@@ -525,15 +601,209 @@ pub fn open_book_with_options(
     let resources = store.resources().to_vec();
     let store_stats = store.stats();
 
-    Ok(BookSummary {
-        rootfiles,
-        package,
-        navigation,
-        diagnostics: diagnostics.into_vec(),
-        capability_report,
-        resources,
-        store_stats,
+    Ok(OpenedBook {
+        summary: BookSummary {
+            rootfiles,
+            package,
+            navigation,
+            diagnostics: diagnostics.into_vec(),
+            capability_report,
+            resources,
+            store_stats,
+        },
+        store,
     })
+}
+
+fn book_ir_from_summary(book: &BookSummary) -> document::BookIr {
+    let mut resources = document::ResourceTable::new();
+    for resource in &book.resources {
+        resources.push(document::ResourceInfo {
+            id: resource.id,
+            path: resource.path.clone(),
+            media_type: resource.media_type.0.clone(),
+            kind: document::ResourceKind::from_media_type(resource.media_type.as_str()),
+            compressed_size: resource.compressed_size,
+            uncompressed_size: resource.uncompressed_size,
+            compression_method: resource.compression_method,
+        });
+    }
+
+    let manifest = book
+        .package
+        .manifest
+        .iter()
+        .map(|item| document::ManifestItem {
+            id: Arc::from(item.id.as_str()),
+            href: Arc::from(item.href.as_str()),
+            resolved_path: Arc::from(item.resolved_path.as_str()),
+            media_type: Arc::from(item.media_type.as_str()),
+            properties: item
+                .properties
+                .iter()
+                .map(|property| Arc::from(property.as_str()))
+                .collect(),
+            fallback: item.fallback.as_deref().map(Arc::from),
+            media_overlay: item.media_overlay.as_deref().map(Arc::from),
+            resource_id: resources.id_for_path(&item.resolved_path),
+        })
+        .collect::<Vec<_>>();
+
+    let spine = book
+        .package
+        .spine
+        .iter()
+        .map(|item| {
+            let manifest_index = book
+                .package
+                .manifest
+                .iter()
+                .position(|manifest_item| manifest_item.id == item.idref)
+                .and_then(|index| u32::try_from(index).ok());
+            let href = manifest_index
+                .and_then(|index| book.package.manifest.get(usize::try_from(index).ok()?))
+                .map(|manifest_item| Arc::from(manifest_item.resolved_path.as_str()));
+            document::SpineItem {
+                idref: Arc::from(item.idref.as_str()),
+                linear: item.linear,
+                properties: item
+                    .properties
+                    .iter()
+                    .map(|property| Arc::from(property.as_str()))
+                    .collect(),
+                manifest_index,
+                href,
+            }
+        })
+        .collect();
+
+    document::BookIr {
+        metadata: document::BookMetadata {
+            package_version: Arc::from(book.package.metadata.package_version.as_str()),
+            unique_identifier: Arc::from(book.package.metadata.unique_identifier.as_str()),
+            identifier: book.package.metadata.identifier.as_deref().map(Arc::from),
+            title: book.package.metadata.title.as_deref().map(Arc::from),
+            language: book.package.metadata.language.as_deref().map(Arc::from),
+            cover_image: book.package.metadata.cover_image.as_deref().map(Arc::from),
+        },
+        package: document::PackageInfo {
+            rootfile_path: Arc::from(book.package.rootfile_path.as_str()),
+            version: Arc::from(book.package.metadata.package_version.as_str()),
+            spine_toc: book.package.spine_toc.as_deref().map(Arc::from),
+            page_progression_direction: book
+                .package
+                .page_progression_direction
+                .as_deref()
+                .map(Arc::from),
+        },
+        manifest,
+        spine,
+        navigation: navigation_ir(&book.navigation),
+        resources,
+        capabilities: capability_report_ir(&book.capability_report),
+    }
+}
+
+fn navigation_ir(navigation: &Navigation) -> document::Navigation {
+    document::Navigation {
+        source: Arc::from(navigation_source_label(navigation.source)),
+        toc: navigation
+            .toc
+            .iter()
+            .map(navigation_item_ir)
+            .collect::<Vec<_>>(),
+        page_list: navigation
+            .page_list
+            .iter()
+            .map(navigation_item_ir)
+            .collect::<Vec<_>>(),
+        landmarks: navigation
+            .landmarks
+            .iter()
+            .map(navigation_item_ir)
+            .collect::<Vec<_>>(),
+    }
+}
+
+fn navigation_item_ir(item: &NavigationItem) -> document::NavigationItem {
+    document::NavigationItem {
+        label: Arc::from(item.label.as_str()),
+        href: Arc::from(item.href.as_str()),
+        children: item.children.iter().map(navigation_item_ir).collect(),
+    }
+}
+
+fn capability_report_ir(report: &CapabilityReport) -> document::CapabilityReport {
+    document::CapabilityReport {
+        mode: Arc::from(compatibility_mode_label(report.mode)),
+        capabilities: report
+            .capabilities
+            .iter()
+            .map(|capability| document::Capability {
+                feature: Arc::from(capability.feature.as_str()),
+                status: Arc::from(capability_status_label(capability.status)),
+                message: Arc::from(capability.message.as_str()),
+            })
+            .collect(),
+    }
+}
+
+fn spine_manifest_item(
+    package: &PackageDocument,
+    spine_index: usize,
+) -> Result<&ManifestItem, PageletError> {
+    let spine = package
+        .spine
+        .get(spine_index)
+        .ok_or_else(|| invalid_package(format!("spine index out of range: {spine_index}")))?;
+    package
+        .manifest
+        .iter()
+        .find(|item| item.id == spine.idref)
+        .ok_or_else(|| invalid_package(format!("spine idref not found: {}", spine.idref)))
+}
+
+fn navigation_title_for_href(navigation: &Navigation, href: &str) -> Option<String> {
+    navigation
+        .toc
+        .iter()
+        .find_map(|item| navigation_title_for_href_in_item(item, href))
+}
+
+fn navigation_title_for_href_in_item(item: &NavigationItem, href: &str) -> Option<String> {
+    let item_href = href.split('#').next().unwrap_or(href);
+    let nav_href = item.href.split('#').next().unwrap_or(&item.href);
+    if item_href.ends_with(nav_href) || nav_href.ends_with(item_href) {
+        return Some(item.label.clone());
+    }
+    item.children
+        .iter()
+        .find_map(|child| navigation_title_for_href_in_item(child, href))
+}
+
+const fn compatibility_mode_label(mode: CompatibilityMode) -> &'static str {
+    match mode {
+        CompatibilityMode::Strict => "strict",
+        CompatibilityMode::Compatible => "compatible",
+        CompatibilityMode::Salvage => "salvage",
+    }
+}
+
+const fn capability_status_label(status: CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Supported => "supported",
+        CapabilityStatus::SupportedWithLimitations => "supported-with-limitations",
+        CapabilityStatus::UnsupportedDiagnosed => "unsupported-diagnosed",
+    }
+}
+
+const fn navigation_source_label(source: NavigationSource) -> &'static str {
+    match source {
+        NavigationSource::Epub3Nav => "epub3-nav",
+        NavigationSource::Ncx => "ncx",
+        NavigationSource::Guide => "guide",
+        NavigationSource::Spine => "spine",
+    }
 }
 
 /// Parse `META-INF/container.xml`.
@@ -692,6 +962,1009 @@ pub fn resolve_resource_path(base_dir: &str, href: &str) -> Result<String, Pagel
         ));
     }
     Ok(parts.join("/"))
+}
+
+/// XHTML token with byte source range.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct XhtmlToken {
+    pub kind: XhtmlTokenKind,
+    pub source_range: SourceRange,
+}
+
+/// Token kinds emitted by the lightweight XHTML tokenizer.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum XhtmlTokenKind {
+    StartElement {
+        name: String,
+        attrs: BTreeMap<String, String>,
+        self_closing: bool,
+    },
+    EndElement {
+        name: String,
+    },
+    Text(String),
+    Comment,
+    ProcessingInstruction,
+}
+
+/// XHTML tree produced by [`parse_xhtml_tree`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct XhtmlDocument {
+    pub nodes: Vec<XhtmlNode>,
+    pub root: usize,
+}
+
+impl XhtmlDocument {
+    fn node(&self, id: usize) -> Option<&XhtmlNode> {
+        self.nodes.get(id)
+    }
+}
+
+/// One XHTML tree node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct XhtmlNode {
+    pub kind: XhtmlNodeKind,
+    pub source_range: SourceRange,
+}
+
+impl XhtmlNode {
+    fn element(&self) -> Option<&XhtmlElement> {
+        match &self.kind {
+            XhtmlNodeKind::Element(element) => Some(element),
+            XhtmlNodeKind::Text(_) => None,
+        }
+    }
+}
+
+/// XHTML tree node kind.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum XhtmlNodeKind {
+    Element(XhtmlElement),
+    Text(String),
+}
+
+/// XHTML element payload.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct XhtmlElement {
+    pub name: String,
+    pub attrs: BTreeMap<String, String>,
+    pub children: Vec<usize>,
+}
+
+impl XhtmlElement {
+    fn local_name(&self) -> &str {
+        local_name(&self.name)
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs.get(name).map(String::as_str)
+    }
+}
+
+/// Tokenize XHTML with default resource limits.
+pub fn tokenize_xhtml(input: &str) -> Result<Vec<XhtmlToken>, PageletError> {
+    tokenize_xhtml_with_limits(input, ResourceLimits::default())
+}
+
+/// Tokenize XHTML with source range tracking and explicit limits.
+pub fn tokenize_xhtml_with_limits(
+    input: &str,
+    limits: ResourceLimits,
+) -> Result<Vec<XhtmlToken>, PageletError> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        if u64::try_from(tokens.len()).unwrap_or(u64::MAX) > u64::from(limits.max_dom_nodes) {
+            return Err(limit_error(
+                ResourceLimitKind::DomNodes,
+                u64::from(limits.max_dom_nodes),
+                u64::try_from(tokens.len()).unwrap_or(u64::MAX),
+            ));
+        }
+
+        let Some(relative_start) = input[cursor..].find('<') else {
+            push_text_token(input, cursor, input.len(), &mut tokens)?;
+            break;
+        };
+        let start = cursor + relative_start;
+        if start > cursor {
+            push_text_token(input, cursor, start, &mut tokens)?;
+        }
+
+        if input[start..].starts_with("<!--") {
+            let end = input[start + 4..]
+                .find("-->")
+                .map(|relative| start + 4 + relative + 3)
+                .ok_or_else(|| {
+                    PageletError::Parse(ParseError::new("unterminated XHTML comment"))
+                })?;
+            tokens.push(XhtmlToken {
+                kind: XhtmlTokenKind::Comment,
+                source_range: source_range(start, end)?,
+            });
+            cursor = end;
+            continue;
+        }
+
+        if input[start..].starts_with("<?") {
+            let end = input[start + 2..]
+                .find("?>")
+                .map(|relative| start + 2 + relative + 2)
+                .ok_or_else(|| {
+                    PageletError::Parse(ParseError::new(
+                        "unterminated XHTML processing instruction",
+                    ))
+                })?;
+            tokens.push(XhtmlToken {
+                kind: XhtmlTokenKind::ProcessingInstruction,
+                source_range: source_range(start, end)?,
+            });
+            cursor = end;
+            continue;
+        }
+
+        if input[start..].starts_with("<!") {
+            let end = find_tag_end(input, start)
+                .ok_or_else(|| PageletError::Parse(ParseError::new("unterminated declaration")))?;
+            tokens.push(XhtmlToken {
+                kind: XhtmlTokenKind::Comment,
+                source_range: source_range(start, end + 1)?,
+            });
+            cursor = end + 1;
+            continue;
+        }
+
+        let end = find_tag_end(input, start)
+            .ok_or_else(|| PageletError::Parse(ParseError::new("unterminated XHTML tag")))?;
+        let source_range = source_range(start, end + 1)?;
+        let inside = input[start + 1..end].trim();
+        if let Some(rest) = inside.strip_prefix('/') {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if name.is_empty() {
+                return Err(PageletError::Parse(ParseError::new("empty XHTML end tag")));
+            }
+            tokens.push(XhtmlToken {
+                kind: XhtmlTokenKind::EndElement { name },
+                source_range,
+            });
+        } else {
+            let self_closing = inside.ends_with('/');
+            let tag = inside.trim_end_matches('/').trim();
+            let name_end = tag.find(char::is_whitespace).unwrap_or(tag.len());
+            let name = tag[..name_end].to_owned();
+            if name.is_empty() {
+                return Err(PageletError::Parse(ParseError::new(
+                    "empty XHTML start tag",
+                )));
+            }
+            tokens.push(XhtmlToken {
+                kind: XhtmlTokenKind::StartElement {
+                    name,
+                    attrs: parse_attrs(&tag[name_end..]),
+                    self_closing,
+                },
+                source_range,
+            });
+        }
+        cursor = end + 1;
+    }
+    Ok(tokens)
+}
+
+/// Build an XHTML tree in the requested compatibility mode.
+pub fn parse_xhtml_tree(
+    input: &str,
+    mode: CompatibilityMode,
+    limits: ResourceLimits,
+) -> Result<XhtmlDocument, PageletError> {
+    let tokens = tokenize_xhtml_with_limits(input, limits)?;
+    build_xhtml_tree(&tokens, mode, limits)
+}
+
+fn build_xhtml_tree(
+    tokens: &[XhtmlToken],
+    mode: CompatibilityMode,
+    limits: ResourceLimits,
+) -> Result<XhtmlDocument, PageletError> {
+    let root_range = SourceRange::new(0, 0).expect("root source range is valid");
+    let mut nodes = vec![XhtmlNode {
+        kind: XhtmlNodeKind::Element(XhtmlElement {
+            name: "#document".to_owned(),
+            attrs: BTreeMap::new(),
+            children: Vec::new(),
+        }),
+        source_range: root_range,
+    }];
+    let mut stack = vec![0_usize];
+
+    for token in tokens {
+        match &token.kind {
+            XhtmlTokenKind::StartElement {
+                name,
+                attrs,
+                self_closing,
+            } => {
+                let observed = u64::try_from(nodes.len().saturating_add(1)).unwrap_or(u64::MAX);
+                if observed > u64::from(limits.max_dom_nodes) {
+                    return Err(limit_error(
+                        ResourceLimitKind::DomNodes,
+                        u64::from(limits.max_dom_nodes),
+                        observed,
+                    ));
+                }
+                let depth = u64::try_from(stack.len().saturating_add(1)).unwrap_or(u64::MAX);
+                if depth > u64::from(limits.max_xml_depth) {
+                    return Err(limit_error(
+                        ResourceLimitKind::XmlDepth,
+                        u64::from(limits.max_xml_depth),
+                        depth,
+                    ));
+                }
+                let node_id = nodes.len();
+                nodes.push(XhtmlNode {
+                    kind: XhtmlNodeKind::Element(XhtmlElement {
+                        name: name.clone(),
+                        attrs: attrs.clone(),
+                        children: Vec::new(),
+                    }),
+                    source_range: token.source_range,
+                });
+                push_child(&mut nodes, *stack.last().unwrap_or(&0), node_id);
+                if !*self_closing && !is_void_xhtml_element(name) {
+                    stack.push(node_id);
+                }
+            }
+            XhtmlTokenKind::EndElement { name } => {
+                close_xhtml_element(&mut nodes, &mut stack, name, token.source_range, mode)?;
+            }
+            XhtmlTokenKind::Text(text) => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let observed = u64::try_from(nodes.len().saturating_add(1)).unwrap_or(u64::MAX);
+                if observed > u64::from(limits.max_dom_nodes) {
+                    return Err(limit_error(
+                        ResourceLimitKind::DomNodes,
+                        u64::from(limits.max_dom_nodes),
+                        observed,
+                    ));
+                }
+                let node_id = nodes.len();
+                nodes.push(XhtmlNode {
+                    kind: XhtmlNodeKind::Text(text.clone()),
+                    source_range: token.source_range,
+                });
+                push_child(&mut nodes, *stack.last().unwrap_or(&0), node_id);
+            }
+            XhtmlTokenKind::Comment | XhtmlTokenKind::ProcessingInstruction => {}
+        }
+    }
+
+    if stack.len() > 1 && mode == CompatibilityMode::Strict {
+        return Err(PageletError::Parse(ParseError::new(format!(
+            "unclosed XHTML element: {}",
+            element_name(&nodes, *stack.last().unwrap_or(&0))
+        ))));
+    }
+    if let Some(last) = tokens.last() {
+        for node_id in stack.iter().copied().skip(1) {
+            nodes[node_id].source_range.end = last.source_range.end;
+        }
+        nodes[0].source_range.end = last.source_range.end;
+    }
+
+    Ok(XhtmlDocument { nodes, root: 0 })
+}
+
+fn push_text_token(
+    input: &str,
+    start: usize,
+    end: usize,
+    tokens: &mut Vec<XhtmlToken>,
+) -> Result<(), PageletError> {
+    if start == end {
+        return Ok(());
+    }
+    let text = unescape_xml(&input[start..end]);
+    if text.is_empty() {
+        return Ok(());
+    }
+    tokens.push(XhtmlToken {
+        kind: XhtmlTokenKind::Text(text),
+        source_range: source_range(start, end)?,
+    });
+    Ok(())
+}
+
+fn source_range(start: usize, end: usize) -> Result<SourceRange, PageletError> {
+    SourceRange::new(
+        u32::try_from(start)
+            .map_err(|_| PageletError::Parse(ParseError::new("source range start exceeds u32")))?,
+        u32::try_from(end)
+            .map_err(|_| PageletError::Parse(ParseError::new("source range end exceeds u32")))?,
+    )
+    .ok_or_else(|| PageletError::Parse(ParseError::new("invalid source range")))
+}
+
+fn find_tag_end(input: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut cursor = start + 1;
+    let bytes = input.as_bytes();
+    while cursor < input.len() {
+        let byte = *bytes.get(cursor)?;
+        match quote {
+            Some(active) if byte == active => quote = None,
+            Some(_) => {}
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None if byte == b'>' => return Some(cursor),
+            None => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn push_child(nodes: &mut [XhtmlNode], parent: usize, child: usize) {
+    if let Some(XhtmlNode {
+        kind: XhtmlNodeKind::Element(element),
+        ..
+    }) = nodes.get_mut(parent)
+    {
+        element.children.push(child);
+    }
+}
+
+fn close_xhtml_element(
+    nodes: &mut [XhtmlNode],
+    stack: &mut Vec<usize>,
+    name: &str,
+    end_range: SourceRange,
+    mode: CompatibilityMode,
+) -> Result<(), PageletError> {
+    let expected = stack
+        .last()
+        .copied()
+        .map(|id| element_name(nodes, id).to_owned())
+        .unwrap_or_default();
+    if local_name(&expected) == local_name(name) {
+        if let Some(node_id) = stack.pop() {
+            nodes[node_id].source_range.end = end_range.end;
+        }
+        return Ok(());
+    }
+
+    if mode == CompatibilityMode::Strict {
+        return Err(PageletError::Parse(ParseError::new(format!(
+            "mismatched XHTML end tag: expected </{}>, got </{}>",
+            expected, name
+        ))));
+    }
+
+    if let Some(position) = stack
+        .iter()
+        .rposition(|node_id| local_name(element_name(nodes, *node_id)) == local_name(name))
+    {
+        for node_id in stack.drain(position..) {
+            nodes[node_id].source_range.end = end_range.end;
+        }
+    }
+    Ok(())
+}
+
+fn element_name(nodes: &[XhtmlNode], node_id: usize) -> &str {
+    nodes
+        .get(node_id)
+        .and_then(XhtmlNode::element)
+        .map_or("#text", |element| element.name.as_str())
+}
+
+fn is_void_xhtml_element(name: &str) -> bool {
+    matches!(
+        local_name(name),
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn local_name(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
+}
+
+fn chapter_ir_from_xhtml(
+    document_id: DocumentId,
+    href: &str,
+    title: &str,
+    input: &str,
+    resources: &document::ResourceTable,
+    options: OpenOptions,
+) -> Result<document::ChapterIr, PageletError> {
+    let content_hash = ContentHash::from_bytes(input.as_bytes());
+    let tree = match parse_xhtml_tree(input, CompatibilityMode::Strict, options.limits) {
+        Ok(tree) => tree,
+        Err(error) if options.compatibility_mode == CompatibilityMode::Strict => return Err(error),
+        Err(_) => match parse_xhtml_tree(input, CompatibilityMode::Compatible, options.limits) {
+            Ok(tree) => tree,
+            Err(_) => {
+                return salvage_chapter_ir(document_id, href, title, input, content_hash);
+            }
+        },
+    };
+
+    let mut builder = ChapterBuilder {
+        document_href: href,
+        base_dir: parent_path(href),
+        resources,
+        chapter: document::ChapterIr::empty(document_id, href, title, content_hash),
+        default_style: StyleId::new(0),
+        tree: &tree,
+    };
+    builder.build()
+}
+
+fn salvage_chapter_ir(
+    document_id: DocumentId,
+    href: &str,
+    title: &str,
+    input: &str,
+    content_hash: ContentHash,
+) -> Result<document::ChapterIr, PageletError> {
+    let mut chapter = document::ChapterIr::empty(document_id, href, title, content_hash);
+    let visible = strip_tags(input);
+    let text = chapter.text_pool.push(visible.trim())?;
+    let paragraph = chapter
+        .nodes
+        .push(document::DocumentNode::Paragraph(document::BlockText {
+            text,
+            style: StyleId::new(0),
+        }))?;
+    let root = chapter
+        .nodes
+        .push(document::DocumentNode::Container(document::ContainerNode {
+            children: vec![paragraph],
+            style: StyleId::new(0),
+        }))?;
+    chapter.root = root;
+    chapter.source_map.insert(
+        root,
+        SourceRange::new(0, u32::try_from(input.len()).unwrap_or(u32::MAX)),
+    );
+    chapter.rebuild_utf16_index();
+    Ok(chapter)
+}
+
+struct ChapterBuilder<'a> {
+    document_href: &'a str,
+    base_dir: String,
+    resources: &'a document::ResourceTable,
+    chapter: document::ChapterIr,
+    default_style: StyleId,
+    tree: &'a XhtmlDocument,
+}
+
+impl ChapterBuilder<'_> {
+    fn build(&mut self) -> Result<document::ChapterIr, PageletError> {
+        let content_root = self.content_root();
+        let children = self.convert_children(content_root)?;
+        let root_range = self.tree.node(content_root).map(|node| node.source_range);
+        let root = self.push_node(
+            document::DocumentNode::Container(document::ContainerNode {
+                children,
+                style: self.default_style,
+            }),
+            root_range,
+        )?;
+        self.chapter.root = root;
+        self.chapter.rebuild_utf16_index();
+        Ok(self.chapter.clone())
+    }
+
+    fn content_root(&self) -> usize {
+        self.find_first_element(self.tree.root, "body")
+            .unwrap_or(self.tree.root)
+    }
+
+    fn find_first_element(&self, node_id: usize, name: &str) -> Option<usize> {
+        let node = self.tree.node(node_id)?;
+        let element = node.element()?;
+        if element.local_name() == name {
+            return Some(node_id);
+        }
+        element
+            .children
+            .iter()
+            .find_map(|child| self.find_first_element(*child, name))
+    }
+
+    fn convert_children(&mut self, node_id: usize) -> Result<Vec<NodeId>, PageletError> {
+        let Some(element) = self.tree.node(node_id).and_then(XhtmlNode::element) else {
+            return Ok(Vec::new());
+        };
+        let children = element.children.clone();
+        let mut out = Vec::new();
+        for child in children {
+            if let Some(node_id) = self.convert_node(child)? {
+                out.push(node_id);
+            }
+        }
+        Ok(out)
+    }
+
+    fn convert_node(&mut self, node_id: usize) -> Result<Option<NodeId>, PageletError> {
+        let Some(node) = self.tree.node(node_id) else {
+            return Ok(None);
+        };
+        let source_range = node.source_range;
+        let kind = node.kind.clone();
+        match kind {
+            XhtmlNodeKind::Text(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(self.text_block_node(
+                    DocumentNodeKind::Paragraph,
+                    text,
+                    source_range,
+                )?))
+            }
+            XhtmlNodeKind::Element(element) => self.convert_element(node_id, &element),
+        }
+    }
+
+    fn convert_element(
+        &mut self,
+        node_id: usize,
+        element: &XhtmlElement,
+    ) -> Result<Option<NodeId>, PageletError> {
+        let source_range = self.tree.node(node_id).map(|node| node.source_range);
+        let converted = match element.local_name() {
+            "html" | "body" | "section" | "article" | "main" | "div" | "nav" => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::Container(document::ContainerNode {
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "p" => Some(self.block_text_node(node_id, DocumentNodeKind::Paragraph)?),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let level = element.local_name()[1..].parse::<u8>().unwrap_or(1);
+                Some(self.heading_node(node_id, level)?)
+            }
+            "ul" | "ol" => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::List(document::ListNode {
+                        ordered: element.local_name() == "ol",
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "li" => {
+                let mut children = self.convert_children(node_id)?;
+                if children.is_empty() {
+                    let text = self.inline_text(node_id).0.trim().to_owned();
+                    if !text.is_empty() {
+                        children.push(
+                            self.text_block_node(
+                                DocumentNodeKind::Paragraph,
+                                &text,
+                                self.tree
+                                    .node(node_id)
+                                    .map(|node| node.source_range)
+                                    .unwrap_or_default(),
+                            )?,
+                        );
+                    }
+                }
+                Some(self.push_node(
+                    document::DocumentNode::ListItem(document::ListItemNode {
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "blockquote" => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::BlockQuote(document::ContainerNode {
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "figure" => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::Figure(document::ContainerNode {
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "table" => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::Table(document::ContainerNode {
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+            "img" => Some(self.image_node(element, source_range)?),
+            "hr" => Some(self.push_node(document::DocumentNode::Divider, source_range)?),
+            "br" => Some(self.push_node(document::DocumentNode::ForcedBreak, source_range)?),
+            "aside" if is_footnote_element(element) => Some(self.footnote_node(node_id, element)?),
+            "a" | "span" | "em" | "strong" | "b" | "i" => {
+                let text = self.inline_text(node_id).0;
+                let text = text.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(self.text_block_node(
+                        DocumentNodeKind::Paragraph,
+                        text,
+                        source_range.unwrap_or_default(),
+                    )?)
+                }
+            }
+            _ => {
+                let children = self.convert_children(node_id)?;
+                Some(self.push_node(
+                    document::DocumentNode::Unsupported(document::UnsupportedNode {
+                        element: Arc::from(element.name.as_str()),
+                        children,
+                        style: self.default_style,
+                    }),
+                    source_range,
+                )?)
+            }
+        };
+
+        if let Some(converted) = converted {
+            self.register_element_anchor(element, converted, source_range);
+            Ok(Some(converted))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn block_text_node(
+        &mut self,
+        tree_node_id: usize,
+        kind: DocumentNodeKind,
+    ) -> Result<NodeId, PageletError> {
+        let (text, links, anchors) = self.inline_text(tree_node_id);
+        let source_range = self.tree.node(tree_node_id).map(|node| node.source_range);
+        let node_id = self.text_block_node(kind, text.trim(), source_range.unwrap_or_default())?;
+        self.add_inline_metadata(node_id, links, anchors);
+        Ok(node_id)
+    }
+
+    fn heading_node(&mut self, tree_node_id: usize, level: u8) -> Result<NodeId, PageletError> {
+        let (text, links, anchors) = self.inline_text(tree_node_id);
+        let text = self.chapter.text_pool.push(text.trim())?;
+        let node_id = self.push_node(
+            document::DocumentNode::Heading(document::HeadingNode {
+                level,
+                content: document::BlockText {
+                    text,
+                    style: self.default_style,
+                },
+            }),
+            self.tree.node(tree_node_id).map(|node| node.source_range),
+        )?;
+        self.add_inline_metadata(node_id, links, anchors);
+        Ok(node_id)
+    }
+
+    fn text_block_node(
+        &mut self,
+        kind: DocumentNodeKind,
+        text: &str,
+        source_range: SourceRange,
+    ) -> Result<NodeId, PageletError> {
+        let text = self.chapter.text_pool.push(text)?;
+        let block = document::BlockText {
+            text,
+            style: self.default_style,
+        };
+        let node = match kind {
+            DocumentNodeKind::Paragraph => document::DocumentNode::Paragraph(block),
+        };
+        self.push_node(node, Some(source_range))
+    }
+
+    fn image_node(
+        &mut self,
+        element: &XhtmlElement,
+        source_range: Option<SourceRange>,
+    ) -> Result<NodeId, PageletError> {
+        let src = element.attr("src").unwrap_or_default();
+        let resolved_path = resolve_resource_path(&self.base_dir, src).ok();
+        let resource_id = resolved_path
+            .as_deref()
+            .and_then(|path| self.resources.id_for_path(path));
+        self.push_node(
+            document::DocumentNode::Image(document::ImageNode {
+                src: Arc::from(src),
+                resolved_path: resolved_path.as_deref().map(Arc::from),
+                resource_id,
+                alt: Arc::from(element.attr("alt").unwrap_or_default()),
+                title: element.attr("title").map(Arc::from),
+                style: self.default_style,
+            }),
+            source_range,
+        )
+    }
+
+    fn footnote_node(
+        &mut self,
+        tree_node_id: usize,
+        element: &XhtmlElement,
+    ) -> Result<NodeId, PageletError> {
+        let mut children = self.convert_children(tree_node_id)?;
+        if children.is_empty() {
+            let text = self.inline_text(tree_node_id).0;
+            let text = text.trim();
+            if !text.is_empty() {
+                let source_range = self
+                    .tree
+                    .node(tree_node_id)
+                    .map(|node| node.source_range)
+                    .unwrap_or_default();
+                children.push(self.text_block_node(
+                    DocumentNodeKind::Paragraph,
+                    text,
+                    source_range,
+                )?);
+            }
+        }
+        self.push_node(
+            document::DocumentNode::Footnote(document::FootnoteNode {
+                note_id: element.attr("id").map(Arc::from),
+                children,
+                backlink: None,
+                style: self.default_style,
+            }),
+            self.tree.node(tree_node_id).map(|node| node.source_range),
+        )
+    }
+
+    fn push_node(
+        &mut self,
+        node: document::DocumentNode,
+        source_range: Option<SourceRange>,
+    ) -> Result<NodeId, PageletError> {
+        let node_id = self.chapter.nodes.push(node)?;
+        self.chapter.source_map.insert(node_id, source_range);
+        Ok(node_id)
+    }
+
+    fn inline_text(&self, node_id: usize) -> (String, Vec<LinkDraft>, Vec<AnchorDraft>) {
+        let mut text = String::new();
+        let mut links = Vec::new();
+        let mut anchors = Vec::new();
+        self.collect_inline(node_id, &mut text, &mut links, &mut anchors);
+        (text, links, anchors)
+    }
+
+    fn collect_inline(
+        &self,
+        node_id: usize,
+        text: &mut String,
+        links: &mut Vec<LinkDraft>,
+        anchors: &mut Vec<AnchorDraft>,
+    ) {
+        let Some(node) = self.tree.node(node_id) else {
+            return;
+        };
+        match &node.kind {
+            XhtmlNodeKind::Text(value) => text.push_str(value),
+            XhtmlNodeKind::Element(element) => {
+                if let Some(id) = element.attr("id") {
+                    anchors.push(AnchorDraft {
+                        fragment: Arc::from(id),
+                        source_range: Some(node.source_range),
+                    });
+                }
+                match element.local_name() {
+                    "br" => text.push('\n'),
+                    "img" => {
+                        if let Some(alt) = element.attr("alt") {
+                            text.push_str(alt);
+                        }
+                    }
+                    "a" => {
+                        let before = text.len();
+                        for child in &element.children {
+                            self.collect_inline(*child, text, links, anchors);
+                        }
+                        if let Some(href) = element.attr("href") {
+                            links.push(LinkDraft {
+                                href: Arc::from(href),
+                                source_range: Some(node.source_range),
+                                kind: if element
+                                    .attr("epub:type")
+                                    .or_else(|| element.attr("role"))
+                                    .is_some_and(|value| value.contains("noteref"))
+                                {
+                                    document::LinkKind::Footnote
+                                } else {
+                                    document::LinkKind::Internal
+                                },
+                            });
+                        }
+                        if text.len() == before {
+                            text.push_str(element.attr("href").unwrap_or_default());
+                        }
+                    }
+                    _ => {
+                        for child in &element.children {
+                            self.collect_inline(*child, text, links, anchors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_inline_metadata(
+        &mut self,
+        node_id: NodeId,
+        links: Vec<LinkDraft>,
+        anchors: Vec<AnchorDraft>,
+    ) {
+        for link in links {
+            self.chapter.links.push(resolve_link(
+                self.document_href,
+                &self.base_dir,
+                node_id,
+                link,
+                self.resources,
+            ));
+        }
+        for anchor in anchors {
+            self.chapter.anchors.insert(document::Anchor {
+                key: Arc::from(format!("{}#{}", self.document_href, anchor.fragment)),
+                document_href: Arc::from(self.document_href),
+                fragment: anchor.fragment,
+                node_id,
+                source_range: anchor.source_range,
+            });
+        }
+    }
+
+    fn register_element_anchor(
+        &mut self,
+        element: &XhtmlElement,
+        node_id: NodeId,
+        source_range: Option<SourceRange>,
+    ) {
+        if let Some(fragment) = element.attr("id") {
+            self.chapter.anchors.insert(document::Anchor {
+                key: Arc::from(format!("{}#{}", self.document_href, fragment)),
+                document_href: Arc::from(self.document_href),
+                fragment: Arc::from(fragment),
+                node_id,
+                source_range,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DocumentNodeKind {
+    Paragraph,
+}
+
+#[derive(Debug, Clone)]
+struct LinkDraft {
+    href: Arc<str>,
+    source_range: Option<SourceRange>,
+    kind: document::LinkKind,
+}
+
+#[derive(Debug, Clone)]
+struct AnchorDraft {
+    fragment: Arc<str>,
+    source_range: Option<SourceRange>,
+}
+
+fn resolve_link(
+    document_href: &str,
+    base_dir: &str,
+    source_node: NodeId,
+    draft: LinkDraft,
+    resources: &document::ResourceTable,
+) -> document::LinkTarget {
+    let href_value = draft.href.clone();
+    let href = href_value.as_ref();
+    if href.starts_with("http:")
+        || href.starts_with("https:")
+        || href.starts_with("mailto:")
+        || href.starts_with("data:")
+    {
+        return document::LinkTarget {
+            source_node,
+            source_range: draft.source_range,
+            href: href_value,
+            resolved_document: None,
+            fragment: None,
+            kind: document::LinkKind::External,
+        };
+    }
+
+    let (path, fragment) = href
+        .split_once('#')
+        .map_or((href, None), |(path, fragment)| {
+            (path, Some(Arc::from(fragment)))
+        });
+    let resolved_document = if path.is_empty() {
+        Some(Arc::from(document_href))
+    } else {
+        resolve_resource_path(base_dir, path).ok().map(Arc::from)
+    };
+    let kind = if draft.kind == document::LinkKind::Footnote {
+        document::LinkKind::Footnote
+    } else if resolved_document
+        .as_deref()
+        .and_then(|path| resources.id_for_path(path))
+        .is_some()
+        && !resolved_document
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".xhtml") || path.ends_with(".html"))
+    {
+        document::LinkKind::Resource
+    } else if resolved_document.is_some() {
+        document::LinkKind::Internal
+    } else {
+        document::LinkKind::Unknown
+    };
+
+    document::LinkTarget {
+        source_node,
+        source_range: draft.source_range,
+        href: href_value,
+        resolved_document,
+        fragment,
+        kind,
+    }
+}
+
+fn is_footnote_element(element: &XhtmlElement) -> bool {
+    element
+        .attr("epub:type")
+        .or_else(|| element.attr("role"))
+        .is_some_and(|value| value.contains("footnote") || value.contains("endnote"))
+        || element
+            .attr("class")
+            .is_some_and(|value| value.contains("footnote") || value.contains("endnote"))
 }
 
 fn parse_container(
@@ -1350,5 +2623,90 @@ mod tests {
         let error =
             ZipPublicationStore::from_bytes(minimal_fixture_bytes(), options).expect_err("limit");
         assert_eq!(error.code(), DiagnosticCode::ResourceLimitExceeded);
+    }
+
+    #[test]
+    fn open_book_ir_serializes_package_level_sections() {
+        let ir = open_book_ir(minimal_fixture_bytes()).expect("book ir");
+        let json = ir.to_golden_json();
+
+        assert_eq!(ir.metadata.title.as_deref(), Some("Minimal EPUB 3"));
+        assert!(json.contains(r#""manifest""#));
+        assert!(json.contains(r#""resources""#));
+        assert!(ir.resources.id_for_path("EPUB/chapter-1.xhtml").is_some());
+    }
+
+    #[test]
+    fn xhtml_tokenizer_preserves_source_ranges() {
+        let input = r#"<p id="a">Hi<br/>there</p>"#;
+        let tokens = tokenize_xhtml(input).expect("tokens");
+
+        assert!(tokens.len() >= 5);
+        for token in tokens {
+            assert!(token.source_range.end <= input.len() as u32);
+            assert!(token.source_range.start < token.source_range.end);
+        }
+    }
+
+    #[test]
+    fn first_chapter_ir_maps_semantic_nodes_links_anchors_and_images() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::MinimalEpub3,
+            "ChapterIR",
+        )
+        .feature("chapter-ir")
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<h1 id="top">Title</h1><p>See <a href="#top">top</a>.</p><ul><li>One</li></ul><figure><img src="images/pic.png" alt="cover" /></figure>"##,
+        )
+        .add_entry("EPUB/images/pic.png", "image/png", vec![0; 32])
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let xhtml_len = fixture
+            .entries()
+            .iter()
+            .find(|entry| entry.path.as_ref() == "EPUB/chapter-1.xhtml")
+            .expect("chapter entry")
+            .bytes
+            .len() as u32;
+
+        assert_eq!(chapter.href.as_ref(), "EPUB/chapter-1.xhtml");
+        assert!(chapter.visible_text().contains("Title"));
+        assert!(chapter.visible_text().contains("See top."));
+        assert!(chapter.visible_text().contains("One"));
+        assert!(chapter.anchors.get("EPUB/chapter-1.xhtml#top").is_some());
+        assert_eq!(chapter.links.len(), 1);
+        assert_eq!(
+            chapter.links[0].resolved_document.as_deref(),
+            Some("EPUB/chapter-1.xhtml")
+        );
+        assert_eq!(chapter.links[0].fragment.as_deref(), Some("top"));
+        assert!(chapter.nodes.iter_with_ids().any(|(_, node)| matches!(
+            node,
+            document::DocumentNode::Image(image)
+                if image.resolved_path.as_deref() == Some("EPUB/images/pic.png")
+                    && image.resource_id.is_some()
+        )));
+        assert!(chapter
+            .source_map
+            .ranges
+            .values()
+            .all(|range| range.end <= xhtml_len));
+    }
+
+    #[test]
+    fn compatible_mode_salvages_malformed_xhtml_without_panic() {
+        let bytes = crate::testkit::GeneratedEpubFixture::preset(
+            crate::testkit::FixtureKind::MalformedXhtml,
+        )
+        .bytes()
+        .to_vec();
+        let chapter = open_first_chapter_ir(bytes.clone()).expect("compatible chapter");
+        assert!(chapter.visible_text().contains("Missing close"));
+
+        let strict_error = open_spine_item_chapter_ir_with_options(bytes, 0, OpenOptions::strict())
+            .expect_err("strict rejects malformed xhtml");
+        assert_eq!(strict_error.code(), DiagnosticCode::Parse);
     }
 }
