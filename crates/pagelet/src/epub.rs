@@ -1,13 +1,15 @@
 //! EPUB container, package, navigation, diagnostics, and inspect support.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
+
+use miniz_oxide::inflate::{decompress_to_vec_with_limit, TINFLStatus};
 
 pub use crate::core::ResourceId;
 use crate::core::{
@@ -16,6 +18,8 @@ use crate::core::{
     StyleId, UnsupportedFeature,
 };
 use crate::document;
+
+const IMAGE_HEADER_PREFIX_BYTES: usize = 4096;
 
 /// EPUB compatibility mode used while opening a book.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
@@ -273,6 +277,28 @@ impl ZipPublicationStore {
         self.read(id)
     }
 
+    /// Read up to `max_uncompressed_bytes` from a resource by path.
+    pub fn read_path_prefix(
+        &self,
+        path: &str,
+        max_uncompressed_bytes: usize,
+        mode: CompatibilityMode,
+    ) -> Result<ResourceBytes, PageletError> {
+        let id = self
+            .resolve_path(path, mode)
+            .ok_or_else(|| invalid_package(format!("resource not found: {path}")))?;
+        self.read_prefix(id, max_uncompressed_bytes)
+    }
+
+    /// Read up to `max_uncompressed_bytes` from a resource.
+    pub fn read_prefix(
+        &self,
+        resource_id: ResourceId,
+        max_uncompressed_bytes: usize,
+    ) -> Result<ResourceBytes, PageletError> {
+        self.read_with_limit(resource_id, Some(max_uncompressed_bytes))
+    }
+
     /// Return lazy read counters.
     #[must_use]
     pub fn stats(&self) -> StoreStats {
@@ -306,26 +332,51 @@ impl PublicationStore for ZipPublicationStore {
     }
 
     fn read(&self, resource_id: ResourceId) -> Result<ResourceBytes, PageletError> {
+        self.read_with_limit(resource_id, None)
+    }
+
+    fn open_stream(
+        &self,
+        resource_id: ResourceId,
+    ) -> Result<Box<dyn Read + Send + 'static>, PageletError> {
+        Ok(Box::new(Cursor::new(self.read(resource_id)?.bytes)))
+    }
+}
+
+impl ZipPublicationStore {
+    fn read_with_limit(
+        &self,
+        resource_id: ResourceId,
+        max_uncompressed_bytes: Option<usize>,
+    ) -> Result<ResourceBytes, PageletError> {
         let index = usize::try_from(resource_id.get()).map_err(|_| {
             PageletError::InvalidContainer(crate::core::ContainerError::new("invalid resource id"))
         })?;
         let entry = self.entries.get(index).ok_or_else(|| {
             PageletError::InvalidContainer(crate::core::ContainerError::new("unknown resource id"))
         })?;
-        if entry.compression_method != 0 {
-            return Err(PageletError::UnsupportedFeature(UnsupportedFeature::new(
-                "compressed ZIP entries are not supported by the M1 store yet",
-            )));
-        }
         let start = entry.data_offset;
         let end = start
             .checked_add(usize::try_from(entry.compressed_size).unwrap_or(usize::MAX))
             .ok_or_else(|| invalid_container("ZIP entry range overflows"))?;
-        let bytes = self
+        let compressed = self
             .bytes
             .get(start..end)
-            .ok_or_else(|| invalid_container("ZIP entry range is outside archive"))?
-            .to_vec();
+            .ok_or_else(|| invalid_container("ZIP entry range is outside archive"))?;
+        let bytes = match entry.compression_method {
+            0 => {
+                let len = max_uncompressed_bytes
+                    .map(|limit| limit.min(compressed.len()))
+                    .unwrap_or(compressed.len());
+                compressed[..len].to_vec()
+            }
+            8 => inflate_zip_entry(compressed, entry, max_uncompressed_bytes)?,
+            method => {
+                return Err(PageletError::UnsupportedFeature(UnsupportedFeature::new(
+                    format!("ZIP compression method {method} is not supported"),
+                )));
+            }
+        };
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.decompressed_bytes.fetch_add(
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -344,13 +395,40 @@ impl PublicationStore for ZipPublicationStore {
             bytes,
         })
     }
+}
 
-    fn open_stream(
-        &self,
-        resource_id: ResourceId,
-    ) -> Result<Box<dyn Read + Send + 'static>, PageletError> {
-        Ok(Box::new(Cursor::new(self.read(resource_id)?.bytes)))
+fn inflate_zip_entry(
+    compressed: &[u8],
+    entry: &ZipEntry,
+    max_uncompressed_bytes: Option<usize>,
+) -> Result<Vec<u8>, PageletError> {
+    let limit = max_uncompressed_bytes
+        .unwrap_or_else(|| usize::try_from(entry.uncompressed_size).unwrap_or(usize::MAX));
+    let bytes = match decompress_to_vec_with_limit(compressed, limit) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if max_uncompressed_bytes.is_some()
+                && error.status == TINFLStatus::HasMoreOutput
+                && !error.output.is_empty() =>
+        {
+            error.output
+        }
+        Err(error) => {
+            return Err(PageletError::InvalidContainer(
+                crate::core::ContainerError::new(format!(
+                    "deflate decode failed for {}: {}",
+                    entry.path, error
+                )),
+            ));
+        }
+    };
+    if max_uncompressed_bytes.is_none() && bytes.len() != entry.uncompressed_size as usize {
+        return Err(invalid_container(format!(
+            "deflated entry size mismatch for {}",
+            entry.path
+        )));
     }
+    Ok(bytes)
 }
 
 /// Parsed rootfile entry from `META-INF/container.xml`.
@@ -466,8 +544,8 @@ impl CapabilityReport {
         );
         report.push(
             "zip/deflate",
-            CapabilityStatus::UnsupportedDiagnosed,
-            "deflate entries are diagnosed until the full ZIP backend lands",
+            CapabilityStatus::SupportedWithLimitations,
+            "deflate entries are inflated with resource limits before use",
         );
         report.push(
             "epub/package",
@@ -531,9 +609,8 @@ pub fn open_book_ir_with_options(
     bytes: impl Into<Vec<u8>>,
     options: OpenOptions,
 ) -> Result<document::BookIr, PageletError> {
-    Ok(book_ir_from_summary(&open_book_with_options(
-        bytes, options,
-    )?))
+    let opened = open_book_context(bytes, options)?;
+    book_ir_from_opened(&opened, options)
 }
 
 /// Parse the first readable spine item into ChapterIR.
@@ -558,7 +635,7 @@ pub fn open_spine_item_chapter_ir_with_options(
     options: OpenOptions,
 ) -> Result<document::ChapterIr, PageletError> {
     let opened = open_book_context(bytes, options)?;
-    let book_ir = book_ir_from_summary(&opened.summary);
+    let book_ir = book_ir_from_opened(&opened, options)?;
     let manifest_item = spine_manifest_item(&opened.summary.package, spine_index)?;
     let bytes = opened
         .store
@@ -574,6 +651,7 @@ pub fn open_spine_item_chapter_ir_with_options(
         &title,
         &xhtml,
         &book_ir.resources,
+        Some(&opened.store),
         options,
     )
 }
@@ -701,6 +779,136 @@ fn book_ir_from_summary(book: &BookSummary) -> document::BookIr {
         navigation: navigation_ir(&book.navigation),
         resources,
         capabilities: capability_report_ir(&book.capability_report),
+    }
+}
+
+fn book_ir_from_opened(
+    opened: &OpenedBook,
+    options: OpenOptions,
+) -> Result<document::BookIr, PageletError> {
+    let mut ir = book_ir_from_summary(&opened.summary);
+    enrich_resource_table(&mut ir.resources, &opened.store, options)?;
+    Ok(ir)
+}
+
+fn enrich_resource_table(
+    resources: &mut document::ResourceTable,
+    store: &ZipPublicationStore,
+    options: OpenOptions,
+) -> Result<(), PageletError> {
+    let indexed = resources.resources.clone();
+    for resource in indexed {
+        match resource.kind {
+            document::ResourceKind::Image => {
+                let header = store.read_prefix(resource.id, IMAGE_HEADER_PREFIX_BYTES)?;
+                let size = parse_image_header(&header.bytes, &resource.media_type);
+                resources.set_image_size(resource.id, size);
+            }
+            document::ResourceKind::Font => {
+                let header = store.read_prefix(resource.id, IMAGE_HEADER_PREFIX_BYTES)?;
+                let mut fingerprint_bytes = Vec::new();
+                fingerprint_bytes.extend_from_slice(resource.path.as_bytes());
+                fingerprint_bytes.extend_from_slice(resource.media_type.as_bytes());
+                fingerprint_bytes.extend_from_slice(&resource.uncompressed_size.to_le_bytes());
+                fingerprint_bytes.extend_from_slice(&header.bytes);
+                resources
+                    .set_font_fingerprint(resource.id, ContentHash::from_bytes(&fingerprint_bytes));
+            }
+            _ => {}
+        }
+    }
+    let _ = options;
+    Ok(())
+}
+
+/// Parse intrinsic dimensions from a bounded image header.
+#[must_use]
+pub fn parse_image_header(bytes: &[u8], media_type: &str) -> Option<document::ImageSize> {
+    let lower = media_type.to_ascii_lowercase();
+    if lower == "image/png" || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return parse_png_size(bytes);
+    }
+    if lower == "image/gif" || bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return parse_gif_size(bytes);
+    }
+    if lower == "image/jpeg" || lower == "image/jpg" || bytes.starts_with(&[0xff, 0xd8]) {
+        return parse_jpeg_size(bytes);
+    }
+    None
+}
+
+fn parse_png_size(bytes: &[u8]) -> Option<document::ImageSize> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    if bytes.get(12..16) != Some(b"IHDR") {
+        return None;
+    }
+    let width = read_be_u32(bytes, 16)?;
+    let height = read_be_u32(bytes, 20)?;
+    non_zero_image_size(width, height)
+}
+
+fn parse_gif_size(bytes: &[u8]) -> Option<document::ImageSize> {
+    if bytes.len() < 10 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let width = u32::from(read_le_u16(bytes, 6)?);
+    let height = u32::from(read_le_u16(bytes, 8)?);
+    non_zero_image_size(width, height)
+}
+
+fn parse_jpeg_size(bytes: &[u8]) -> Option<document::ImageSize> {
+    if bytes.len() < 4 || bytes.get(0..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+
+    let mut cursor = 2;
+    while cursor + 4 <= bytes.len() {
+        while bytes.get(cursor) == Some(&0xff) {
+            cursor += 1;
+        }
+        let marker = *bytes.get(cursor)?;
+        cursor += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let segment_len = usize::from(read_be_u16(bytes, cursor)?);
+        if segment_len < 2 {
+            return None;
+        }
+        let segment_end = cursor.checked_add(segment_len)?;
+        if segment_end > bytes.len() {
+            return None;
+        }
+        if is_jpeg_sof_marker(marker) {
+            if cursor + 7 > bytes.len() {
+                return None;
+            }
+            let height = u32::from(read_be_u16(bytes, cursor + 3)?);
+            let width = u32::from(read_be_u16(bytes, cursor + 5)?);
+            return non_zero_image_size(width, height);
+        }
+        cursor = segment_end;
+    }
+    None
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf
+    )
+}
+
+fn non_zero_image_size(width: u32, height: u32) -> Option<document::ImageSize> {
+    if width == 0 || height == 0 {
+        None
+    } else {
+        Some(document::ImageSize { width, height })
     }
 }
 
@@ -1166,6 +1374,501 @@ pub fn parse_xhtml_tree(
     build_xhtml_tree(&tokens, mode, limits)
 }
 
+/// Parsed CSS stylesheet for the supported M2 subset.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CssStylesheet {
+    pub imports: Vec<CssImport>,
+    pub rules: Vec<CssRule>,
+    pub unsupported: Vec<CssUnsupportedDeclaration>,
+}
+
+/// One CSS `@import` rule.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CssImport {
+    pub href: String,
+    pub source_order: u32,
+}
+
+/// One parsed CSS rule.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CssRule {
+    pub selectors: Vec<CssSelector>,
+    pub declarations: Vec<CssDeclaration>,
+    pub source_order: u32,
+}
+
+/// Descendant selector made of simple compounds.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CssSelector {
+    pub parts: Vec<CssSimpleSelector>,
+    pub specificity: CssSpecificity,
+}
+
+/// One simple type/class/id selector compound.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CssSimpleSelector {
+    pub element: Option<String>,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+}
+
+/// CSS specificity tuple.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct CssSpecificity {
+    pub ids: u16,
+    pub classes: u16,
+    pub elements: u16,
+}
+
+/// CSS declaration.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CssDeclaration {
+    pub property: String,
+    pub value: String,
+    pub important: bool,
+}
+
+/// Unsupported declaration recorded as a diagnostic input.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CssUnsupportedDeclaration {
+    pub property: String,
+    pub value: String,
+}
+
+/// CSS element snapshot used by the cascade engine and fuzz targets.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CssElementSnapshot {
+    pub name: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+    pub inline_style: Option<String>,
+}
+
+/// Parse CSS supported by the M2 subset without regexes.
+pub fn parse_css(input: &str, limits: ResourceLimits) -> Result<CssStylesheet, PageletError> {
+    let input = strip_css_comments(input);
+    let mut cursor = 0;
+    let mut source_order = 0_u32;
+    let mut stylesheet = CssStylesheet::default();
+
+    while cursor < input.len() {
+        skip_css_ws(&input, &mut cursor);
+        if cursor >= input.len() {
+            break;
+        }
+        if input[cursor..].starts_with("@import") {
+            let start = cursor + "@import".len();
+            let Some(relative_end) = input[start..].find(';') else {
+                return Err(PageletError::Parse(ParseError::new(
+                    "unterminated CSS @import",
+                )));
+            };
+            let import_body = input[start..start + relative_end].trim();
+            if let Some(href) = parse_css_import_href(import_body) {
+                stylesheet.imports.push(CssImport { href, source_order });
+                source_order = source_order.saturating_add(1);
+            }
+            cursor = start + relative_end + 1;
+            continue;
+        }
+
+        let Some(open_relative) = input[cursor..].find('{') else {
+            break;
+        };
+        let selector_text = input[cursor..cursor + open_relative].trim();
+        let body_start = cursor + open_relative + 1;
+        let Some(close_relative) = input[body_start..].find('}') else {
+            return Err(PageletError::Parse(ParseError::new(
+                "unterminated CSS rule",
+            )));
+        };
+        let body_end = body_start + close_relative;
+        let selectors = parse_css_selectors(selector_text, limits)?;
+        if !selectors.is_empty() {
+            let (declarations, unsupported) = parse_css_declarations(&input[body_start..body_end]);
+            stylesheet.unsupported.extend(unsupported);
+            stylesheet.rules.push(CssRule {
+                selectors,
+                declarations,
+                source_order,
+            });
+            source_order = source_order.saturating_add(1);
+        }
+        cursor = body_end + 1;
+    }
+
+    Ok(stylesheet)
+}
+
+/// Compute a style for one element snapshot and its ancestors.
+pub fn cascade_css_for_element(
+    element: &CssElementSnapshot,
+    ancestors: &[CssElementSnapshot],
+    stylesheet: &CssStylesheet,
+    inherited: &document::ComputedStyle,
+) -> document::ComputedStyle {
+    let mut winners = BTreeMap::<String, (CssSpecificity, u32, bool, String)>::new();
+    for (name, value) in inherited
+        .properties
+        .iter()
+        .filter(|(name, _)| is_inherited_css_property(name))
+    {
+        winners.insert(
+            name.to_string(),
+            (CssSpecificity::default(), 0, false, value.to_string()),
+        );
+    }
+
+    for rule in &stylesheet.rules {
+        for selector in &rule.selectors {
+            if selector_matches(selector, element, ancestors) {
+                for declaration in &rule.declarations {
+                    if !is_supported_css_property(&declaration.property) {
+                        continue;
+                    }
+                    let candidate = (
+                        selector.specificity,
+                        rule.source_order,
+                        declaration.important,
+                        declaration.value.clone(),
+                    );
+                    let replace = winners
+                        .get(&declaration.property)
+                        .is_none_or(|existing| css_candidate_wins(&candidate, existing));
+                    if replace {
+                        winners.insert(declaration.property.clone(), candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(inline_style) = &element.inline_style {
+        let (declarations, _) = parse_css_declarations(inline_style);
+        for (source_order, declaration) in declarations.into_iter().enumerate() {
+            if !is_supported_css_property(&declaration.property) {
+                continue;
+            }
+            winners.insert(
+                declaration.property,
+                (
+                    CssSpecificity {
+                        ids: u16::MAX,
+                        classes: u16::MAX,
+                        elements: u16::MAX,
+                    },
+                    u32::try_from(source_order).unwrap_or(u32::MAX),
+                    declaration.important,
+                    declaration.value,
+                ),
+            );
+        }
+    }
+
+    let mut style = document::ComputedStyle::new();
+    for (name, (_, _, _, value)) in winners {
+        style = style.with_property(name, value);
+    }
+    style
+}
+
+fn strip_css_comments(input: &str) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        if input[cursor..].starts_with("/*") {
+            if let Some(end) = input[cursor + 2..].find("*/") {
+                cursor += 2 + end + 2;
+            } else {
+                break;
+            }
+        } else if let Some(ch) = input[cursor..].chars().next() {
+            out.push(ch);
+            cursor += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn skip_css_ws(input: &str, cursor: &mut usize) {
+    while input
+        .as_bytes()
+        .get(*cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        *cursor += 1;
+    }
+}
+
+fn parse_css_import_href(input: &str) -> Option<String> {
+    let input = input.trim();
+    if let Some(value) = input.strip_prefix("url(") {
+        return value
+            .split(')')
+            .next()
+            .map(|href| href.trim().trim_matches('"').trim_matches('\'').to_owned())
+            .filter(|href| !href.is_empty());
+    }
+    input
+        .trim_matches('"')
+        .trim_matches('\'')
+        .split_whitespace()
+        .next()
+        .map(ToOwned::to_owned)
+        .filter(|href| !href.is_empty())
+}
+
+fn parse_css_selectors(
+    input: &str,
+    limits: ResourceLimits,
+) -> Result<Vec<CssSelector>, PageletError> {
+    let mut selectors = Vec::new();
+    for raw in input.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let observed = u64::try_from(selectors.len().saturating_add(1)).unwrap_or(u64::MAX);
+        if observed > u64::from(limits.max_css_selectors) {
+            return Err(limit_error(
+                ResourceLimitKind::CssSelectors,
+                u64::from(limits.max_css_selectors),
+                observed,
+            ));
+        }
+        let mut parts = Vec::new();
+        for compound in raw.split_whitespace() {
+            if let Some(selector) = parse_css_simple_selector(compound) {
+                parts.push(selector);
+            }
+        }
+        if !parts.is_empty() {
+            selectors.push(CssSelector {
+                specificity: css_specificity(&parts),
+                parts,
+            });
+        }
+    }
+    Ok(selectors)
+}
+
+fn parse_css_simple_selector(input: &str) -> Option<CssSimpleSelector> {
+    let mut selector = CssSimpleSelector::default();
+    let bytes = input.as_bytes();
+    let mut cursor = 0;
+    if bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'*')
+    {
+        let start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+        {
+            cursor += 1;
+        }
+        if &input[start..cursor] != "*" {
+            selector.element = Some(input[start..cursor].to_ascii_lowercase());
+        }
+    }
+
+    while cursor < input.len() {
+        let marker = bytes[cursor];
+        if marker != b'.' && marker != b'#' {
+            return None;
+        }
+        cursor += 1;
+        let start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+        {
+            cursor += 1;
+        }
+        if start == cursor {
+            return None;
+        }
+        let value = input[start..cursor].to_owned();
+        if marker == b'#' {
+            selector.id = Some(value);
+        } else {
+            selector.classes.push(value);
+        }
+    }
+
+    Some(selector)
+}
+
+fn css_specificity(parts: &[CssSimpleSelector]) -> CssSpecificity {
+    let mut specificity = CssSpecificity::default();
+    for part in parts {
+        if part.id.is_some() {
+            specificity.ids = specificity.ids.saturating_add(1);
+        }
+        specificity.classes = specificity
+            .classes
+            .saturating_add(u16::try_from(part.classes.len()).unwrap_or(u16::MAX));
+        if part.element.is_some() {
+            specificity.elements = specificity.elements.saturating_add(1);
+        }
+    }
+    specificity
+}
+
+fn parse_css_declarations(input: &str) -> (Vec<CssDeclaration>, Vec<CssUnsupportedDeclaration>) {
+    let mut declarations = Vec::new();
+    let mut unsupported = Vec::new();
+    for raw in input.split(';') {
+        let Some((property, value)) = raw.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let mut value = value.trim().to_owned();
+        let important = value.to_ascii_lowercase().ends_with("!important");
+        if important {
+            let len = value.len().saturating_sub("!important".len());
+            value = value[..len].trim().to_owned();
+        }
+        if property.is_empty() || value.is_empty() {
+            continue;
+        }
+        if is_supported_css_property(&property) {
+            declarations.push(CssDeclaration {
+                property,
+                value,
+                important,
+            });
+        } else {
+            unsupported.push(CssUnsupportedDeclaration { property, value });
+        }
+    }
+    (declarations, unsupported)
+}
+
+fn is_supported_css_property(property: &str) -> bool {
+    matches!(
+        property,
+        "display"
+            | "visibility"
+            | "font-family"
+            | "font-size"
+            | "font-weight"
+            | "font-style"
+            | "line-height"
+            | "letter-spacing"
+            | "text-align"
+            | "text-indent"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
+            | "width"
+            | "height"
+            | "max-width"
+            | "max-height"
+            | "break-before"
+            | "break-after"
+            | "break-inside"
+            | "page-break-before"
+            | "page-break-after"
+            | "page-break-inside"
+            | "widows"
+            | "orphans"
+            | "direction"
+            | "writing-mode"
+    )
+}
+
+fn is_inherited_css_property(property: &str) -> bool {
+    matches!(
+        property,
+        "visibility"
+            | "font-family"
+            | "font-size"
+            | "font-weight"
+            | "font-style"
+            | "line-height"
+            | "letter-spacing"
+            | "text-align"
+            | "text-indent"
+            | "widows"
+            | "orphans"
+            | "direction"
+            | "writing-mode"
+    )
+}
+
+fn selector_matches(
+    selector: &CssSelector,
+    element: &CssElementSnapshot,
+    ancestors: &[CssElementSnapshot],
+) -> bool {
+    let Some(last) = selector.parts.last() else {
+        return false;
+    };
+    if !simple_selector_matches(last, element) {
+        return false;
+    }
+    if selector.parts.len() == 1 {
+        return true;
+    }
+
+    let mut ancestor_index = ancestors.len();
+    for part in selector.parts[..selector.parts.len() - 1].iter().rev() {
+        let mut found = false;
+        while ancestor_index > 0 {
+            ancestor_index -= 1;
+            if simple_selector_matches(part, &ancestors[ancestor_index]) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+fn simple_selector_matches(selector: &CssSimpleSelector, element: &CssElementSnapshot) -> bool {
+    if selector
+        .element
+        .as_deref()
+        .is_some_and(|name| name != element.name)
+    {
+        return false;
+    }
+    if selector
+        .id
+        .as_deref()
+        .is_some_and(|id| element.id.as_deref() != Some(id))
+    {
+        return false;
+    }
+    selector
+        .classes
+        .iter()
+        .all(|class| element.classes.iter().any(|item| item == class))
+}
+
+fn css_candidate_wins(
+    candidate: &(CssSpecificity, u32, bool, String),
+    existing: &(CssSpecificity, u32, bool, String),
+) -> bool {
+    if candidate.2 != existing.2 {
+        return candidate.2;
+    }
+    (candidate.0, candidate.1) >= (existing.0, existing.1)
+}
+
 fn build_xhtml_tree(
     tokens: &[XhtmlToken],
     mode: CompatibilityMode,
@@ -1387,12 +2090,146 @@ fn local_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
 
+fn load_css_cascade(
+    tree: &XhtmlDocument,
+    document_href: &str,
+    resources: &document::ResourceTable,
+    store: Option<&ZipPublicationStore>,
+    options: OpenOptions,
+) -> Result<CssStylesheet, PageletError> {
+    let mut cascade = CssStylesheet::default();
+    let base_dir = parent_path(document_href);
+    let mut linked = Vec::new();
+    collect_linked_stylesheets(tree, tree.root, &mut linked);
+    let mut visited = BTreeSet::new();
+    for href in linked {
+        let path = resolve_resource_path(&base_dir, &href)?;
+        if resources.id_for_path(&path).is_none() {
+            continue;
+        }
+        if let Some(store) = store {
+            load_css_resource(store, &path, options, &mut visited, 0, &mut cascade)?;
+        }
+    }
+
+    let mut inline_styles = Vec::new();
+    collect_style_elements(tree, tree.root, &mut inline_styles);
+    for css in inline_styles {
+        merge_css_stylesheet(&mut cascade, parse_css(&css, options.limits)?);
+    }
+    Ok(cascade)
+}
+
+fn collect_linked_stylesheets(tree: &XhtmlDocument, node_id: usize, out: &mut Vec<String>) {
+    let Some(node) = tree.node(node_id) else {
+        return;
+    };
+    let Some(element) = node.element() else {
+        return;
+    };
+    if element.local_name() == "link"
+        && element
+            .attr("rel")
+            .is_some_and(|value| value.split_whitespace().any(|item| item == "stylesheet"))
+        && element.attr("href").is_some()
+    {
+        out.push(element.attr("href").unwrap_or_default().to_owned());
+    }
+    for child in &element.children {
+        collect_linked_stylesheets(tree, *child, out);
+    }
+}
+
+fn collect_style_elements(tree: &XhtmlDocument, node_id: usize, out: &mut Vec<String>) {
+    let Some(node) = tree.node(node_id) else {
+        return;
+    };
+    let Some(element) = node.element() else {
+        return;
+    };
+    if element.local_name() == "style" {
+        let mut css = String::new();
+        collect_raw_text(tree, node_id, &mut css);
+        out.push(css);
+    }
+    for child in &element.children {
+        collect_style_elements(tree, *child, out);
+    }
+}
+
+fn collect_raw_text(tree: &XhtmlDocument, node_id: usize, out: &mut String) {
+    let Some(node) = tree.node(node_id) else {
+        return;
+    };
+    match &node.kind {
+        XhtmlNodeKind::Text(text) => out.push_str(text),
+        XhtmlNodeKind::Element(element) => {
+            for child in &element.children {
+                collect_raw_text(tree, *child, out);
+            }
+        }
+    }
+}
+
+fn load_css_resource(
+    store: &ZipPublicationStore,
+    path: &str,
+    options: OpenOptions,
+    visited: &mut BTreeSet<String>,
+    depth: u32,
+    cascade: &mut CssStylesheet,
+) -> Result<(), PageletError> {
+    if depth > options.limits.max_css_import_depth {
+        return Err(limit_error(
+            ResourceLimitKind::CssImportDepth,
+            u64::from(options.limits.max_css_import_depth),
+            u64::from(depth),
+        ));
+    }
+    if !visited.insert(path.to_owned()) {
+        return Err(PageletError::Parse(ParseError::new(format!(
+            "CSS import cycle detected at {path}"
+        ))));
+    }
+    let bytes = store.read_path(path, options.compatibility_mode)?;
+    let text = resource_text(&bytes)?;
+    let stylesheet = parse_css(&text, options.limits)?;
+    let imports = stylesheet.imports.clone();
+
+    let base_dir = parent_path(path);
+    for import in imports {
+        let import_path = resolve_resource_path(&base_dir, &import.href)?;
+        load_css_resource(
+            store,
+            &import_path,
+            options,
+            visited,
+            depth.saturating_add(1),
+            cascade,
+        )?;
+    }
+    merge_css_stylesheet(cascade, stylesheet);
+    visited.remove(path);
+    Ok(())
+}
+
+fn merge_css_stylesheet(target: &mut CssStylesheet, mut source: CssStylesheet) {
+    let base = u32::try_from(target.rules.len()).unwrap_or(u32::MAX);
+    for rule in &mut source.rules {
+        rule.source_order = rule.source_order.saturating_add(base);
+    }
+    target.imports.extend(source.imports);
+    target.rules.extend(source.rules);
+    target.unsupported.extend(source.unsupported);
+}
+
 fn chapter_ir_from_xhtml(
     document_id: DocumentId,
     href: &str,
     title: &str,
     input: &str,
     resources: &document::ResourceTable,
+    store: Option<&ZipPublicationStore>,
     options: OpenOptions,
 ) -> Result<document::ChapterIr, PageletError> {
     let content_hash = ContentHash::from_bytes(input.as_bytes());
@@ -1406,13 +2243,28 @@ fn chapter_ir_from_xhtml(
             }
         },
     };
+    let css = load_css_cascade(&tree, href, resources, store, options)?;
+    let base_dir = parent_path(href);
+    let mut referenced_footnote_keys = BTreeSet::new();
+    collect_referenced_footnote_keys(
+        &tree,
+        tree.root,
+        href,
+        &base_dir,
+        &mut referenced_footnote_keys,
+    );
 
     let mut builder = ChapterBuilder {
         document_href: href,
-        base_dir: parent_path(href),
+        base_dir,
         resources,
+        store,
+        options,
+        css,
+        referenced_footnote_keys,
         chapter: document::ChapterIr::empty(document_id, href, title, content_hash),
         default_style: StyleId::new(0),
+        computed_styles: BTreeMap::new(),
         tree: &tree,
     };
     builder.build()
@@ -1453,24 +2305,35 @@ struct ChapterBuilder<'a> {
     document_href: &'a str,
     base_dir: String,
     resources: &'a document::ResourceTable,
+    store: Option<&'a ZipPublicationStore>,
+    options: OpenOptions,
+    css: CssStylesheet,
+    referenced_footnote_keys: BTreeSet<String>,
     chapter: document::ChapterIr,
     default_style: StyleId,
+    computed_styles: BTreeMap<usize, (StyleId, document::ComputedStyle)>,
     tree: &'a XhtmlDocument,
 }
 
 impl ChapterBuilder<'_> {
     fn build(&mut self) -> Result<document::ChapterIr, PageletError> {
+        for unsupported in &self.css.unsupported {
+            self.chapter.diagnostics.push(Diagnostic::new(
+                DiagnosticCode::UnsupportedFeature,
+                Severity::Warning,
+                format!("unsupported CSS property: {}", unsupported.property),
+            ));
+        }
         let content_root = self.content_root();
         let children = self.convert_children(content_root)?;
+        let style = self.style_for_node(content_root)?;
         let root_range = self.tree.node(content_root).map(|node| node.source_range);
         let root = self.push_node(
-            document::DocumentNode::Container(document::ContainerNode {
-                children,
-                style: self.default_style,
-            }),
+            document::DocumentNode::Container(document::ContainerNode { children, style }),
             root_range,
         )?;
         self.chapter.root = root;
+        self.resolve_footnotes()?;
         self.chapter.rebuild_utf16_index();
         Ok(self.chapter.clone())
     }
@@ -1518,10 +2381,14 @@ impl ChapterBuilder<'_> {
                 if text.is_empty() {
                     return Ok(None);
                 }
+                let style = self
+                    .parent_node(node_id)
+                    .map_or(Ok(self.default_style), |parent| self.style_for_node(parent))?;
                 Ok(Some(self.text_block_node(
                     DocumentNodeKind::Paragraph,
                     text,
                     source_range,
+                    style,
                 )?))
             }
             XhtmlNodeKind::Element(element) => self.convert_element(node_id, &element),
@@ -1534,21 +2401,19 @@ impl ChapterBuilder<'_> {
         element: &XhtmlElement,
     ) -> Result<Option<NodeId>, PageletError> {
         let source_range = self.tree.node(node_id).map(|node| node.source_range);
+        let style = self.style_for_node(node_id)?;
         let converted = match element.local_name() {
             "html" | "body" | "section" | "article" | "main" | "div" | "nav" => {
                 let children = self.convert_children(node_id)?;
                 Some(self.push_node(
-                    document::DocumentNode::Container(document::ContainerNode {
-                        children,
-                        style: self.default_style,
-                    }),
+                    document::DocumentNode::Container(document::ContainerNode { children, style }),
                     source_range,
                 )?)
             }
-            "p" => Some(self.block_text_node(node_id, DocumentNodeKind::Paragraph)?),
+            "p" => Some(self.block_text_node(node_id, DocumentNodeKind::Paragraph, style)?),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = element.local_name()[1..].parse::<u8>().unwrap_or(1);
-                Some(self.heading_node(node_id, level)?)
+                Some(self.heading_node(node_id, level, style)?)
             }
             "ul" | "ol" => {
                 let children = self.convert_children(node_id)?;
@@ -1556,7 +2421,7 @@ impl ChapterBuilder<'_> {
                     document::DocumentNode::List(document::ListNode {
                         ordered: element.local_name() == "ol",
                         children,
-                        style: self.default_style,
+                        style,
                     }),
                     source_range,
                 )?)
@@ -1574,52 +2439,44 @@ impl ChapterBuilder<'_> {
                                     .node(node_id)
                                     .map(|node| node.source_range)
                                     .unwrap_or_default(),
+                                style,
                             )?,
                         );
                     }
                 }
                 Some(self.push_node(
-                    document::DocumentNode::ListItem(document::ListItemNode {
-                        children,
-                        style: self.default_style,
-                    }),
+                    document::DocumentNode::ListItem(document::ListItemNode { children, style }),
                     source_range,
                 )?)
             }
             "blockquote" => {
                 let children = self.convert_children(node_id)?;
                 Some(self.push_node(
-                    document::DocumentNode::BlockQuote(document::ContainerNode {
-                        children,
-                        style: self.default_style,
-                    }),
+                    document::DocumentNode::BlockQuote(document::ContainerNode { children, style }),
                     source_range,
                 )?)
             }
             "figure" => {
                 let children = self.convert_children(node_id)?;
                 Some(self.push_node(
-                    document::DocumentNode::Figure(document::ContainerNode {
-                        children,
-                        style: self.default_style,
-                    }),
+                    document::DocumentNode::Figure(document::ContainerNode { children, style }),
                     source_range,
                 )?)
             }
             "table" => {
                 let children = self.convert_children(node_id)?;
                 Some(self.push_node(
-                    document::DocumentNode::Table(document::ContainerNode {
-                        children,
-                        style: self.default_style,
-                    }),
+                    document::DocumentNode::Table(document::ContainerNode { children, style }),
                     source_range,
                 )?)
             }
-            "img" => Some(self.image_node(element, source_range)?),
+            "img" => Some(self.image_node(element, source_range, style)?),
             "hr" => Some(self.push_node(document::DocumentNode::Divider, source_range)?),
             "br" => Some(self.push_node(document::DocumentNode::ForcedBreak, source_range)?),
-            "aside" if is_footnote_element(element) => Some(self.footnote_node(node_id, element)?),
+            "aside" if is_footnote_element(element) && self.footnote_is_referenced(element) => {
+                Some(self.footnote_node(node_id, element, style)?)
+            }
+            "aside" if is_footnote_element(element) => None,
             "a" | "span" | "em" | "strong" | "b" | "i" => {
                 let text = self.inline_text(node_id).0;
                 let text = text.trim();
@@ -1630,6 +2487,7 @@ impl ChapterBuilder<'_> {
                         DocumentNodeKind::Paragraph,
                         text,
                         source_range.unwrap_or_default(),
+                        style,
                     )?)
                 }
             }
@@ -1639,7 +2497,7 @@ impl ChapterBuilder<'_> {
                     document::DocumentNode::Unsupported(document::UnsupportedNode {
                         element: Arc::from(element.name.as_str()),
                         children,
-                        style: self.default_style,
+                        style,
                     }),
                     source_range,
                 )?)
@@ -1658,24 +2516,28 @@ impl ChapterBuilder<'_> {
         &mut self,
         tree_node_id: usize,
         kind: DocumentNodeKind,
+        style: StyleId,
     ) -> Result<NodeId, PageletError> {
         let (text, links, anchors) = self.inline_text(tree_node_id);
         let source_range = self.tree.node(tree_node_id).map(|node| node.source_range);
-        let node_id = self.text_block_node(kind, text.trim(), source_range.unwrap_or_default())?;
+        let node_id =
+            self.text_block_node(kind, text.trim(), source_range.unwrap_or_default(), style)?;
         self.add_inline_metadata(node_id, links, anchors);
         Ok(node_id)
     }
 
-    fn heading_node(&mut self, tree_node_id: usize, level: u8) -> Result<NodeId, PageletError> {
+    fn heading_node(
+        &mut self,
+        tree_node_id: usize,
+        level: u8,
+        style: StyleId,
+    ) -> Result<NodeId, PageletError> {
         let (text, links, anchors) = self.inline_text(tree_node_id);
         let text = self.chapter.text_pool.push(text.trim())?;
         let node_id = self.push_node(
             document::DocumentNode::Heading(document::HeadingNode {
                 level,
-                content: document::BlockText {
-                    text,
-                    style: self.default_style,
-                },
+                content: document::BlockText { text, style },
             }),
             self.tree.node(tree_node_id).map(|node| node.source_range),
         )?;
@@ -1688,12 +2550,10 @@ impl ChapterBuilder<'_> {
         kind: DocumentNodeKind,
         text: &str,
         source_range: SourceRange,
+        style: StyleId,
     ) -> Result<NodeId, PageletError> {
         let text = self.chapter.text_pool.push(text)?;
-        let block = document::BlockText {
-            text,
-            style: self.default_style,
-        };
+        let block = document::BlockText { text, style };
         let node = match kind {
             DocumentNodeKind::Paragraph => document::DocumentNode::Paragraph(block),
         };
@@ -1704,6 +2564,7 @@ impl ChapterBuilder<'_> {
         &mut self,
         element: &XhtmlElement,
         source_range: Option<SourceRange>,
+        style: StyleId,
     ) -> Result<NodeId, PageletError> {
         let src = element.attr("src").unwrap_or_default();
         let resolved_path = resolve_resource_path(&self.base_dir, src).ok();
@@ -1717,7 +2578,7 @@ impl ChapterBuilder<'_> {
                 resource_id,
                 alt: Arc::from(element.attr("alt").unwrap_or_default()),
                 title: element.attr("title").map(Arc::from),
-                style: self.default_style,
+                style,
             }),
             source_range,
         )
@@ -1727,6 +2588,7 @@ impl ChapterBuilder<'_> {
         &mut self,
         tree_node_id: usize,
         element: &XhtmlElement,
+        style: StyleId,
     ) -> Result<NodeId, PageletError> {
         let mut children = self.convert_children(tree_node_id)?;
         if children.is_empty() {
@@ -1742,18 +2604,184 @@ impl ChapterBuilder<'_> {
                     DocumentNodeKind::Paragraph,
                     text,
                     source_range,
+                    style,
                 )?);
             }
         }
         self.push_node(
             document::DocumentNode::Footnote(document::FootnoteNode {
-                note_id: element.attr("id").map(Arc::from),
+                note_id: xhtml_element_id(element).map(Arc::from),
                 children,
                 backlink: None,
-                style: self.default_style,
+                style,
             }),
             self.tree.node(tree_node_id).map(|node| node.source_range),
         )
+    }
+
+    fn footnote_is_referenced(&self, element: &XhtmlElement) -> bool {
+        xhtml_element_id(element).is_some_and(|fragment| {
+            self.referenced_footnote_keys
+                .contains(&format!("{}#{fragment}", self.document_href))
+        })
+    }
+
+    fn style_for_node(&mut self, tree_node_id: usize) -> Result<StyleId, PageletError> {
+        if let Some((id, _)) = self.computed_styles.get(&tree_node_id) {
+            return Ok(*id);
+        }
+        let Some(element) = self.tree.node(tree_node_id).and_then(XhtmlNode::element) else {
+            return Ok(self.default_style);
+        };
+
+        let inherited = if let Some(parent) = self.parent_node(tree_node_id) {
+            let parent_id = self.style_for_node(parent)?;
+            self.chapter
+                .styles
+                .get(parent_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            document::ComputedStyle::new()
+        };
+        let snapshot = self.snapshot_for_element(element);
+        let ancestors = self.ancestor_snapshots(tree_node_id);
+        let style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &inherited);
+        let style_id = self.chapter.styles.intern(style.clone())?;
+        self.computed_styles.insert(tree_node_id, (style_id, style));
+        Ok(style_id)
+    }
+
+    fn snapshot_for_element(&self, element: &XhtmlElement) -> CssElementSnapshot {
+        CssElementSnapshot {
+            name: element.local_name().to_ascii_lowercase(),
+            id: element.attr("id").map(ToOwned::to_owned),
+            classes: element
+                .attr("class")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect(),
+            inline_style: element.attr("style").map(ToOwned::to_owned),
+        }
+    }
+
+    fn ancestor_snapshots(&self, tree_node_id: usize) -> Vec<CssElementSnapshot> {
+        let mut ancestors = Vec::new();
+        let mut current = tree_node_id;
+        while let Some(parent) = self.parent_node(current) {
+            if let Some(element) = self.tree.node(parent).and_then(XhtmlNode::element) {
+                ancestors.push(self.snapshot_for_element(element));
+            }
+            current = parent;
+        }
+        ancestors.reverse();
+        ancestors
+    }
+
+    fn parent_node(&self, child_id: usize) -> Option<usize> {
+        self.parent_node_from(self.tree.root, child_id)
+    }
+
+    fn parent_node_from(&self, current: usize, child_id: usize) -> Option<usize> {
+        let element = self.tree.node(current)?.element()?;
+        if element.children.contains(&child_id) {
+            return Some(current);
+        }
+        element
+            .children
+            .iter()
+            .find_map(|child| self.parent_node_from(*child, child_id))
+    }
+
+    fn resolve_footnotes(&mut self) -> Result<(), PageletError> {
+        let links = self
+            .chapter
+            .links
+            .iter()
+            .filter(|link| link.kind == document::LinkKind::Footnote)
+            .cloned()
+            .collect::<Vec<_>>();
+        for link in links {
+            let Some(fragment) = link.fragment.as_deref() else {
+                continue;
+            };
+            if let Some(note_id) = self.find_footnote_by_fragment(fragment) {
+                self.set_footnote_backlink(note_id, link);
+                continue;
+            }
+            if link.resolved_document.as_deref() != Some(self.document_href) {
+                self.add_external_footnote(&link)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn find_footnote_by_fragment(&self, fragment: &str) -> Option<NodeId> {
+        self.chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                if let document::DocumentNode::Footnote(note) = node {
+                    if note.note_id.as_deref() == Some(fragment) {
+                        return Some(node_id);
+                    }
+                }
+                None
+            })
+    }
+
+    fn set_footnote_backlink(&mut self, node_id: NodeId, link: document::LinkTarget) {
+        if let Some(document::DocumentNode::Footnote(note)) = self.chapter.nodes.get_mut(node_id) {
+            note.backlink = Some(link);
+        }
+    }
+
+    fn add_external_footnote(&mut self, link: &document::LinkTarget) -> Result<(), PageletError> {
+        let Some(store) = self.store else {
+            return Ok(());
+        };
+        let Some(document_href) = link.resolved_document.as_deref() else {
+            return Ok(());
+        };
+        let Some(fragment) = link.fragment.as_deref() else {
+            return Ok(());
+        };
+        let bytes = store.read_path(document_href, self.options.compatibility_mode)?;
+        let text = resource_text(&bytes)?;
+        let tree = parse_xhtml_tree(&text, CompatibilityMode::Compatible, self.options.limits)?;
+        let Some(note_tree_id) = find_xhtml_element_by_id(&tree, tree.root, fragment) else {
+            return Ok(());
+        };
+        let mut note_text = String::new();
+        collect_visible_xhtml_text(&tree, note_tree_id, &mut note_text);
+        let note_text = note_text.trim();
+        if note_text.is_empty() {
+            return Ok(());
+        }
+        let text_range = self.chapter.text_pool.push(note_text)?;
+        let paragraph =
+            self.chapter
+                .nodes
+                .push(document::DocumentNode::Paragraph(document::BlockText {
+                    text: text_range,
+                    style: self.default_style,
+                }))?;
+        let footnote =
+            self.chapter
+                .nodes
+                .push(document::DocumentNode::Footnote(document::FootnoteNode {
+                    note_id: Some(Arc::from(fragment)),
+                    children: vec![paragraph],
+                    backlink: Some(link.clone()),
+                    style: self.default_style,
+                }))?;
+        if let Some(document::DocumentNode::Container(root)) =
+            self.chapter.nodes.get_mut(self.chapter.root)
+        {
+            root.children.push(footnote);
+        }
+        Ok(())
     }
 
     fn push_node(
@@ -1787,7 +2815,7 @@ impl ChapterBuilder<'_> {
         match &node.kind {
             XhtmlNodeKind::Text(value) => text.push_str(value),
             XhtmlNodeKind::Element(element) => {
-                if let Some(id) = element.attr("id") {
+                if let Some(id) = xhtml_element_id(element) {
                     anchors.push(AnchorDraft {
                         fragment: Arc::from(id),
                         source_range: Some(node.source_range),
@@ -1809,11 +2837,7 @@ impl ChapterBuilder<'_> {
                             links.push(LinkDraft {
                                 href: Arc::from(href),
                                 source_range: Some(node.source_range),
-                                kind: if element
-                                    .attr("epub:type")
-                                    .or_else(|| element.attr("role"))
-                                    .is_some_and(|value| value.contains("noteref"))
-                                {
+                                kind: if is_noteref_element(element) {
                                     document::LinkKind::Footnote
                                 } else {
                                     document::LinkKind::Internal
@@ -1866,7 +2890,7 @@ impl ChapterBuilder<'_> {
         node_id: NodeId,
         source_range: Option<SourceRange>,
     ) {
-        if let Some(fragment) = element.attr("id") {
+        if let Some(fragment) = xhtml_element_id(element) {
             self.chapter.anchors.insert(document::Anchor {
                 key: Arc::from(format!("{}#{}", self.document_href, fragment)),
                 document_href: Arc::from(self.document_href),
@@ -1965,6 +2989,102 @@ fn is_footnote_element(element: &XhtmlElement) -> bool {
         || element
             .attr("class")
             .is_some_and(|value| value.contains("footnote") || value.contains("endnote"))
+}
+
+fn is_noteref_element(element: &XhtmlElement) -> bool {
+    element
+        .attr("epub:type")
+        .or_else(|| element.attr("role"))
+        .is_some_and(|value| value.contains("noteref"))
+}
+
+fn xhtml_element_id(element: &XhtmlElement) -> Option<&str> {
+    element.attr("id").or_else(|| element.attr("xml:id"))
+}
+
+fn collect_referenced_footnote_keys(
+    tree: &XhtmlDocument,
+    node_id: usize,
+    document_href: &str,
+    base_dir: &str,
+    out: &mut BTreeSet<String>,
+) {
+    let Some(node) = tree.node(node_id) else {
+        return;
+    };
+    let Some(element) = node.element() else {
+        return;
+    };
+    if element.local_name() == "a" && is_noteref_element(element) {
+        if let Some(href) = element.attr("href") {
+            if let Some((resolved_document, fragment)) =
+                resolve_footnote_href(document_href, base_dir, href)
+            {
+                out.insert(format!("{resolved_document}#{fragment}"));
+            }
+        }
+    }
+    for child in &element.children {
+        collect_referenced_footnote_keys(tree, *child, document_href, base_dir, out);
+    }
+}
+
+fn resolve_footnote_href(
+    document_href: &str,
+    base_dir: &str,
+    href: &str,
+) -> Option<(String, String)> {
+    let (path, fragment) = href.split_once('#')?;
+    if fragment.is_empty() {
+        return None;
+    }
+    let resolved_document = if path.is_empty() {
+        document_href.to_owned()
+    } else {
+        resolve_resource_path(base_dir, path).ok()?
+    };
+    Some((resolved_document, fragment.to_owned()))
+}
+
+fn find_xhtml_element_by_id(tree: &XhtmlDocument, node_id: usize, id: &str) -> Option<usize> {
+    let node = tree.node(node_id)?;
+    let element = node.element()?;
+    if xhtml_element_id(element) == Some(id) {
+        return Some(node_id);
+    }
+    element
+        .children
+        .iter()
+        .find_map(|child| find_xhtml_element_by_id(tree, *child, id))
+}
+
+fn collect_visible_xhtml_text(tree: &XhtmlDocument, node_id: usize, out: &mut String) {
+    let Some(node) = tree.node(node_id) else {
+        return;
+    };
+    match &node.kind {
+        XhtmlNodeKind::Text(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            if !out.is_empty() && !out.chars().last().is_some_and(char::is_whitespace) {
+                out.push(' ');
+            }
+            out.push_str(text);
+        }
+        XhtmlNodeKind::Element(element) => {
+            if matches!(
+                element.local_name(),
+                "head" | "script" | "style" | "title" | "meta" | "link"
+            ) {
+                return;
+            }
+            for child in &element.children {
+                collect_visible_xhtml_text(tree, *child, out);
+            }
+        }
+    }
 }
 
 fn parse_container(
@@ -2192,10 +3312,12 @@ fn index_zip_entries(bytes: &[u8], options: OpenOptions) -> Result<Vec<ZipEntry>
 
     let mut entries = Vec::with_capacity(entry_count);
     let mut cursor = central_offset;
+    let mut records_seen = 0_usize;
     while cursor < central_end {
         if read_u32(bytes, cursor)? != 0x0201_4b50 {
             return Err(invalid_container("invalid central directory header"));
         }
+        records_seen = records_seen.saturating_add(1);
         let compression_method = read_u16(bytes, cursor + 10)?;
         let compressed_size = u64::from(read_u32(bytes, cursor + 20)?);
         let uncompressed_size = u64::from(read_u32(bytes, cursor + 24)?);
@@ -2215,20 +3337,22 @@ fn index_zip_entries(bytes: &[u8], options: OpenOptions) -> Result<Vec<ZipEntry>
         .map_err(|_| invalid_container("ZIP entry path is not UTF-8"))?
         .to_owned();
         let data_offset = local_data_offset(bytes, local_offset)?;
-        entries.push(ZipEntry {
-            path,
-            compression_method,
-            compressed_size,
-            uncompressed_size,
-            data_offset,
-        });
+        if !path.ends_with('/') {
+            entries.push(ZipEntry {
+                path,
+                compression_method,
+                compressed_size,
+                uncompressed_size,
+                data_offset,
+            });
+        }
         cursor = name_end
             .checked_add(extra_len)
             .and_then(|value| value.checked_add(comment_len))
             .ok_or_else(|| invalid_container("central directory cursor overflows"))?;
     }
 
-    if entries.len() != entry_count && options.compatibility_mode == CompatibilityMode::Strict {
+    if records_seen != entry_count && options.compatibility_mode == CompatibilityMode::Strict {
         return Err(invalid_container("central directory entry count mismatch"));
     }
     Ok(entries)
@@ -2280,6 +3404,21 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PageletError> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let bytes = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 fn validate_container_path(path: &str, mode: CompatibilityMode) -> Result<(), PageletError> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') {
         return Err(invalid_container(format!("unsafe ZIP path: {path}")));
@@ -2307,6 +3446,10 @@ fn media_type_for_path(path: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
         "xml" => "application/xml",
         _ => "application/octet-stream",
     }
@@ -2708,5 +3851,272 @@ mod tests {
         let strict_error = open_spine_item_chapter_ir_with_options(bytes, 0, OpenOptions::strict())
             .expect_err("strict rejects malformed xhtml");
         assert_eq!(strict_error.code(), DiagnosticCode::Parse);
+    }
+
+    #[test]
+    fn css_parser_and_cascade_apply_specificity_inheritance_and_inline_style() {
+        let stylesheet = parse_css(
+            r#"
+            @import "theme.css";
+            p.lead { font-weight: normal; color: red; }
+            #main .lead { font-weight: bold; }
+            section p { text-indent: 2em; }
+            "#,
+            ResourceLimits::default(),
+        )
+        .expect("parse css");
+        let element = CssElementSnapshot {
+            name: "p".to_owned(),
+            id: None,
+            classes: vec!["lead".to_owned()],
+            inline_style: Some("font-style: italic".to_owned()),
+        };
+        let ancestors = vec![CssElementSnapshot {
+            name: "section".to_owned(),
+            id: Some("main".to_owned()),
+            classes: Vec::new(),
+            inline_style: None,
+        }];
+        let inherited = document::ComputedStyle::new().with_property("font-family", "serif");
+        let computed = cascade_css_for_element(&element, &ancestors, &stylesheet, &inherited);
+
+        assert_eq!(stylesheet.imports[0].href, "theme.css");
+        assert!(stylesheet
+            .unsupported
+            .iter()
+            .any(|declaration| declaration.property == "color"));
+        assert_eq!(style_value(&computed, "font-family"), Some("serif"));
+        assert_eq!(style_value(&computed, "font-weight"), Some("bold"));
+        assert_eq!(style_value(&computed, "font-style"), Some("italic"));
+        assert_eq!(style_value(&computed, "text-indent"), Some("2em"));
+    }
+
+    #[test]
+    fn linked_css_imports_are_loaded_and_errors_are_diagnosed() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Linked CSS",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title><link rel="stylesheet" href="styles/base.css"/></head><body><p class="lead">Styled.</p></body></html>"#,
+        )
+        .add_stylesheet("EPUB/styles/base.css", r#"@import "theme.css"; p { font-style: italic; }"#)
+        .add_stylesheet("EPUB/styles/theme.css", ".lead { font-weight: bold; }")
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let paragraph_style = first_paragraph_style(&chapter).expect("paragraph style");
+
+        assert_eq!(style_value(paragraph_style, "font-style"), Some("italic"));
+        assert_eq!(style_value(paragraph_style, "font-weight"), Some("bold"));
+
+        let mut options = OpenOptions::compatible();
+        options.limits.max_css_import_depth = 0;
+        let error = open_spine_item_chapter_ir_with_options(fixture.bytes().to_vec(), 0, options)
+            .expect_err("depth limit");
+        assert_eq!(error.code(), DiagnosticCode::ResourceLimitExceeded);
+
+        let cycle = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "CSS Cycle",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title><link rel="stylesheet" href="styles/base.css"/></head><body><p>Styled.</p></body></html>"#,
+        )
+        .add_stylesheet("EPUB/styles/base.css", r#"@import "theme.css";"#)
+        .add_stylesheet("EPUB/styles/theme.css", r#"@import "base.css";"#)
+        .build();
+        let error = open_first_chapter_ir(cycle.bytes().to_vec()).expect_err("cycle");
+        assert_eq!(error.code(), DiagnosticCode::Parse);
+    }
+
+    #[test]
+    fn unsupported_css_properties_are_recorded_as_chapter_diagnostics() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "CSS Diagnostics",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title><style>p { color: red; font-weight: bold; }</style></head><body><p>Styled.</p></body></html>"#,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+
+        assert!(chapter.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DiagnosticCode::UnsupportedFeature
+                && diagnostic.message.contains("color")
+        }));
+    }
+
+    #[test]
+    fn footnote_noterefs_get_backlinks_and_unreferenced_notes_are_skipped() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::FootnoteCollision,
+            "Footnotes",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<p>See <a epub:type="noteref" href="#fn1">1</a>.</p><aside epub:type="footnote" id="fn1"><p>Referenced note.</p></aside><aside epub:type="footnote" id="fn2"><p>Unreferenced note.</p></aside>"##,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let footnotes = footnote_nodes(&chapter);
+
+        assert_eq!(footnotes.len(), 1);
+        assert_eq!(footnotes[0].note_id.as_deref(), Some("fn1"));
+        let backlink = footnotes[0].backlink.as_ref().expect("backlink");
+        assert_eq!(backlink.kind, document::LinkKind::Footnote);
+        assert_eq!(backlink.fragment.as_deref(), Some("fn1"));
+        assert!(chapter.visible_text().contains("Referenced note."));
+        assert!(!chapter.visible_text().contains("Unreferenced note."));
+    }
+
+    #[test]
+    fn external_footnotes_are_loaded_on_demand_by_fragment() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::FootnoteCollision,
+            "External Footnotes",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<p>See <a epub:type="noteref" href="notes.xhtml#fn1">1</a>.</p>"##,
+        )
+        .add_xhtml(
+            "EPUB/notes.xhtml",
+            "Notes",
+            r##"<aside epub:type="footnote" id="fn1"><p>External note.</p></aside><aside epub:type="footnote" id="fn2"><p>Other note.</p></aside>"##,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let footnotes = footnote_nodes(&chapter);
+
+        assert_eq!(footnotes.len(), 1);
+        assert_eq!(footnotes[0].note_id.as_deref(), Some("fn1"));
+        assert!(chapter.visible_text().contains("External note."));
+        assert!(!chapter.visible_text().contains("Other note."));
+    }
+
+    #[test]
+    fn image_header_parser_handles_png_gif_and_jpeg() {
+        assert_eq!(
+            parse_image_header(&png_header(640, 480), "image/png"),
+            Some(document::ImageSize {
+                width: 640,
+                height: 480
+            })
+        );
+        assert_eq!(
+            parse_image_header(b"GIF89a\x20\x00\x10\x00\x00\x00", "image/gif"),
+            Some(document::ImageSize {
+                width: 32,
+                height: 16
+            })
+        );
+        assert_eq!(
+            parse_image_header(
+                &[
+                    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x20, 0x00, 0x10, 0x03, 0x01,
+                    0x11, 0x00,
+                ],
+                "image/jpeg",
+            ),
+            Some(document::ImageSize {
+                width: 16,
+                height: 32
+            })
+        );
+        assert_eq!(parse_image_header(b"not an image", "image/png"), None);
+    }
+
+    #[test]
+    fn book_ir_indexes_lazy_image_dimensions_and_font_fingerprints() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "Resources",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<figure><img src="images/pic.png" alt="pic" /></figure>"#,
+        )
+        .add_entry("EPUB/images/pic.png", "image/png", png_header(320, 200))
+        .add_entry(
+            "EPUB/fonts/body.ttf",
+            "font/ttf",
+            b"fake font bytes".to_vec(),
+        )
+        .build();
+        let ir = open_book_ir(fixture.bytes().to_vec()).expect("book ir");
+
+        let image = ir
+            .resources
+            .images
+            .iter()
+            .find(|image| image.path.as_ref() == "EPUB/images/pic.png")
+            .expect("image resource");
+        assert_eq!(
+            image.intrinsic_size,
+            Some(document::ImageSize {
+                width: 320,
+                height: 200
+            })
+        );
+        assert_eq!(image.byte_length, png_header(320, 200).len() as u64);
+
+        let font = ir
+            .resources
+            .fonts
+            .iter()
+            .find(|font| font.path.as_ref() == "EPUB/fonts/body.ttf")
+            .expect("font resource");
+        assert_ne!(
+            font.fingerprint,
+            crate::core::ContentHash::from_bytes(b"EPUB/fonts/body.ttf")
+        );
+    }
+
+    fn style_value<'a>(style: &'a document::ComputedStyle, property: &str) -> Option<&'a str> {
+        style.properties.get(property).map(AsRef::as_ref)
+    }
+
+    fn first_paragraph_style(chapter: &document::ChapterIr) -> Option<&document::ComputedStyle> {
+        chapter.nodes.iter_with_ids().find_map(|(_, node)| {
+            if let document::DocumentNode::Paragraph(block) = node {
+                return chapter.styles.get(block.style);
+            }
+            None
+        })
+    }
+
+    fn footnote_nodes(chapter: &document::ChapterIr) -> Vec<&document::FootnoteNode> {
+        chapter
+            .nodes
+            .iter_with_ids()
+            .filter_map(|(_, node)| {
+                if let document::DocumentNode::Footnote(note) = node {
+                    Some(note)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::from(&b"\x89PNG\r\n\x1a\n"[..]);
+        bytes.extend_from_slice(&13_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes
     }
 }

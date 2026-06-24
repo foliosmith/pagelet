@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::core::{
-    ContentHash, DiagnosticCode, DocumentId, NodeId, PageletError, ResourceId, ResourceLimitError,
-    ResourceLimitKind, SourceRange, StyleId,
+    ContentHash, Diagnostic, DiagnosticCode, DocumentId, NodeId, PageletError, ResourceId,
+    ResourceLimitError, ResourceLimitKind, SourceRange, StyleId,
 };
 
 /// Package-level intermediate representation.
@@ -139,6 +139,7 @@ impl ResourceTable {
                 media_type: resource.media_type.clone(),
                 byte_length: resource.uncompressed_size,
                 intrinsic_size: None,
+                orientation: ImageOrientation::Unspecified,
             });
         }
         if resource.kind == ResourceKind::Font {
@@ -150,6 +151,20 @@ impl ResourceTable {
             });
         }
         self.resources.push(resource);
+    }
+
+    /// Set an image size discovered from a bounded header read.
+    pub fn set_image_size(&mut self, id: ResourceId, size: Option<ImageSize>) {
+        if let Some(image) = self.images.iter_mut().find(|image| image.id == id) {
+            image.intrinsic_size = size;
+        }
+    }
+
+    /// Set a stable font fingerprint discovered from resource metadata/header bytes.
+    pub fn set_font_fingerprint(&mut self, id: ResourceId, fingerprint: ContentHash) {
+        if let Some(font) = self.fonts.iter_mut().find(|font| font.id == id) {
+            font.fingerprint = fingerprint;
+        }
     }
 
     /// Resolve a resource path to its typed identifier.
@@ -237,6 +252,7 @@ pub struct ImageResource {
     pub media_type: Arc<str>,
     pub byte_length: u64,
     pub intrinsic_size: Option<ImageSize>,
+    pub orientation: ImageOrientation,
 }
 
 /// Intrinsic image dimensions when known from a header parser.
@@ -244,6 +260,13 @@ pub struct ImageResource {
 pub struct ImageSize {
     pub width: u32,
     pub height: u32,
+}
+
+/// Image orientation metadata.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum ImageOrientation {
+    #[default]
+    Unspecified,
 }
 
 /// Font resource metadata.
@@ -284,6 +307,7 @@ pub struct ChapterIr {
     pub links: Vec<LinkTarget>,
     pub source_map: SourceMap,
     pub utf16_index: Utf16Index,
+    pub diagnostics: Vec<Diagnostic>,
     pub content_hash: ContentHash,
 }
 
@@ -308,6 +332,7 @@ impl ChapterIr {
             links: Vec::new(),
             source_map: SourceMap::new(),
             utf16_index: Utf16Index::new(),
+            diagnostics: Vec::new(),
             content_hash,
         }
     }
@@ -481,6 +506,11 @@ impl NodeArena {
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<&DocumentNode> {
         self.nodes.get(usize::try_from(id.get()).ok()?)
+    }
+
+    /// Get one mutable node by id.
+    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut DocumentNode> {
+        self.nodes.get_mut(usize::try_from(id.get()).ok()?)
     }
 
     /// Iterate over typed node ids and nodes.

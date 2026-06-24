@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use pagelet::epub::{open_book_ir, open_spine_item_chapter_ir};
 use pagelet_testkit::{FixtureKind, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
 fn main() -> ExitCode {
@@ -265,30 +266,72 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tests/corpus-manifest.toml"));
 
-    let Some(root) = root else {
-        if required {
-            return Err(XtaskError::Command(
-                "PAGELET_CORPUS_ROOT is required but not set".into(),
-            ));
+    if let Some(root) = &root {
+        if !root.exists() {
+            return Err(XtaskError::Command(format!(
+                "corpus root does not exist: {}",
+                root.display()
+            )));
         }
-        println!("corpus profile={profile} skipped: PAGELET_CORPUS_ROOT not set");
-        return Ok(());
-    };
-
-    if !root.exists() {
-        return Err(XtaskError::Command(format!(
-            "corpus root does not exist: {}",
-            root.display()
-        )));
+    } else if required {
+        return Err(XtaskError::Command(
+            "PAGELET_CORPUS_ROOT is required but not set".into(),
+        ));
     }
+
     let manifest_text = fs::read_to_string(&manifest)?;
-    let case_count = manifest_text.matches("[[books]]").count();
+    let books = parse_corpus_manifest(&manifest, &manifest_text)?;
+    let selected = select_corpus_books(&books, &profile);
+    if selected.is_empty() {
+        if required {
+            return Err(XtaskError::Command(format!(
+                "corpus profile={profile} selected no books"
+            )));
+        }
+        println!(
+            "corpus profile={profile} manifest={} selected=0",
+            manifest.display()
+        );
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for book in &selected {
+        match corpus_book_bytes(book, root.as_deref()) {
+            Ok(bytes) => match validate_corpus_book(book, &bytes) {
+                Ok(summary) => println!(
+                    "corpus case={} status=ok chapters_checked={} visible_chars={}",
+                    book.id, summary.chapters_checked, summary.visible_chars
+                ),
+                Err(error) => failures.push(format!("{}: {error}", book.id)),
+            },
+            Err(error) => {
+                if book.license == "generated" || required {
+                    failures.push(format!("{}: {error}", book.id));
+                } else {
+                    println!("corpus case={} status=skipped reason={error}", book.id);
+                }
+            }
+        }
+    }
+
     println!(
-        "corpus profile={profile} root={} manifest={} cases={case_count}",
-        root.display(),
-        manifest.display()
+        "corpus profile={profile} root={} manifest={} selected={}",
+        root.as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<generated-only>".to_owned()),
+        manifest.display(),
+        selected.len()
     );
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(XtaskError::Command(format!(
+            "corpus validation failed:\n{}",
+            failures.join("\n")
+        )))
+    }
 }
 
 fn validate_corpus_profile(profile: &str) -> Result<(), XtaskError> {
@@ -298,6 +341,181 @@ fn validate_corpus_profile(profile: &str) -> Result<(), XtaskError> {
             "unknown corpus profile: {other}"
         ))),
     }
+}
+
+fn parse_corpus_manifest(path: &Path, text: &str) -> Result<Vec<CorpusBook>, XtaskError> {
+    require_schema_version(&path.display().to_string(), text)?;
+    let mut books = Vec::new();
+    let mut current: Option<CorpusBookDraft> = None;
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() || line.starts_with('[') && line != "[[books]]" {
+            continue;
+        }
+        if line == "[[books]]" {
+            push_corpus_book(path, current.take(), &mut books)?;
+            current = Some(CorpusBookDraft::default());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(book) = current.as_mut() else {
+            continue;
+        };
+        match key.trim() {
+            "id" => book.id = Some(toml_string(path, line_number, value.trim())?),
+            "path" => book.path = Some(toml_string(path, line_number, value.trim())?),
+            "sha256" => book.sha256 = Some(toml_string(path, line_number, value.trim())?),
+            "license" => book.license = Some(toml_string(path, line_number, value.trim())?),
+            "expected" => book.expected = Some(toml_string(path, line_number, value.trim())?),
+            "categories" => book.categories = parse_toml_string_array(path, line_number, value)?,
+            _ => {}
+        }
+    }
+    push_corpus_book(path, current.take(), &mut books)?;
+    if books.is_empty() {
+        return Err(XtaskError::Command(format!(
+            "{} must define at least one [[books]] entry",
+            path.display()
+        )));
+    }
+    Ok(books)
+}
+
+fn push_corpus_book(
+    path: &Path,
+    current: Option<CorpusBookDraft>,
+    books: &mut Vec<CorpusBook>,
+) -> Result<(), XtaskError> {
+    if let Some(current) = current {
+        let book = current.finish(path)?;
+        if books.iter().any(|existing| existing.id == book.id) {
+            return Err(XtaskError::Command(format!(
+                "{} duplicate corpus book id: {}",
+                path.display(),
+                book.id
+            )));
+        }
+        books.push(book);
+    }
+    Ok(())
+}
+
+fn parse_toml_string_array(
+    path: &Path,
+    line_number: usize,
+    value: &str,
+) -> Result<Vec<String>, XtaskError> {
+    let value = value.trim();
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for raw in inner.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        out.push(toml_string(path, line_number, raw)?);
+    }
+    Ok(out)
+}
+
+fn select_corpus_books<'a>(books: &'a [CorpusBook], profile: &str) -> Vec<&'a CorpusBook> {
+    books
+        .iter()
+        .filter(|book| {
+            profile == "full" || book.categories.iter().any(|category| category == profile)
+        })
+        .collect()
+}
+
+fn corpus_book_bytes(book: &CorpusBook, root: Option<&Path>) -> Result<Vec<u8>, XtaskError> {
+    if book.license == "generated" {
+        return generated_corpus_fixture(book)
+            .map(|fixture| fixture.bytes().to_vec())
+            .ok_or_else(|| {
+                XtaskError::Command(format!(
+                    "no generated fixture is registered for {}",
+                    book.id
+                ))
+            });
+    }
+    let Some(root) = root else {
+        return Err(XtaskError::Command(
+            "PAGELET_CORPUS_ROOT not set for private corpus case".into(),
+        ));
+    };
+    let path = root.join(&book.path);
+    let bytes = fs::read(&path)?;
+    if let Some(expected) = book.sha256.as_deref() {
+        if !expected.chars().all(|ch| ch == '0') {
+            let actual = sha256_hex(&bytes);
+            if actual != expected {
+                return Err(XtaskError::Command(format!(
+                    "{} sha256 mismatch: expected {expected}, got {actual}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn generated_corpus_fixture(book: &CorpusBook) -> Option<pagelet_testkit::Fixture> {
+    let kind = match book.id.as_str() {
+        "generated/minimal-epub3" => FixtureKind::MinimalEpub3,
+        "generated/pathological" => FixtureKind::ZipBombLike,
+        _ => return None,
+    };
+    Some(ValidEpubBuilder::preset(kind).build())
+}
+
+fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary, XtaskError> {
+    let book_ir = match open_book_ir(bytes.to_vec()) {
+        Ok(ir) if book.expected != "invalid" => ir,
+        Ok(_) => {
+            return Err(XtaskError::Command(
+                "expected invalid corpus case opened successfully".into(),
+            ));
+        }
+        Err(_) if book.expected == "invalid" => {
+            return Ok(CorpusSummary {
+                chapters_checked: 0,
+                visible_chars: 0,
+            });
+        }
+        Err(error) => return Err(XtaskError::Command(error.to_string())),
+    };
+
+    let mut chapters_checked = 0_usize;
+    let mut visible_chars = 0_usize;
+    for (index, spine) in book_ir.spine.iter().enumerate() {
+        if !spine.linear {
+            continue;
+        }
+        chapters_checked += 1;
+        let chapter = open_spine_item_chapter_ir(bytes.to_vec(), index)
+            .map_err(|error| XtaskError::Command(error.to_string()))?;
+        visible_chars = visible_chars.saturating_add(chapter.visible_text().chars().count());
+        if visible_chars > 0 {
+            break;
+        }
+    }
+    if visible_chars == 0 && book.expected != "invalid" {
+        return Err(XtaskError::Command(
+            "no visible chapter text extracted".into(),
+        ));
+    }
+    Ok(CorpusSummary {
+        chapters_checked,
+        visible_chars,
+    })
 }
 
 fn run_manifests(args: &[String]) -> Result<(), XtaskError> {
@@ -777,6 +995,53 @@ struct GoldenCase {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+struct CorpusBook {
+    id: String,
+    path: String,
+    sha256: Option<String>,
+    license: String,
+    expected: String,
+    categories: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct CorpusBookDraft {
+    id: Option<String>,
+    path: Option<String>,
+    sha256: Option<String>,
+    license: Option<String>,
+    expected: Option<String>,
+    categories: Vec<String>,
+}
+
+impl CorpusBookDraft {
+    fn finish(self, path: &Path) -> Result<CorpusBook, XtaskError> {
+        Ok(CorpusBook {
+            id: self.id.ok_or_else(|| {
+                XtaskError::Command(format!("{} [[books]] requires id", path.display()))
+            })?,
+            path: self.path.ok_or_else(|| {
+                XtaskError::Command(format!("{} [[books]] requires path", path.display()))
+            })?,
+            sha256: self.sha256,
+            license: self.license.ok_or_else(|| {
+                XtaskError::Command(format!("{} [[books]] requires license", path.display()))
+            })?,
+            expected: self.expected.ok_or_else(|| {
+                XtaskError::Command(format!("{} [[books]] requires expected", path.display()))
+            })?,
+            categories: self.categories,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CorpusSummary {
+    chapters_checked: usize,
+    visible_chars: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct BenchOptions {
     profile: String,
     iterations: u32,
@@ -992,6 +1257,161 @@ impl BudgetPolicy {
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut h = [
+        0x6a09_e667_u32,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = bytes.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks(64) {
+        let mut w = [0_u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PerfSection {
     Root,
@@ -1031,6 +1451,53 @@ mod tests {
     fn corpus_profiles_are_validated() {
         assert!(validate_corpus_profile("smoke").is_ok());
         assert!(validate_corpus_profile("bogus").is_err());
+    }
+
+    #[test]
+    fn corpus_manifest_parses_and_selects_profile_cases() {
+        let books = parse_corpus_manifest(
+            Path::new("tests/corpus-manifest.toml"),
+            r#"
+schema_version = 1
+
+[[books]]
+id = "generated/minimal-epub3"
+path = "generated/minimal-epub3.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["smoke"]
+features = ["package"]
+
+[[books]]
+id = "private/regression"
+path = "book.epub"
+sha256 = "abc"
+license = "private-ci"
+expected = "valid"
+categories = ["regression"]
+"#,
+        )
+        .expect("manifest");
+
+        assert_eq!(books.len(), 2);
+        assert_eq!(
+            select_corpus_books(&books, "smoke")[0].id,
+            "generated/minimal-epub3"
+        );
+        assert_eq!(
+            select_corpus_books(&books, "regression")[0].path,
+            "book.epub"
+        );
+        assert_eq!(select_corpus_books(&books, "full").len(), 2);
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

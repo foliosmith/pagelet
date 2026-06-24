@@ -33,3 +33,45 @@ path = "fuzz_targets/ocf_paths.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "xhtml_fast"
+path = "fuzz_targets/xhtml_fast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xhtml_differential"
+path = "fuzz_targets/xhtml_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "css_parse"
+path = "fuzz_targets/css_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "css_cascade"
+path = "fuzz_targets/css_cascade.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "footnote_resolver"
+path = "fuzz_targets/footnote_resolver.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_header"
+path = "fuzz_targets/image_header.rs"
+test = false
+doc = false
+bench = false
