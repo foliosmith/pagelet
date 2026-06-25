@@ -11,7 +11,7 @@ pub mod document;
 pub mod engine;
 pub mod epub;
 mod ffi;
-mod layout;
+pub mod layout;
 #[cfg(test)]
 mod testkit;
 pub mod text;

@@ -75,3 +75,10 @@ path = "fuzz_targets/image_header.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "layout_typed_ir"
+path = "fuzz_targets/layout_typed_ir.rs"
+test = false
+doc = false
+bench = false

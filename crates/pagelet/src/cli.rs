@@ -3,12 +3,14 @@
 use std::{fs, path::Path};
 
 use crate::{
-    core::{Diagnostic, Severity},
+    core::{Diagnostic, LayoutUnit, Severity},
     document::{ChapterIr, DocumentNode},
     epub::{
         BookSummary, CapabilityStatus, CompatibilityMode, NavigationItem, NavigationSource,
         OpenOptions,
     },
+    layout::{self, LayoutConstraints, LayoutOptions},
+    text::DefaultTextBackend,
 };
 
 /// Inspect EPUB bytes and return a deterministic JSON document.
@@ -19,6 +21,86 @@ pub fn inspect_bytes_json(bytes: impl Into<Vec<u8>>) -> Result<String, crate::co
 /// Inspect an EPUB path and return a deterministic JSON document.
 pub fn inspect_path_json(path: impl AsRef<Path>) -> Result<String, crate::core::PageletError> {
     inspect_bytes_json(fs::read(path)?)
+}
+
+/// Paginate EPUB bytes and return deterministic PageScene JSON for the first spine item.
+pub fn paginate_bytes_json(bytes: impl Into<Vec<u8>>) -> Result<String, crate::core::PageletError> {
+    paginate_bytes_json_with_options(bytes, OpenOptions::default(), LayoutOptions::default())
+}
+
+/// Paginate an EPUB path and return deterministic PageScene JSON for the first spine item.
+pub fn paginate_path_json(path: impl AsRef<Path>) -> Result<String, crate::core::PageletError> {
+    paginate_bytes_json(fs::read(path)?)
+}
+
+/// Paginate EPUB bytes with explicit EPUB and layout options.
+pub fn paginate_bytes_json_with_options(
+    bytes: impl Into<Vec<u8>>,
+    open_options: OpenOptions,
+    layout_options: LayoutOptions,
+) -> Result<String, crate::core::PageletError> {
+    let chapter = crate::epub::open_spine_item_chapter_ir_with_options(bytes, 0, open_options)?;
+    let backend = DefaultTextBackend::new();
+    let pages = layout::paginate_chapter_with_options(&chapter, &backend, layout_options)?;
+    Ok(paginated_chapter_json(&chapter, &pages))
+}
+
+/// Paginate EPUB bytes and return debug SVG for the first page.
+pub fn paginate_bytes_debug_svg(
+    bytes: impl Into<Vec<u8>>,
+) -> Result<String, crate::core::PageletError> {
+    paginate_bytes_debug_svg_with_options(bytes, OpenOptions::default(), LayoutOptions::default())
+}
+
+/// Paginate an EPUB path and return debug SVG for the first page.
+pub fn paginate_path_debug_svg(
+    path: impl AsRef<Path>,
+) -> Result<String, crate::core::PageletError> {
+    paginate_bytes_debug_svg(fs::read(path)?)
+}
+
+/// Paginate EPUB bytes with explicit options and return debug SVG for the first page.
+pub fn paginate_bytes_debug_svg_with_options(
+    bytes: impl Into<Vec<u8>>,
+    open_options: OpenOptions,
+    layout_options: LayoutOptions,
+) -> Result<String, crate::core::PageletError> {
+    let chapter = crate::epub::open_spine_item_chapter_ir_with_options(bytes, 0, open_options)?;
+    let backend = DefaultTextBackend::new();
+    let pages = layout::paginate_chapter_with_options(&chapter, &backend, layout_options)?;
+    Ok(pages
+        .pages
+        .first()
+        .map(layout::page_debug_svg)
+        .unwrap_or_else(|| {
+            let page = layout::PageScene {
+                page_index: 0,
+                size: layout::PageSize {
+                    width: layout_options.constraints.viewport_width,
+                    height: layout_options.constraints.viewport_height,
+                },
+                start_anchor: None,
+                end_anchor: None,
+                fragments: Vec::new(),
+                links: Vec::new(),
+                anchors: Vec::new(),
+                selections: Vec::new(),
+                semantics: Vec::new(),
+                fingerprint: layout::PageFingerprint(crate::core::ContentHash::from_bytes(&[])),
+                next_break_token: None,
+                diagnostics: Vec::new(),
+            };
+            layout::page_debug_svg(&page)
+        }))
+}
+
+/// Create layout options from whole-pixel viewport dimensions.
+#[must_use]
+pub fn layout_options_from_px(width: i64, height: i64) -> LayoutOptions {
+    LayoutOptions::new(
+        LayoutConstraints::new(LayoutUnit::from_px(width), LayoutUnit::from_px(height))
+            .with_margin(LayoutUnit::from_px(24)),
+    )
 }
 
 /// Inspect EPUB bytes with explicit open options.
@@ -36,6 +118,36 @@ pub fn inspect_bytes_json_with_options(
 #[must_use]
 pub fn book_summary_json(book: &BookSummary) -> String {
     book_summary_json_with_chapter(book, None)
+}
+
+fn paginated_chapter_json(chapter: &ChapterIr, pages: &layout::PaginatedDocument) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    push_field(&mut out, 1, "href", &chapter.href, true);
+    push_field(&mut out, 1, "title", &chapter.title, true);
+    indent(&mut out, 1);
+    out.push_str("\"document_id\": ");
+    out.push_str(&chapter.document_id.get().to_string());
+    out.push_str(",\n");
+    indent(&mut out, 1);
+    out.push_str("\"page_count\": ");
+    out.push_str(&pages.pages.len().to_string());
+    out.push_str(",\n");
+    let pages_json = pages.to_normalized_json();
+    let mut lines = pages_json.lines();
+    if let Some(first) = lines.next() {
+        indent(&mut out, 1);
+        out.push_str("\"pagination\": ");
+        out.push_str(first);
+        out.push('\n');
+    }
+    for line in lines {
+        indent(&mut out, 1);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
 }
 
 /// Serialize a book summary and optional first ChapterIR for `pagelet inspect`.

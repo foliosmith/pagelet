@@ -5,7 +5,8 @@ use std::{fmt, sync::Arc};
 use crate::{
     core::{CancellationToken, LayoutUnit, PageletError},
     text::{
-        FontSetFingerprint, MeasureBatch, MeasuredBatch, MeasuredText, TextBackend, TextBackendId,
+        FontSetFingerprint, LineMetrics, MeasureBatch, MeasuredBatch, MeasuredText, TextBackend,
+        TextBackendId, TextCluster,
     },
 };
 
@@ -670,16 +671,82 @@ impl TextBackend for FakeTextBackend {
             let width = LayoutUnit::from_raw(natural_width.min(max_width_raw));
             let height = LayoutUnit::from_raw(i64::from(line_count).saturating_mul(line_height));
 
-            results.push(MeasuredText {
-                request_id: item.id,
+            let (lines, clusters) = fake_lines(
+                &item.text,
+                LayoutUnit::from_raw(char_width),
+                LayoutUnit::from_raw(line_height),
+                item.max_width,
+            );
+
+            results.push(MeasuredText::new(
+                item.id,
                 width,
                 height,
-                line_count,
-                utf8_len: u32::try_from(item.text.len()).unwrap_or(u32::MAX),
-            });
+                u32::try_from(item.text.len()).unwrap_or(u32::MAX),
+                lines,
+                clusters,
+                item.request_fingerprint ^ self.font_fingerprint.0,
+            ));
         }
 
         Ok(MeasuredBatch::new(results))
+    }
+}
+
+fn fake_lines(
+    text: &str,
+    char_width: LayoutUnit,
+    line_height: LayoutUnit,
+    max_width: LayoutUnit,
+) -> (Vec<LineMetrics>, Vec<TextCluster>) {
+    let chars_per_line = (max_width.raw().max(char_width.raw()) / char_width.raw()).max(1);
+    let mut lines = Vec::new();
+    let mut clusters = Vec::new();
+    let mut line_start = 0_usize;
+    let mut line_width = LayoutUnit::ZERO;
+    let mut cluster_x = LayoutUnit::ZERO;
+    let mut line_index = 0_u32;
+    let mut count = 0_i64;
+
+    for (offset, ch) in text.char_indices() {
+        if count >= chars_per_line && offset > line_start {
+            lines.push(fake_line(line_start, offset, line_width, line_height));
+            line_start = offset;
+            line_width = LayoutUnit::ZERO;
+            cluster_x = LayoutUnit::ZERO;
+            line_index = line_index.saturating_add(1);
+            count = 0;
+        }
+        let end = offset + ch.len_utf8();
+        clusters.push(TextCluster {
+            text_start: u32::try_from(offset).unwrap_or(u32::MAX),
+            text_end: u32::try_from(end).unwrap_or(u32::MAX),
+            line_index,
+            x_start: cluster_x,
+            x_end: cluster_x + char_width,
+        });
+        line_width += char_width;
+        cluster_x += char_width;
+        count += 1;
+    }
+
+    if line_start < text.len() || lines.is_empty() {
+        lines.push(fake_line(line_start, text.len(), line_width, line_height));
+    }
+
+    (lines, clusters)
+}
+
+fn fake_line(start: usize, end: usize, width: LayoutUnit, line_height: LayoutUnit) -> LineMetrics {
+    LineMetrics {
+        text_start: u32::try_from(start).unwrap_or(u32::MAX),
+        text_end: u32::try_from(end).unwrap_or(u32::MAX),
+        baseline: LayoutUnit::from_raw((line_height.raw() * 4) / 5),
+        ascent: LayoutUnit::from_raw((line_height.raw() * 4) / 5),
+        descent: LayoutUnit::from_raw(line_height.raw() / 5),
+        line_height,
+        width,
+        hard_break: false,
     }
 }
 
