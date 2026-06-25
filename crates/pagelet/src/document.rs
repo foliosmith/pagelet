@@ -211,19 +211,12 @@ impl ResourceKind {
             "application/x-dtbncx+xml" => Self::Navigation,
             "application/xml" | "text/xml" => Self::Xml,
             value if value.starts_with("image/") => Self::Image,
-            value
-                if matches!(
-                    value,
-                    "font/otf"
-                        | "font/ttf"
-                        | "font/woff"
-                        | "font/woff2"
-                        | "application/font-sfnt"
-                        | "application/vnd.ms-opentype"
-                ) =>
-            {
-                Self::Font
-            }
+            "font/otf"
+            | "font/ttf"
+            | "font/woff"
+            | "font/woff2"
+            | "application/font-sfnt"
+            | "application/vnd.ms-opentype" => Self::Font,
             _ => Self::Other,
         }
     }

@@ -183,23 +183,21 @@ impl ZipPublicationStore {
                     total_uncompressed,
                 ));
             }
-            if entry.compressed_size > 0 {
-                let ratio = (entry
-                    .uncompressed_size
-                    .saturating_add(entry.compressed_size - 1))
-                    / entry.compressed_size;
-                if ratio > u64::from(options.limits.max_compression_ratio) {
-                    return Err(limit_error(
-                        ResourceLimitKind::CompressionRatio,
-                        u64::from(options.limits.max_compression_ratio),
-                        ratio,
-                    ));
-                }
-            } else if entry.uncompressed_size > 0 {
+            let zero_compressed_ratio = if entry.uncompressed_size == 0 {
+                0
+            } else {
+                u64::MAX
+            };
+            let ratio = entry
+                .uncompressed_size
+                .saturating_add(entry.compressed_size.saturating_sub(1))
+                .checked_div(entry.compressed_size)
+                .unwrap_or(zero_compressed_ratio);
+            if ratio > u64::from(options.limits.max_compression_ratio) {
                 return Err(limit_error(
                     ResourceLimitKind::CompressionRatio,
                     u64::from(options.limits.max_compression_ratio),
-                    u64::MAX,
+                    ratio,
                 ));
             }
 
@@ -1532,9 +1530,10 @@ pub fn cascade_css_for_element(
                         declaration.important,
                         declaration.value.clone(),
                     );
-                    let replace = winners
-                        .get(&declaration.property)
-                        .is_none_or(|existing| css_candidate_wins(&candidate, existing));
+                    let replace = match winners.get(&declaration.property) {
+                        Some(existing) => css_candidate_wins(&candidate, existing),
+                        None => true,
+                    };
                     if replace {
                         winners.insert(declaration.property.clone(), candidate);
                     }

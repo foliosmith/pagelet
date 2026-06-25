@@ -1526,7 +1526,7 @@ id = "local-generated-fixture-smoke"
 description = "local"
 os = "any"
 arch = "any"
-rust_toolchain = "stable"
+rust_toolchain = "1.95.0"
 fixture_source = "generated"
 cache_policy = "warm"
 

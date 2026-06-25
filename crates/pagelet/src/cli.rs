@@ -77,7 +77,7 @@ pub fn book_summary_json_with_chapter(book: &BookSummary, chapter: Option<&Chapt
     out.push_str("\"manifest\": [\n");
     for (index, item) in book.package.manifest.iter().enumerate() {
         indent(&mut out, 2);
-        out.push_str("{");
+        out.push('{');
         push_inline_field(&mut out, "id", &item.id, true);
         push_inline_field(&mut out, "href", &item.href, true);
         push_inline_field(&mut out, "resolved_path", &item.resolved_path, true);
@@ -95,7 +95,7 @@ pub fn book_summary_json_with_chapter(book: &BookSummary, chapter: Option<&Chapt
     out.push_str("\"spine\": [\n");
     for (index, item) in book.package.spine.iter().enumerate() {
         indent(&mut out, 2);
-        out.push_str("{");
+        out.push('{');
         push_inline_field(&mut out, "idref", &item.idref, true);
         out.push_str("\"linear\": ");
         out.push_str(if item.linear { "true" } else { "false" });
@@ -138,7 +138,7 @@ fn push_diagnostics(out: &mut String, diagnostics: &[Diagnostic]) {
     out.push_str("\"diagnostics\": [\n");
     for (index, diagnostic) in diagnostics.iter().enumerate() {
         indent(out, 2);
-        out.push_str("{");
+        out.push('{');
         push_inline_field(out, "code", &format!("{:?}", diagnostic.code), true);
         push_inline_field(out, "severity", severity_name(diagnostic.severity), true);
         push_inline_field(out, "message", &diagnostic.message, false);
@@ -255,7 +255,7 @@ fn push_capabilities(out: &mut String, book: &BookSummary) {
     out.push_str("\"capabilities\": [\n");
     for (index, capability) in book.capability_report.capabilities.iter().enumerate() {
         indent(out, 3);
-        out.push_str("{");
+        out.push('{');
         push_inline_field(out, "feature", &capability.feature, true);
         push_inline_field(
             out,

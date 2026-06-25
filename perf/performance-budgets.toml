@@ -5,7 +5,7 @@ id = "local-generated-fixture-smoke"
 description = "Local generated fixture smoke runner; not a hard pinned performance gate."
 os = "any"
 arch = "any"
-rust_toolchain = "stable"
+rust_toolchain = "1.95.0"
 fixture_source = "tools/pagelet-testkit generated EPUB fixtures"
 cache_policy = "warm process, generated inputs, no external corpus"
 

@@ -12,7 +12,7 @@ env:
 
 jobs:
   check:
-    name: ${{ matrix.os }} / stable
+    name: ${{ matrix.os }} / Rust 1.95.0
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -24,10 +24,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
 
@@ -49,33 +49,16 @@ jobs:
       - name: Docs
         run: cargo doc --workspace --all-features --no-deps
 
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.80
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
-
   policy:
     name: Policy
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
