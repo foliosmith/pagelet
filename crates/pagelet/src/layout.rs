@@ -366,6 +366,40 @@ pub struct BreakToken {
     pub font_fingerprint: crate::text::FontSetFingerprint,
 }
 
+#[derive(Clone, Copy)]
+struct TokenContext<'a> {
+    chapter: &'a ChapterIr,
+    options: LayoutOptions,
+    text_backend: &'a dyn TextBackend,
+}
+
+#[derive(Clone, Copy)]
+struct BreakTokenPosition {
+    node_id: NodeId,
+    child_index: usize,
+    text_offset: u32,
+    continuation: bool,
+    page_index: u32,
+}
+
+impl BreakTokenPosition {
+    const fn new(
+        node_id: NodeId,
+        child_index: usize,
+        text_offset: u32,
+        continuation: bool,
+        page_index: u32,
+    ) -> Self {
+        Self {
+            node_id,
+            child_index,
+            text_offset,
+            continuation,
+            page_index,
+        }
+    }
+}
+
 impl BreakToken {
     fn start(
         chapter: &ChapterIr,
@@ -386,26 +420,17 @@ impl BreakToken {
         }
     }
 
-    fn for_position(
-        chapter: &ChapterIr,
-        options: LayoutOptions,
-        backend: &dyn TextBackend,
-        node_id: NodeId,
-        child_index: usize,
-        text_offset: u32,
-        continuation: bool,
-        page_index: u32,
-    ) -> Self {
+    fn for_position(context: TokenContext<'_>, position: BreakTokenPosition) -> Self {
         Self {
-            node_id,
-            child_index: u32::try_from(child_index).unwrap_or(u32::MAX),
-            text_offset,
-            continuation,
-            page_index,
-            content_fingerprint: chapter.content_hash,
-            config_fingerprint: config_fingerprint(options.constraints),
-            text_backend_id: backend.backend_id(),
-            font_fingerprint: backend.font_fingerprint(),
+            node_id: position.node_id,
+            child_index: u32::try_from(position.child_index).unwrap_or(u32::MAX),
+            text_offset: position.text_offset,
+            continuation: position.continuation,
+            page_index: position.page_index,
+            content_fingerprint: context.chapter.content_hash,
+            config_fingerprint: config_fingerprint(context.options.constraints),
+            text_backend_id: context.text_backend.backend_id(),
+            font_fingerprint: context.text_backend.font_fingerprint(),
         }
     }
 
@@ -995,14 +1020,12 @@ impl Fragmentable for ParagraphLayout {
             Ok(FragmentResult::Split {
                 head: Vec::new(),
                 next: BreakToken::for_position(
-                    context.chapter,
-                    context.options,
-                    context.text_backend,
-                    self.node_id,
-                    0,
-                    next_offset,
-                    true,
-                    0,
+                    TokenContext {
+                        chapter: context.chapter,
+                        options: context.options,
+                        text_backend: context.text_backend,
+                    },
+                    BreakTokenPosition::new(self.node_id, 0, next_offset, true, 0),
                 ),
                 consumed,
             })
@@ -1027,6 +1050,11 @@ fn paginate_page_from_blocks(
     let mut index = usize::try_from(start.child_index).unwrap_or(usize::MAX);
     let mut text_offset = start.text_offset;
     let content_bottom = options.constraints.viewport_height - options.constraints.margin_bottom;
+    let token_context = TokenContext {
+        chapter,
+        options,
+        text_backend,
+    };
     let mut next_token = None;
 
     while index < blocks.len() {
@@ -1047,14 +1075,14 @@ fn paginate_page_from_blocks(
         let block = &blocks[index];
         if block.style.break_before && !page.fragments.is_empty() {
             next_token = Some(BreakToken::for_position(
-                chapter,
-                options,
-                text_backend,
-                block.node_id,
-                index,
-                text_offset,
-                text_offset > 0,
-                start.page_index.saturating_add(1),
+                token_context,
+                BreakTokenPosition::new(
+                    block.node_id,
+                    index,
+                    text_offset,
+                    text_offset > 0,
+                    start.page_index.saturating_add(1),
+                ),
             ));
             break;
         }
@@ -1066,14 +1094,8 @@ fn paginate_page_from_blocks(
                     text_offset = 0;
                     continue;
                 }
-                next_token = next_block_token(
-                    chapter,
-                    options,
-                    text_backend,
-                    blocks,
-                    index + 1,
-                    start.page_index + 1,
-                );
+                next_token =
+                    next_block_token(token_context, blocks, index + 1, start.page_index + 1);
                 break;
             }
             LayoutBlockContent::Text { text, marker } => {
@@ -1091,36 +1113,32 @@ fn paginate_page_from_blocks(
                     && should_keep_with_next(blocks, index, &measured, page.y, content_bottom)
                 {
                     next_token = Some(BreakToken::for_position(
-                        chapter,
-                        options,
-                        text_backend,
-                        block.node_id,
-                        index,
-                        text_offset,
-                        text_offset > 0,
-                        start.page_index + 1,
+                        token_context,
+                        BreakTokenPosition::new(
+                            block.node_id,
+                            index,
+                            text_offset,
+                            text_offset > 0,
+                            start.page_index + 1,
+                        ),
                     ));
                     break;
                 }
-                let outcome = page.push_text_block(
-                    chapter,
+                let outcome = page.push_text_block(TextBlockPush {
+                    token_context,
                     block,
-                    index,
+                    block_index: index,
                     text,
-                    marker.as_deref(),
-                    &measured,
+                    marker: marker.as_deref(),
+                    measured: &measured,
                     text_offset,
-                    options,
-                    text_backend,
                     content_bottom,
-                )?;
+                })?;
                 match outcome {
                     BlockPushOutcome::Complete => {
                         if block.style.break_after {
                             next_token = next_block_token(
-                                chapter,
-                                options,
-                                text_backend,
+                                token_context,
                                 blocks,
                                 index + 1,
                                 start.page_index + 1,
@@ -1136,14 +1154,14 @@ fn paginate_page_from_blocks(
                     }
                     BlockPushOutcome::NoFit => {
                         next_token = Some(BreakToken::for_position(
-                            chapter,
-                            options,
-                            text_backend,
-                            block.node_id,
-                            index,
-                            text_offset,
-                            text_offset > 0,
-                            start.page_index + 1,
+                            token_context,
+                            BreakTokenPosition::new(
+                                block.node_id,
+                                index,
+                                text_offset,
+                                text_offset > 0,
+                                start.page_index + 1,
+                            ),
                         ));
                         break;
                     }
@@ -1158,14 +1176,14 @@ fn paginate_page_from_blocks(
                     content_bottom,
                 ) {
                     next_token = Some(BreakToken::for_position(
-                        chapter,
-                        options,
-                        text_backend,
-                        block.node_id,
-                        index,
-                        0,
-                        false,
-                        start.page_index + 1,
+                        token_context,
+                        BreakTokenPosition::new(
+                            block.node_id,
+                            index,
+                            0,
+                            false,
+                            start.page_index + 1,
+                        ),
                     ));
                     break;
                 }
@@ -1179,14 +1197,14 @@ fn paginate_page_from_blocks(
                 }
                 if !fit {
                     next_token = Some(BreakToken::for_position(
-                        chapter,
-                        options,
-                        text_backend,
-                        block.node_id,
-                        index,
-                        0,
-                        false,
-                        start.page_index + 1,
+                        token_context,
+                        BreakTokenPosition::new(
+                            block.node_id,
+                            index,
+                            0,
+                            false,
+                            start.page_index + 1,
+                        ),
                     ));
                     break;
                 }
@@ -1202,14 +1220,14 @@ fn paginate_page_from_blocks(
                     content_bottom,
                 ) {
                     next_token = Some(BreakToken::for_position(
-                        chapter,
-                        options,
-                        text_backend,
-                        block.node_id,
-                        index,
-                        0,
-                        false,
-                        start.page_index + 1,
+                        token_context,
+                        BreakTokenPosition::new(
+                            block.node_id,
+                            index,
+                            0,
+                            false,
+                            start.page_index + 1,
+                        ),
                     ));
                     break;
                 }
@@ -1250,6 +1268,17 @@ struct PageBuilder {
     fingerprint: PageFingerprint,
 }
 
+struct TextBlockPush<'a> {
+    token_context: TokenContext<'a>,
+    block: &'a LayoutBlock,
+    block_index: usize,
+    text: &'a str,
+    marker: Option<&'a str>,
+    measured: &'a MeasuredText,
+    text_offset: u32,
+    content_bottom: LayoutUnit,
+}
+
 impl PageBuilder {
     fn new(page_index: u32, constraints: LayoutConstraints) -> Self {
         Self {
@@ -1273,17 +1302,20 @@ impl PageBuilder {
 
     fn push_text_block(
         &mut self,
-        chapter: &ChapterIr,
-        block: &LayoutBlock,
-        block_index: usize,
-        text: &str,
-        marker: Option<&str>,
-        measured: &MeasuredText,
-        text_offset: u32,
-        options: LayoutOptions,
-        text_backend: &dyn TextBackend,
-        content_bottom: LayoutUnit,
+        input: TextBlockPush<'_>,
     ) -> Result<BlockPushOutcome, PageletError> {
+        let TextBlockPush {
+            token_context,
+            block,
+            block_index,
+            text,
+            marker,
+            measured,
+            text_offset,
+            content_bottom,
+        } = input;
+        let chapter = token_context.chapter;
+        let options = token_context.options;
         let start_line = measured
             .lines
             .iter()
@@ -1418,14 +1450,14 @@ impl PageBuilder {
             let next_offset = measured.lines[start_line + fit_count - 1].text_end;
             Ok(BlockPushOutcome::Split {
                 next: BreakToken::for_position(
-                    chapter,
-                    options,
-                    text_backend,
-                    block.node_id,
-                    block_index,
-                    next_offset,
-                    true,
-                    self.page_index + 1,
+                    token_context,
+                    BreakTokenPosition::new(
+                        block.node_id,
+                        block_index,
+                        next_offset,
+                        true,
+                        self.page_index + 1,
+                    ),
                 ),
             })
         }
@@ -1924,23 +1956,15 @@ fn line_metrics(
 }
 
 fn next_block_token(
-    chapter: &ChapterIr,
-    options: LayoutOptions,
-    text_backend: &dyn TextBackend,
+    token_context: TokenContext<'_>,
     blocks: &[LayoutBlock],
     next_index: usize,
     page_index: u32,
 ) -> Option<BreakToken> {
     blocks.get(next_index).map(|block| {
         BreakToken::for_position(
-            chapter,
-            options,
-            text_backend,
-            block.node_id,
-            next_index,
-            0,
-            false,
-            page_index,
+            token_context,
+            BreakTokenPosition::new(block.node_id, next_index, 0, false, page_index),
         )
     })
 }
@@ -2631,11 +2655,8 @@ mod tests {
         let all = paginate_chapter_with_options(&chapter, &backend, options).expect("all");
         let mut token = None;
         let mut incremental = Vec::new();
-        loop {
-            let Some(page) = paginate_next_page(&chapter, &backend, options, token).expect("next")
-            else {
-                break;
-            };
+        while let Some(page) = paginate_next_page(&chapter, &backend, options, token).expect("next")
+        {
             token = page.next_break_token.clone();
             incremental.push(page);
             if token.is_none() {

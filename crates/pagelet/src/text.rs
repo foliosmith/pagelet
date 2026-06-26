@@ -418,8 +418,7 @@ fn measure_deterministic(
             line_width + advance
         };
         if !hard_break && next_width.raw() > width_limit && relative_offset > line_start {
-            push_line(
-                &mut lines,
+            lines.push(line_metrics(
                 line_start,
                 relative_offset,
                 line_width,
@@ -427,7 +426,7 @@ fn measure_deterministic(
                 descent,
                 line_height,
                 false,
-            );
+            ));
             max_line_width = max_line_width.max(line_width);
             line_index = line_index.saturating_add(1);
             line_start = relative_offset;
@@ -448,8 +447,7 @@ fn measure_deterministic(
         }
 
         if hard_break {
-            push_line(
-                &mut lines,
+            lines.push(line_metrics(
                 line_start,
                 relative_offset,
                 line_width,
@@ -457,7 +455,7 @@ fn measure_deterministic(
                 descent,
                 line_height,
                 true,
-            );
+            ));
             max_line_width = max_line_width.max(line_width);
             line_index = line_index.saturating_add(1);
             line_start = ch_end;
@@ -467,8 +465,7 @@ fn measure_deterministic(
     }
 
     if line_start < text.len() || lines.is_empty() {
-        push_line(
-            &mut lines,
+        lines.push(line_metrics(
             line_start,
             text.len(),
             line_width,
@@ -476,7 +473,7 @@ fn measure_deterministic(
             descent,
             line_height,
             false,
-        );
+        ));
         max_line_width = max_line_width.max(line_width);
     }
 
@@ -500,8 +497,7 @@ fn measure_deterministic(
     )
 }
 
-fn push_line(
-    lines: &mut Vec<LineMetrics>,
+fn line_metrics(
     start: usize,
     end: usize,
     width: LayoutUnit,
@@ -509,8 +505,8 @@ fn push_line(
     descent: LayoutUnit,
     line_height: LayoutUnit,
     hard_break: bool,
-) {
-    lines.push(LineMetrics {
+) -> LineMetrics {
+    LineMetrics {
         text_start: u32::try_from(start).unwrap_or(u32::MAX),
         text_end: u32::try_from(end).unwrap_or(u32::MAX),
         baseline: ascent,
@@ -519,7 +515,7 @@ fn push_line(
         line_height,
         width,
         hard_break,
-    });
+    }
 }
 
 #[cfg(test)]
