@@ -13,6 +13,20 @@ cargo check --workspace
 cargo fmt --all -- --check
 ```
 
+Enable the local pre-push guard once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+After setup, `git push` runs the same local validation used by the push guard:
+
+```sh
+scripts/validate-before-push.sh
+```
+
+If any validation command fails, Git aborts the push.
+
 When `cargo-deny` is installed, validate license policy with:
 
 ```sh
