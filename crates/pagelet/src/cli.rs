@@ -3,8 +3,8 @@
 use std::{fs, path::Path};
 
 use crate::{
-    core::{Diagnostic, LayoutUnit, Severity},
-    document::{ChapterIr, DocumentNode},
+    core::{Diagnostic, LayoutUnit, Severity, SourceRange},
+    document::{ChapterIr, DocumentNode, LinkKind},
     epub::{
         BookSummary, CapabilityStatus, CompatibilityMode, NavigationItem, NavigationSource,
         OpenOptions,
@@ -39,7 +39,31 @@ pub fn paginate_bytes_json_with_options(
     open_options: OpenOptions,
     layout_options: LayoutOptions,
 ) -> Result<String, crate::core::PageletError> {
-    let chapter = crate::epub::open_spine_item_chapter_ir_with_options(bytes, 0, open_options)?;
+    paginate_spine_item_bytes_json_with_options(bytes, 0, open_options, layout_options)
+}
+
+/// Paginate one EPUB spine item and return deterministic PageScene JSON.
+pub fn paginate_spine_item_bytes_json(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+) -> Result<String, crate::core::PageletError> {
+    paginate_spine_item_bytes_json_with_options(
+        bytes,
+        spine_index,
+        OpenOptions::default(),
+        LayoutOptions::default(),
+    )
+}
+
+/// Paginate one EPUB spine item with explicit EPUB and layout options.
+pub fn paginate_spine_item_bytes_json_with_options(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+    open_options: OpenOptions,
+    layout_options: LayoutOptions,
+) -> Result<String, crate::core::PageletError> {
+    let chapter =
+        crate::epub::open_spine_item_chapter_ir_with_options(bytes, spine_index, open_options)?;
     let backend = DefaultTextBackend::new();
     let pages = layout::paginate_chapter_with_options(&chapter, &backend, layout_options)?;
     Ok(paginated_chapter_json(&chapter, &pages))
@@ -103,6 +127,25 @@ pub fn layout_options_from_px(width: i64, height: i64) -> LayoutOptions {
     )
 }
 
+/// Parse one spine item and return renderable ChapterIR JSON for Web/WASM consumers.
+pub fn spine_chapter_ir_json(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+) -> Result<String, crate::core::PageletError> {
+    spine_chapter_ir_json_with_options(bytes, spine_index, OpenOptions::default())
+}
+
+/// Parse one spine item with explicit options and return renderable ChapterIR JSON.
+pub fn spine_chapter_ir_json_with_options(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+    options: OpenOptions,
+) -> Result<String, crate::core::PageletError> {
+    let chapter =
+        crate::epub::open_spine_item_chapter_ir_with_options(bytes, spine_index, options)?;
+    Ok(chapter_ir_json(&chapter))
+}
+
 /// Inspect EPUB bytes with explicit open options.
 pub fn inspect_bytes_json_with_options(
     bytes: impl Into<Vec<u8>>,
@@ -118,6 +161,15 @@ pub fn inspect_bytes_json_with_options(
 #[must_use]
 pub fn book_summary_json(book: &BookSummary) -> String {
     book_summary_json_with_chapter(book, None)
+}
+
+/// Serialize renderable ChapterIR JSON for Web/WASM consumers.
+#[must_use]
+pub fn chapter_ir_json(chapter: &ChapterIr) -> String {
+    let mut out = String::new();
+    push_chapter_ir_value(&mut out, chapter, 0);
+    out.push('\n');
+    out
 }
 
 fn paginated_chapter_json(chapter: &ChapterIr, pages: &layout::PaginatedDocument) -> String {
@@ -271,86 +323,262 @@ fn push_chapter_ir(out: &mut String, chapter: Option<&ChapterIr>) {
         out.push_str("null");
         return;
     };
+    push_chapter_ir_value(out, chapter, 1);
+}
+
+fn push_chapter_ir_value(out: &mut String, chapter: &ChapterIr, level: usize) {
     out.push_str("{\n");
-    push_field(out, 2, "href", &chapter.href, true);
-    push_field(out, 2, "title", &chapter.title, true);
-    indent(out, 2);
+    push_field(out, level + 1, "href", &chapter.href, true);
+    push_field(out, level + 1, "title", &chapter.title, true);
+    indent(out, level + 1);
     out.push_str("\"document_id\": ");
     out.push_str(&chapter.document_id.get().to_string());
     out.push_str(",\n");
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("\"root\": ");
     out.push_str(&chapter.root.get().to_string());
     out.push_str(",\n");
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("\"node_count\": ");
     out.push_str(&chapter.nodes.len().to_string());
     out.push_str(",\n");
-    push_field(out, 2, "visible_text", &chapter.visible_text(), true);
+    push_field(
+        out,
+        level + 1,
+        "visible_text",
+        &chapter.visible_text(),
+        true,
+    );
 
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("\"nodes\": [\n");
     for (index, (node_id, node)) in chapter.nodes.iter_with_ids().enumerate() {
-        indent(out, 3);
-        out.push('{');
-        out.push_str("\"id\": ");
-        out.push_str(&node_id.get().to_string());
-        out.push_str(", ");
-        push_inline_field(out, "kind", document_node_kind(node), false);
-        out.push('}');
+        push_chapter_node_json(out, chapter, node_id, node, level + 2);
         if index + 1 < chapter.nodes.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("],\n");
 
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("\"anchors\": [\n");
     for (index, anchor) in chapter.anchors.anchors.values().enumerate() {
-        indent(out, 3);
+        indent(out, level + 2);
         out.push('{');
-        push_inline_field(out, "key", &anchor.key, true);
-        out.push_str("\"node_id\": ");
-        out.push_str(&anchor.node_id.get().to_string());
+        let mut first = true;
+        push_json_str_prop(out, "key", &anchor.key, &mut first);
+        push_json_str_prop(out, "document_href", &anchor.document_href, &mut first);
+        push_json_str_prop(out, "fragment", &anchor.fragment, &mut first);
+        push_json_u32_prop(out, "node_id", anchor.node_id.get(), &mut first);
+        push_json_source_range_prop(out, "source_range", anchor.source_range, &mut first);
         out.push('}');
         if index + 1 < chapter.anchors.anchors.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("],\n");
 
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("\"links\": [\n");
     for (index, link) in chapter.links.iter().enumerate() {
-        indent(out, 3);
+        indent(out, level + 2);
         out.push('{');
-        push_inline_field(out, "href", &link.href, true);
-        push_inline_field(
+        let mut first = true;
+        push_json_u32_prop(out, "source_node", link.source_node.get(), &mut first);
+        push_json_str_prop(out, "href", &link.href, &mut first);
+        push_json_opt_str_prop(
             out,
             "resolved_document",
-            link.resolved_document.as_deref().unwrap_or(""),
-            true,
+            link.resolved_document.as_deref(),
+            &mut first,
         );
-        push_inline_field(
-            out,
-            "fragment",
-            link.fragment.as_deref().unwrap_or(""),
-            false,
-        );
+        push_json_opt_str_prop(out, "fragment", link.fragment.as_deref(), &mut first);
+        push_json_str_prop(out, "kind", link_kind_name(link.kind), &mut first);
+        push_json_source_range_prop(out, "source_range", link.source_range, &mut first);
         out.push('}');
         if index + 1 < chapter.links.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    indent(out, 2);
+    indent(out, level + 1);
     out.push_str("]\n");
-    indent(out, 1);
+    indent(out, level);
     out.push('}');
+}
+
+fn push_chapter_node_json(
+    out: &mut String,
+    chapter: &ChapterIr,
+    node_id: crate::core::NodeId,
+    node: &DocumentNode,
+    level: usize,
+) {
+    indent(out, level);
+    out.push('{');
+    let mut first = true;
+    push_json_u32_prop(out, "id", node_id.get(), &mut first);
+    push_json_str_prop(out, "kind", document_node_kind(node), &mut first);
+    push_json_source_range_prop(
+        out,
+        "source_range",
+        chapter.source_map.get(node_id),
+        &mut first,
+    );
+
+    match node {
+        DocumentNode::Paragraph(text) => {
+            push_json_str_prop(out, "text", block_text(chapter, *text), &mut first);
+            push_json_u32_prop(out, "style", text.style.get(), &mut first);
+        }
+        DocumentNode::Heading(heading) => {
+            push_json_u8_prop(out, "level", heading.level, &mut first);
+            push_json_str_prop(
+                out,
+                "text",
+                block_text(chapter, heading.content),
+                &mut first,
+            );
+            push_json_u32_prop(out, "style", heading.content.style.get(), &mut first);
+        }
+        DocumentNode::List(list) => {
+            push_json_bool_prop(out, "ordered", list.ordered, &mut first);
+            push_json_children_prop(out, &list.children, &mut first);
+            push_json_u32_prop(out, "style", list.style.get(), &mut first);
+        }
+        DocumentNode::ListItem(item) => {
+            push_json_children_prop(out, &item.children, &mut first);
+            push_json_u32_prop(out, "style", item.style.get(), &mut first);
+        }
+        DocumentNode::BlockQuote(container)
+        | DocumentNode::Figure(container)
+        | DocumentNode::Table(container)
+        | DocumentNode::Container(container) => {
+            push_json_children_prop(out, &container.children, &mut first);
+            push_json_u32_prop(out, "style", container.style.get(), &mut first);
+        }
+        DocumentNode::Image(image) => {
+            push_json_str_prop(out, "src", &image.src, &mut first);
+            push_json_opt_str_prop(
+                out,
+                "resolved_path",
+                image.resolved_path.as_deref(),
+                &mut first,
+            );
+            push_json_opt_u32_prop(
+                out,
+                "resource_id",
+                image.resource_id.map(|resource| resource.get()),
+                &mut first,
+            );
+            push_json_str_prop(out, "alt", &image.alt, &mut first);
+            push_json_opt_str_prop(out, "title", image.title.as_deref(), &mut first);
+            push_json_u32_prop(out, "style", image.style.get(), &mut first);
+        }
+        DocumentNode::Footnote(footnote) => {
+            push_json_opt_str_prop(out, "note_id", footnote.note_id.as_deref(), &mut first);
+            push_json_children_prop(out, &footnote.children, &mut first);
+            push_json_u32_prop(out, "style", footnote.style.get(), &mut first);
+        }
+        DocumentNode::Unsupported(unsupported) => {
+            push_json_str_prop(out, "element", &unsupported.element, &mut first);
+            push_json_children_prop(out, &unsupported.children, &mut first);
+            push_json_u32_prop(out, "style", unsupported.style.get(), &mut first);
+        }
+        DocumentNode::Divider | DocumentNode::ForcedBreak => {}
+    }
+    out.push('}');
+}
+
+fn block_text(chapter: &ChapterIr, text: crate::document::BlockText) -> &str {
+    chapter.text_pool.get(text.text).unwrap_or("")
+}
+
+fn push_json_prop_name(out: &mut String, name: &str, first: &mut bool) {
+    if !*first {
+        out.push_str(", ");
+    }
+    *first = false;
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": ");
+}
+
+fn push_json_str_prop(out: &mut String, name: &str, value: &str, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    out.push('"');
+    out.push_str(&escape_json(value));
+    out.push('"');
+}
+
+fn push_json_opt_str_prop(out: &mut String, name: &str, value: Option<&str>, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    if let Some(value) = value {
+        out.push('"');
+        out.push_str(&escape_json(value));
+        out.push('"');
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn push_json_u32_prop(out: &mut String, name: &str, value: u32, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    out.push_str(&value.to_string());
+}
+
+fn push_json_opt_u32_prop(out: &mut String, name: &str, value: Option<u32>, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    if let Some(value) = value {
+        out.push_str(&value.to_string());
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn push_json_u8_prop(out: &mut String, name: &str, value: u8, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    out.push_str(&value.to_string());
+}
+
+fn push_json_bool_prop(out: &mut String, name: &str, value: bool, first: &mut bool) {
+    push_json_prop_name(out, name, first);
+    out.push_str(if value { "true" } else { "false" });
+}
+
+fn push_json_children_prop(out: &mut String, children: &[crate::core::NodeId], first: &mut bool) {
+    push_json_prop_name(out, "children", first);
+    out.push('[');
+    for (index, child) in children.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&child.get().to_string());
+    }
+    out.push(']');
+}
+
+fn push_json_source_range_prop(
+    out: &mut String,
+    name: &str,
+    range: Option<SourceRange>,
+    first: &mut bool,
+) {
+    push_json_prop_name(out, name, first);
+    if let Some(range) = range {
+        out.push('{');
+        out.push_str("\"start\": ");
+        out.push_str(&range.start.to_string());
+        out.push_str(", \"end\": ");
+        out.push_str(&range.end.to_string());
+        out.push('}');
+    } else {
+        out.push_str("null");
+    }
 }
 
 fn push_capabilities(out: &mut String, book: &BookSummary) {
@@ -403,6 +631,16 @@ fn document_node_kind(node: &DocumentNode) -> &'static str {
         DocumentNode::Footnote(_) => "footnote",
         DocumentNode::Container(_) => "container",
         DocumentNode::Unsupported(_) => "unsupported",
+    }
+}
+
+const fn link_kind_name(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::Internal => "internal",
+        LinkKind::External => "external",
+        LinkKind::Resource => "resource",
+        LinkKind::Footnote => "footnote",
+        LinkKind::Unknown => "unknown",
     }
 }
 

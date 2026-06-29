@@ -10,7 +10,7 @@ pub fn public_pagelet_facade_is_available() -> bool {
 #[cfg(test)]
 mod tests {
     use pagelet::epub::{open_book, resolve_resource_path, NavigationSource, OpenOptions};
-    use pagelet_testkit::{GoldenDocument, GoldenSectionName, ValidEpubBuilder};
+    use pagelet_testkit::{FixtureEntry, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
     use super::*;
 
@@ -97,5 +97,83 @@ mod tests {
             error.code(),
             pagelet::core::DiagnosticCode::ResourceLimitExceeded
         );
+    }
+
+    #[test]
+    fn wasm_chapter_ir_json_contains_renderable_node_contract() {
+        let fixture = wasm_contract_fixture();
+
+        let json =
+            pagelet::cli::spine_chapter_ir_json(fixture.bytes().to_vec(), 0).expect("chapter json");
+
+        assert!(json.contains(r#""href": "EPUB/chapter-1.xhtml""#));
+        assert!(json.contains(r#""kind": "heading""#));
+        assert!(json.contains(r#""level": 1"#));
+        assert!(json.contains(r#""text": "Intro""#));
+        assert!(json.contains(r#""kind": "list""#));
+        assert!(json.contains(r#""children": ["#));
+        assert!(json.contains(r#""kind": "image""#));
+        assert!(json.contains(r#""resolved_path": "EPUB/images/cover.png""#));
+        assert!(json.contains(r#""resource_id": "#));
+        assert!(json.contains(r#""alt": "Cover""#));
+        assert!(json.contains(r#""document_href": "EPUB/chapter-1.xhtml""#));
+        assert!(json.contains(r#""kind": "internal""#));
+        assert!(json.contains(r#""source_range": {"#));
+    }
+
+    #[test]
+    fn wasm_pagination_json_supports_explicit_spine_item() {
+        let fixture = wasm_contract_fixture();
+        let options = pagelet::cli::layout_options_from_px(360, 480);
+
+        let json = pagelet::cli::paginate_spine_item_bytes_json_with_options(
+            fixture.bytes().to_vec(),
+            0,
+            OpenOptions::default(),
+            options,
+        )
+        .expect("pagination json");
+
+        assert!(json.contains(r#""href": "EPUB/chapter-1.xhtml""#));
+        assert!(json.contains(r#""page_count": "#));
+        assert!(json.contains(r#""pagination": {"#));
+        assert!(json.contains(r#""complete": true"#));
+        assert!(json.contains(r#""pages": ["#));
+        assert!(json.contains(r#""page_index": 0"#));
+        assert!(json.contains(r#""fragments": ["#));
+    }
+
+    #[test]
+    fn wasm_resource_read_returns_bytes_and_media_type() {
+        let fixture = wasm_contract_fixture();
+        let book = open_book(fixture.bytes().to_vec()).expect("open fixture");
+        let image = book
+            .resources
+            .iter()
+            .find(|resource| resource.path.as_ref() == "EPUB/images/cover.png")
+            .expect("image resource");
+
+        let payload =
+            pagelet::epub::read_resource_bytes(fixture.bytes().to_vec(), image.id).expect("read");
+
+        assert_eq!(payload.id, image.id);
+        assert_eq!(payload.path.as_ref(), "EPUB/images/cover.png");
+        assert_eq!(payload.media_type.as_str(), "image/png");
+        assert_eq!(payload.bytes, b"png bytes".to_vec());
+    }
+
+    fn wasm_contract_fixture() -> pagelet_testkit::Fixture {
+        ValidEpubBuilder::epub3("wasm-contract")
+            .xhtml(
+                "EPUB/chapter-1.xhtml",
+                "Chapter 1",
+                r##"<h1 id="intro">Intro</h1><p>Alpha <a href="#intro">again</a>.</p><ul><li>One</li></ul><figure><img src="images/cover.png" alt="Cover"/></figure>"##,
+            )
+            .entry(FixtureEntry::new(
+                "EPUB/images/cover.png",
+                "image/png",
+                b"png bytes".to_vec(),
+            ))
+            .build()
     }
 }

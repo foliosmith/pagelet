@@ -109,6 +109,7 @@ pub struct ResourceMetadata {
 pub struct ResourceBytes {
     pub id: ResourceId,
     pub path: Arc<str>,
+    pub media_type: MediaType,
     pub bytes: Vec<u8>,
 }
 
@@ -390,6 +391,10 @@ impl ZipPublicationStore {
                 .metadata(resource_id)
                 .map(|metadata| metadata.path.clone())
                 .unwrap_or_else(|| Arc::from(entry.path.as_str())),
+            media_type: self
+                .metadata(resource_id)
+                .map(|metadata| metadata.media_type.clone())
+                .unwrap_or_else(|| MediaType::new("application/octet-stream")),
             bytes,
         })
     }
@@ -652,6 +657,24 @@ pub fn open_spine_item_chapter_ir_with_options(
         Some(&opened.store),
         options,
     )
+}
+
+/// Read one resource by typed id with compatible defaults.
+pub fn read_resource_bytes(
+    bytes: impl Into<Vec<u8>>,
+    resource_id: ResourceId,
+) -> Result<ResourceBytes, PageletError> {
+    read_resource_bytes_with_options(bytes, resource_id, OpenOptions::default())
+}
+
+/// Read one resource by typed id using explicit open options.
+pub fn read_resource_bytes_with_options(
+    bytes: impl Into<Vec<u8>>,
+    resource_id: ResourceId,
+    options: OpenOptions,
+) -> Result<ResourceBytes, PageletError> {
+    let store = ZipPublicationStore::from_bytes(bytes, options)?;
+    store.read(resource_id)
 }
 
 fn open_book_context(
