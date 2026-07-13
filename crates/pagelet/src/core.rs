@@ -52,6 +52,7 @@ id_type!(NodeId, u32);
 id_type!(ResourceId, u32);
 id_type!(StyleId, u32);
 id_type!(FontId, u32);
+id_type!(BlockId, u32);
 
 /// Fixed-point layout unit with 1/64 logical pixel precision.
 #[repr(transparent)]
@@ -238,6 +239,177 @@ impl TextAnchor {
             affinity,
         }
     }
+}
+
+/// EPUB Canonical Fragment Identifier.
+///
+/// CFIs identify a precise position, range, or structural element within an
+/// EPUB publication.  This type stores a pre-computed CFI string together with
+/// the spine index and node path that were used to construct it so that
+/// consumers can navigate without re-parsing the string.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct EpubCfi {
+    pub spine_index: u32,
+    pub node_steps: Vec<(u32, Option<Arc<str>>)>,
+    pub character_offset: Option<u32>,
+}
+
+impl EpubCfi {
+    /// Create a CFI from a spine index, node step list and optional char offset.
+    #[must_use]
+    pub fn new(
+        spine_index: u32,
+        node_steps: Vec<(u32, Option<Arc<str>>)>,
+        character_offset: Option<u32>,
+    ) -> Self {
+        Self {
+            spine_index,
+            node_steps,
+            character_offset,
+        }
+    }
+
+    /// Serialize into an EPUB CFI string per the EPUB 3 spec section 4.2.
+    #[must_use]
+    pub fn to_cfi_string(&self) -> String {
+        let mut out = String::from("epubcfi(");
+        out.push_str(&format!(
+            "/{}",
+            self.spine_index.saturating_mul(2).saturating_add(4)
+        ));
+        if !self.node_steps.is_empty() {
+            out.push('!');
+            for (step, id) in &self.node_steps {
+                out.push_str(&format!("/{}", step.saturating_mul(2)));
+                if let Some(id) = id {
+                    out.push('[');
+                    out.push_str(id);
+                    out.push(']');
+                }
+            }
+        }
+        if let Some(offset) = self.character_offset {
+            out.push_str(&format!("/:{offset}"));
+        }
+        out.push(')');
+        out
+    }
+
+    /// Parse a minimal subset of EPUB CFI strings.
+    ///
+    /// Currently supports the common `epubcfi(/spine!.../:offset)` pattern.
+    /// Returns `None` when the input does not match the expected prefix.
+    #[must_use]
+    pub fn parse(input: &str) -> Option<Self> {
+        let body = input.strip_prefix("epubcfi(")?.strip_suffix(')')?;
+        let mut parts = body.splitn(2, '!');
+        let spine_part = parts.next()?;
+        let spine_step: u32 = spine_part
+            .strip_prefix('/')
+            .and_then(|s| s.parse().ok())
+            .filter(|s| s % 2 == 0)
+            .filter(|s| s >= &4)?;
+        let spine_index = (spine_step.saturating_sub(4)) / 2;
+        let rest = parts.next();
+
+        let mut node_steps = Vec::new();
+        let mut character_offset = None;
+
+        if let Some(rest) = rest {
+            let mut segment = rest;
+            while !segment.is_empty() {
+                if let Some(rest_after_colon) = segment.strip_prefix("/:") {
+                    character_offset = rest_after_colon.parse().ok();
+                    break;
+                }
+                let rest_after_step = segment.strip_prefix('/').and_then(|s| {
+                    let step_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+                    let step: u32 = s[..step_end].parse().ok()?;
+                    let rest = &s[step_end..];
+                    let id: Option<Arc<str>> = rest.strip_prefix('[').and_then(|s| {
+                        let id_end = s.find(']')?;
+                        Some(Arc::from(s[..id_end].to_owned()))
+                    });
+                    Some((step, id))
+                })?;
+                let step_value = rest_after_step.0;
+                let id_len = rest_after_step
+                    .1
+                    .as_ref()
+                    .map_or(0, |id| id.len().saturating_add(2));
+                if step_value % 2 == 0 {
+                    node_steps.push((step_value / 2, rest_after_step.1));
+                }
+                let consumed = format!("/{step_value}").len() + id_len;
+                segment = &segment[consumed.min(segment.len())..];
+            }
+        }
+
+        Some(Self {
+            spine_index,
+            node_steps,
+            character_offset,
+        })
+    }
+}
+
+impl fmt::Display for EpubCfi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_cfi_string())
+    }
+}
+
+/// Per-block text fingerprint derived from the block text content.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct BlockFingerprint(ContentHash);
+
+impl BlockFingerprint {
+    /// Compute a fingerprint from the block text bytes.
+    #[must_use]
+    pub fn from_text(text: &str) -> Self {
+        Self(ContentHash::from_bytes(text.as_bytes()))
+    }
+
+    /// Return the underlying content hash.
+    #[must_use]
+    pub const fn hash(&self) -> &ContentHash {
+        &self.0
+    }
+
+    /// Return the first 16 hex characters for human-readable short ids.
+    #[must_use]
+    pub fn short_id(&self) -> String {
+        hex_encode(&self.0.as_bytes()[..8])
+    }
+}
+
+/// Stable block identifier combining chapter path, order, and text fingerprint.
+///
+/// A stable block_id remains unchanged across repeated parses of the same
+/// EPUB as long as the chapter structure and block text stay the same.
+#[must_use]
+pub fn make_stable_block_id(
+    chapter_href: &str,
+    order: u32,
+    fingerprint: BlockFingerprint,
+) -> String {
+    let mut input = String::with_capacity(chapter_href.len() + 64);
+    input.push_str(chapter_href);
+    input.push('/');
+    input.push_str(&order.to_string());
+    input.push(':');
+    input.push_str(&fingerprint.short_id());
+    hex_encode(&ContentHash::from_bytes(input.as_bytes()).as_bytes()[..16])
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Severity of a diagnostic.

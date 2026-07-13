@@ -363,6 +363,27 @@ fn push_chapter_ir_value(out: &mut String, chapter: &ChapterIr, level: usize) {
     out.push_str("],\n");
 
     indent(out, level + 1);
+    out.push_str("\"blocks\": [\n");
+    let blocks = chapter.blocks();
+    for (index, block) in blocks.iter().enumerate() {
+        indent(out, level + 2);
+        out.push('{');
+        let mut first = true;
+        push_json_u32_prop(out, "node_id", block.node_id.get(), &mut first);
+        push_json_u32_prop(out, "order", block.order, &mut first);
+        push_json_str_prop(out, "block_id", &block.block_id, &mut first);
+        push_json_str_prop(out, "kind", &block.kind, &mut first);
+        push_json_str_prop(out, "text", &block.text, &mut first);
+        out.push('}');
+        if index + 1 < blocks.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, level + 1);
+    out.push_str("],\n");
+
+    indent(out, level + 1);
     out.push_str("\"anchors\": [\n");
     for (index, anchor) in chapter.anchors.anchors.values().enumerate() {
         indent(out, level + 2);

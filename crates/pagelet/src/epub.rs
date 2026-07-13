@@ -842,6 +842,106 @@ fn enrich_resource_table(
     Ok(())
 }
 
+/// Heuristic to detect likely noise chapters (copyright, TOC, ads, boilerplate).
+///
+/// Returns true when the title or content strongly indicates the chapter is
+/// not part of the main book content.
+#[must_use]
+pub fn is_likely_noise_chapter(
+    title: &str,
+    visible_text: &str,
+    spine_index: usize,
+    spine_len: usize,
+) -> bool {
+    let lower_title = title.to_ascii_lowercase();
+    let lower_text = visible_text.to_ascii_lowercase();
+
+    let noise_title_keywords = [
+        "copyright",
+        "legal",
+        "imprint",
+        "colophon",
+        "acknowledgments",
+        "acknowledgements",
+        "credits",
+        "license",
+        "trademark",
+        "cataloging",
+        "publication data",
+        "verso",
+        "title page",
+        "half-title",
+        "bastard title",
+        "also by",
+        "other books",
+        "by the same author",
+        "front matter",
+        "epigraph",
+        "dedication",
+        "praise for",
+    ];
+    if noise_title_keywords
+        .iter()
+        .any(|kw| lower_title.contains(kw))
+    {
+        return true;
+    }
+
+    let noise_text_patterns = [
+        "copyright ©",
+        "all rights reserved",
+        "isbn",
+        "library of congress",
+        "cataloging-in-publication",
+        "printed in",
+    ];
+    let short_text = visible_text.len() < 300;
+    if short_text
+        && noise_text_patterns
+            .iter()
+            .any(|pat| lower_text.contains(pat))
+    {
+        return true;
+    }
+
+    if spine_index == 0
+        && visible_text.len() < 200
+        && (lower_text.contains("copyright") || lower_text.contains("title page"))
+    {
+        return true;
+    }
+
+    let is_end_matter = spine_index >= spine_len.saturating_sub(2);
+    if is_end_matter
+        && visible_text.len() < 500
+        && noise_text_patterns
+            .iter()
+            .any(|pat| lower_text.contains(pat))
+    {
+        return true;
+    }
+
+    if !lower_text.contains(' ') && visible_text.len() > 100 {
+        return true;
+    }
+
+    if visible_text.len() < 30 && !lower_text.chars().any(|c| c.is_alphanumeric()) {
+        return true;
+    }
+
+    false
+}
+
+/// Return spine indices that pass the noise filter, preserving original order.
+#[must_use]
+pub fn filter_noise_chapters(chapters: &[(usize, &str, &str)], spine_len: usize) -> Vec<usize> {
+    chapters
+        .iter()
+        .filter(|(index, title, text)| !is_likely_noise_chapter(title, text, *index, spine_len))
+        .map(|(index, ..)| *index)
+        .collect()
+}
+
 /// Parse intrinsic dimensions from a bounded image header.
 #[must_use]
 pub fn parse_image_header(bytes: &[u8], media_type: &str) -> Option<document::ImageSize> {
@@ -2320,6 +2420,7 @@ fn salvage_chapter_ir(
         SourceRange::new(0, u32::try_from(input.len()).unwrap_or(u32::MAX)),
     );
     chapter.rebuild_utf16_index();
+    chapter.rebuild_blocks();
     Ok(chapter)
 }
 
@@ -2357,6 +2458,7 @@ impl ChapterBuilder<'_> {
         self.chapter.root = root;
         self.resolve_footnotes()?;
         self.chapter.rebuild_utf16_index();
+        self.chapter.rebuild_blocks();
         Ok(self.chapter.clone())
     }
 

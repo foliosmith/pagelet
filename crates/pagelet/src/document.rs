@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::core::{
-    ContentHash, Diagnostic, DiagnosticCode, DocumentId, NodeId, PageletError, ResourceId,
-    ResourceLimitError, ResourceLimitKind, SourceRange, StyleId,
+    make_stable_block_id, BlockFingerprint, ContentHash, Diagnostic, DiagnosticCode, DocumentId,
+    NodeId, PageletError, ResourceId, ResourceLimitError, ResourceLimitKind, SourceRange, StyleId,
 };
 
 /// Package-level intermediate representation.
@@ -302,6 +302,8 @@ pub struct ChapterIr {
     pub utf16_index: Utf16Index,
     pub diagnostics: Vec<Diagnostic>,
     pub content_hash: ContentHash,
+    pub block_order: BTreeMap<NodeId, u32>,
+    pub block_fingerprints: BTreeMap<NodeId, BlockFingerprint>,
 }
 
 impl ChapterIr {
@@ -327,7 +329,146 @@ impl ChapterIr {
             utf16_index: Utf16Index::new(),
             diagnostics: Vec::new(),
             content_hash,
+            block_order: BTreeMap::new(),
+            block_fingerprints: BTreeMap::new(),
         }
+    }
+
+    /// Rebuild block order and compute per-block text fingerprints.
+    pub fn rebuild_blocks(&mut self) {
+        self.block_order.clear();
+        self.block_fingerprints.clear();
+        let mut order = 0_u32;
+        self.collect_blocks(self.root, &mut order);
+    }
+
+    fn collect_blocks(&mut self, node_id: NodeId, order: &mut u32) {
+        let node = match self.nodes.get(node_id) {
+            Some(node) => node,
+            None => return,
+        };
+        match node {
+            DocumentNode::Paragraph(_)
+            | DocumentNode::Heading(_)
+            | DocumentNode::Footnote(_)
+            | DocumentNode::Divider
+            | DocumentNode::ForcedBreak => {
+                self.block_order.insert(node_id, *order);
+                *order += 1;
+                if let Some(text) = self.node_text(node_id) {
+                    self.block_fingerprints
+                        .insert(node_id, BlockFingerprint::from_text(&text));
+                } else {
+                    self.block_fingerprints
+                        .insert(node_id, BlockFingerprint::from_text(""));
+                }
+            }
+            _ => {
+                let children: Vec<NodeId> = node.children().to_vec();
+                for child in children {
+                    self.collect_blocks(child, order);
+                }
+            }
+        }
+    }
+
+    fn node_text(&self, node_id: NodeId) -> Option<String> {
+        let node = self.nodes.get(node_id)?;
+        match node {
+            DocumentNode::Paragraph(text) => self.text_pool.get(text.text).map(|s| s.to_owned()),
+            DocumentNode::Heading(heading) => self
+                .text_pool
+                .get(heading.content.text)
+                .map(|s| s.to_owned()),
+            DocumentNode::Footnote(note) => {
+                let mut out = String::new();
+                for child in &note.children {
+                    if let Some(DocumentNode::Paragraph(text)) = self.nodes.get(*child) {
+                        if let Some(s) = self.text_pool.get(text.text) {
+                            out.push_str(s);
+                        }
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return all text-bearing blocks with stable identifiers.
+    #[must_use]
+    pub fn blocks(&self) -> Vec<ChapterBlock> {
+        let mut blocks: Vec<_> = self
+            .block_order
+            .iter()
+            .filter_map(|(node_id, order)| {
+                let fingerprint = self.block_fingerprints.get(node_id)?;
+                let node = self.nodes.get(*node_id)?;
+                let text = self.node_text(*node_id).unwrap_or_default();
+                let block_id = make_stable_block_id(&self.href, *order, *fingerprint);
+                let kind = chapter_block_kind(node);
+                Some(ChapterBlock {
+                    node_id: *node_id,
+                    order: *order,
+                    block_id,
+                    kind: kind.to_owned(),
+                    text,
+                    fingerprint: *fingerprint,
+                })
+            })
+            .collect();
+        blocks.sort_by_key(|block| block.order);
+        blocks
+    }
+
+    /// Build EPUB CFI for a given node and optional character offset.
+    #[must_use]
+    pub fn node_cfi(
+        &self,
+        node_id: NodeId,
+        spine_index: u32,
+        character_offset: Option<u32>,
+    ) -> Option<crate::core::EpubCfi> {
+        let mut steps = Vec::new();
+        self.cfi_steps(node_id, &mut steps);
+        if steps.is_empty() {
+            return None;
+        }
+        steps.reverse();
+        Some(crate::core::EpubCfi::new(
+            spine_index,
+            steps,
+            character_offset,
+        ))
+    }
+
+    fn cfi_steps(&self, node_id: NodeId, steps: &mut Vec<(u32, Option<Arc<str>>)>) {
+        let order = self.block_order.get(&node_id).copied();
+        let element_id = self.element_id_for_node(node_id);
+        if let Some(order) = order {
+            steps.push((order, element_id));
+        }
+        if let Some(parent) = self.parent_node(node_id) {
+            self.cfi_steps(parent, steps);
+        }
+    }
+
+    fn parent_node(&self, node_id: NodeId) -> Option<NodeId> {
+        for (candidate_id, candidate) in self.nodes.iter_with_ids() {
+            if candidate.children().contains(&node_id) {
+                return Some(candidate_id);
+            }
+        }
+        None
+    }
+
+    fn element_id_for_node(&self, node_id: NodeId) -> Option<Arc<str>> {
+        for anchor in self.anchors.anchors.values() {
+            if anchor.node_id == node_id {
+                return Some(anchor.key.clone());
+            }
+        }
+        None
     }
 
     /// Rebuild derived UTF-16 lookup tables from text-bearing nodes.
@@ -637,6 +778,35 @@ pub struct UnsupportedNode {
     pub element: Arc<str>,
     pub children: Vec<NodeId>,
     pub style: StyleId,
+}
+
+/// One text-bearing block exported for codexia / Book IR consumers.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ChapterBlock {
+    pub node_id: NodeId,
+    pub order: u32,
+    pub block_id: String,
+    pub kind: String,
+    pub text: String,
+    pub fingerprint: BlockFingerprint,
+}
+
+/// Return a stable label for a document node's block kind.
+#[must_use]
+pub fn chapter_block_kind(node: &DocumentNode) -> &'static str {
+    match node {
+        DocumentNode::Paragraph(_) => "paragraph",
+        DocumentNode::Heading(heading) => match heading.level {
+            1 => "heading-1",
+            2 => "heading-2",
+            3 => "heading-3",
+            _ => "heading",
+        },
+        DocumentNode::Footnote(_) => "footnote",
+        DocumentNode::Divider => "divider",
+        DocumentNode::ForcedBreak => "forced-break",
+        _ => "other",
+    }
 }
 
 /// Anchor index keyed by `resolved-document-href#fragment`.
