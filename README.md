@@ -44,6 +44,20 @@ The minimum supported Rust version is declared in `Cargo.toml` and currently
 set to Rust 1.80. The local development toolchain is pinned by
 `rust-toolchain.toml`.
 
+## External Standards Tools
+
+Pinned W3C EPUB Tests and EPUBCheck distributions are described by
+`tests/corpus-manifest.toml`. Download them explicitly, then keep validation
+offline:
+
+```sh
+cargo xtask external sync --locked
+cargo xtask external verify
+```
+
+Artifacts default to `target/pagelet-external` and are not committed. Set
+`PAGELET_EXTERNAL_ROOT` when CI or a shared local cache uses another location.
+
 ## Licensing
 
 pagelet is licensed under either of:

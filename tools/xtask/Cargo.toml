@@ -10,6 +10,7 @@ description = "Private pagelet development automation."
 [dependencies]
 pagelet = { path = "../../crates/pagelet", version = "0.1.0" }
 pagelet-testkit = { path = "../pagelet-testkit", version = "0.1.0" }
+sha2 = "0.10.9"
 
 [lints]
 workspace = true

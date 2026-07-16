@@ -71,6 +71,17 @@ Rules:
   feature coverage before use in CI.
 - Golden output must be normalized and deterministic.
 
+External standards tools are never fetched implicitly by tests. After a
+checked-in pin changes, synchronize and verify it explicitly:
+
+```sh
+cargo xtask external sync --locked
+cargo xtask external verify
+```
+
+The sync command requires `--locked`; both commands reject artifacts whose
+SHA-256 does not match `tests/corpus-manifest.toml`.
+
 ## Benchmarks
 
 Performance work must identify the fixture, profile stage, target platform, and

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod external;
+
 use std::{
     env, fs,
     hint::black_box,
@@ -38,7 +40,7 @@ fn run(args: Vec<String>) -> Result<(), XtaskError> {
         "manifests" => run_manifests(&args[1..]),
         "bench" => run_bench(&args[1..]),
         "release" => print_command_help("release", "verify and publish the pagelet crate"),
-        "external" => print_command_help("external", "sync and verify external test tools"),
+        "external" => external::run(&args[1..]),
         other => Err(XtaskError::Usage(format!("unknown xtask command: {other}"))),
     }
 }
@@ -547,6 +549,7 @@ fn manifest_lint() -> Result<(), XtaskError> {
         let text = fs::read_to_string(file)?;
         require_schema_version(file, &text)?;
     }
+    external::lint_manifest(Path::new("tests/corpus-manifest.toml"))?;
     read_perf_budget_manifest(Path::new("perf/performance-budgets.toml"))?;
     validate_quoted_values(
         "tests/corpus-manifest.toml",
