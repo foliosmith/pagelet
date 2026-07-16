@@ -13,9 +13,9 @@ use miniz_oxide::inflate::{decompress_to_vec_with_limit, TINFLStatus};
 
 pub use crate::core::ResourceId;
 use crate::core::{
-    ContentHash, Diagnostic, DiagnosticCode, DocumentId, NodeId, PackageError, PageletError,
-    ParseError, ResourceLimitError, ResourceLimitKind, ResourceLimits, Severity, SourceRange,
-    StyleId, UnsupportedFeature,
+    ContentHash, Diagnostic, DiagnosticCode, DocumentId, LayoutUnit, NodeId, PackageError,
+    PageletError, ParseError, ResourceLimitError, ResourceLimitKind, ResourceLimits, Severity,
+    SourceRange, StyleId, UnsupportedFeature,
 };
 use crate::document;
 
@@ -2387,6 +2387,7 @@ fn chapter_ir_from_xhtml(
         chapter: document::ChapterIr::empty(document_id, href, title, content_hash),
         default_style: StyleId::new(0),
         computed_styles: BTreeMap::new(),
+        font_contexts: BTreeMap::new(),
         tree: &tree,
     };
     builder.build()
@@ -2435,7 +2436,30 @@ struct ChapterBuilder<'a> {
     chapter: document::ChapterIr,
     default_style: StyleId,
     computed_styles: BTreeMap<usize, (StyleId, document::ComputedStyle)>,
+    font_contexts: BTreeMap<usize, ResolvedFontContext>,
     tree: &'a XhtmlDocument,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedFontContext {
+    font_size: LayoutUnit,
+    line_height: ResolvedLineHeight,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedLineHeight {
+    Normal,
+    Absolute(LayoutUnit),
+    Multiplier(f64),
+}
+
+impl Default for ResolvedFontContext {
+    fn default() -> Self {
+        Self {
+            font_size: LayoutUnit::from_px(16),
+            line_height: ResolvedLineHeight::Normal,
+        }
+    }
 }
 
 impl ChapterBuilder<'_> {
@@ -2602,18 +2626,7 @@ impl ChapterBuilder<'_> {
             }
             "aside" if is_footnote_element(element) => None,
             "a" | "span" | "em" | "strong" | "b" | "i" => {
-                let text = self.inline_text(node_id).0;
-                let text = text.trim();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(self.text_block_node(
-                        DocumentNodeKind::Paragraph,
-                        text,
-                        source_range.unwrap_or_default(),
-                        style,
-                    )?)
-                }
+                self.inline_element_text_node(node_id, style)?
             }
             _ => {
                 let children = self.convert_children(node_id)?;
@@ -2634,6 +2647,27 @@ impl ChapterBuilder<'_> {
         } else {
             Ok(None)
         }
+    }
+
+    fn inline_element_text_node(
+        &mut self,
+        tree_node_id: usize,
+        style: StyleId,
+    ) -> Result<Option<NodeId>, PageletError> {
+        let (text, links, anchors) = self.inline_text(tree_node_id);
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let source_range = self
+            .tree
+            .node(tree_node_id)
+            .map(|node| node.source_range)
+            .unwrap_or_default();
+        let node_id =
+            self.text_block_node(DocumentNodeKind::Paragraph, text, source_range, style)?;
+        self.add_inline_metadata(node_id, links, anchors);
+        Ok(Some(node_id))
     }
 
     fn block_text_node(
@@ -2758,21 +2792,50 @@ impl ChapterBuilder<'_> {
             return Ok(self.default_style);
         };
 
-        let inherited = if let Some(parent) = self.parent_node(tree_node_id) {
+        let parent = self.parent_node(tree_node_id);
+        let (inherited, parent_font) = if let Some(parent) = parent {
             let parent_id = self.style_for_node(parent)?;
-            self.chapter
-                .styles
-                .get(parent_id)
-                .cloned()
-                .unwrap_or_default()
+            (
+                self.chapter
+                    .styles
+                    .get(parent_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.font_contexts.get(&parent).copied().unwrap_or_default(),
+            )
         } else {
-            document::ComputedStyle::new()
+            (
+                document::ComputedStyle::new(),
+                ResolvedFontContext::default(),
+            )
         };
         let snapshot = self.snapshot_for_element(element);
         let ancestors = self.ancestor_snapshots(tree_node_id);
-        let style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &inherited);
+        let authored = cascade_css_for_element(
+            &snapshot,
+            &ancestors,
+            &self.css,
+            &document::ComputedStyle::new(),
+        );
+        let mut style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &inherited);
+        let root_font_size = if element.local_name() == "html" {
+            LayoutUnit::from_px(16)
+        } else {
+            self.find_first_element(self.tree.root, "html")
+                .and_then(|root| self.font_contexts.get(&root))
+                .map_or(LayoutUnit::from_px(16), |context| context.font_size)
+        };
+        let font_context = resolve_font_metrics(
+            element.local_name(),
+            &mut style,
+            &authored,
+            &inherited,
+            parent_font,
+            root_font_size,
+        );
         let style_id = self.chapter.styles.intern(style.clone())?;
         self.computed_styles.insert(tree_node_id, (style_id, style));
+        self.font_contexts.insert(tree_node_id, font_context);
         Ok(style_id)
     }
 
@@ -3024,6 +3087,172 @@ impl ChapterBuilder<'_> {
             });
         }
     }
+}
+
+fn resolve_font_metrics(
+    element_name: &str,
+    style: &mut document::ComputedStyle,
+    authored: &document::ComputedStyle,
+    inherited: &document::ComputedStyle,
+    parent: ResolvedFontContext,
+    root_font_size: LayoutUnit,
+) -> ResolvedFontContext {
+    let authored_font_size = authored.properties.get("font-size").map(AsRef::as_ref);
+    let inherits_font_size = inherited.properties.contains_key("font-size");
+    let font_size = authored_font_size
+        .and_then(|value| resolve_font_size(value, parent.font_size, root_font_size))
+        .unwrap_or_else(|| {
+            if inherits_font_size {
+                parent.font_size
+            } else {
+                default_font_size_for_element(element_name)
+            }
+        });
+    if authored_font_size.is_some() || inherits_font_size {
+        style
+            .properties
+            .insert(Arc::from("font-size"), Arc::from(format_css_px(font_size)));
+    }
+
+    let authored_line_height = authored.properties.get("line-height").map(AsRef::as_ref);
+    let inherits_line_height = inherited.properties.contains_key("line-height");
+    let line_height = if let Some(value) = authored_line_height {
+        resolve_line_height(value, font_size, root_font_size, parent.line_height).unwrap_or({
+            if inherits_line_height {
+                parent.line_height
+            } else {
+                ResolvedLineHeight::Normal
+            }
+        })
+    } else if inherits_line_height {
+        parent.line_height
+    } else {
+        ResolvedLineHeight::Normal
+    };
+    if authored_line_height.is_some() || inherits_line_height {
+        let value = match line_height {
+            ResolvedLineHeight::Normal => Arc::from("normal"),
+            ResolvedLineHeight::Absolute(value) => Arc::from(format_css_px(value)),
+            ResolvedLineHeight::Multiplier(multiplier) => {
+                Arc::from(format_css_px(scale_layout_unit(font_size, multiplier)))
+            }
+        };
+        style.properties.insert(Arc::from("line-height"), value);
+    }
+
+    ResolvedFontContext {
+        font_size,
+        line_height,
+    }
+}
+
+fn resolve_font_size(
+    value: &str,
+    parent_font_size: LayoutUnit,
+    root_font_size: LayoutUnit,
+) -> Option<LayoutUnit> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "inherit" | "unset" => Some(parent_font_size),
+        "initial" | "medium" => Some(LayoutUnit::from_px(16)),
+        "xx-small" => Some(LayoutUnit::from_px(9)),
+        "x-small" => Some(LayoutUnit::from_px(10)),
+        "small" => Some(LayoutUnit::from_px(13)),
+        "large" => Some(LayoutUnit::from_px(18)),
+        "x-large" => Some(LayoutUnit::from_px(24)),
+        "xx-large" => Some(LayoutUnit::from_px(32)),
+        "xxx-large" => Some(LayoutUnit::from_px(48)),
+        "smaller" => Some(scale_layout_unit(parent_font_size, 0.8)),
+        "larger" => Some(scale_layout_unit(parent_font_size, 1.2)),
+        _ => parse_css_length(&value, parent_font_size, root_font_size, parent_font_size),
+    }
+}
+
+fn resolve_line_height(
+    value: &str,
+    font_size: LayoutUnit,
+    root_font_size: LayoutUnit,
+    parent_line_height: ResolvedLineHeight,
+) -> Option<ResolvedLineHeight> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "normal" | "initial" => Some(ResolvedLineHeight::Normal),
+        "inherit" | "unset" => Some(parent_line_height),
+        _ => {
+            if let Some(multiplier) = parse_css_number(&value) {
+                return Some(ResolvedLineHeight::Multiplier(multiplier));
+            }
+            parse_css_length(&value, font_size, root_font_size, font_size)
+                .map(ResolvedLineHeight::Absolute)
+        }
+    }
+}
+
+fn parse_css_length(
+    value: &str,
+    em_base: LayoutUnit,
+    rem_base: LayoutUnit,
+    percent_base: LayoutUnit,
+) -> Option<LayoutUnit> {
+    if let Some(number) = value.strip_suffix("rem") {
+        return parse_css_number_value(number).map(|factor| scale_layout_unit(rem_base, factor));
+    }
+    if let Some(number) = value.strip_suffix("em") {
+        return parse_css_number_value(number).map(|factor| scale_layout_unit(em_base, factor));
+    }
+    if let Some(number) = value.strip_suffix('%') {
+        return parse_css_number_value(number)
+            .map(|percent| scale_layout_unit(percent_base, percent / 100.0));
+    }
+    if let Some(number) = value.strip_suffix("px") {
+        return parse_css_number_value(number).map(LayoutUnit::from_f64_px);
+    }
+    (value.trim() == "0").then_some(LayoutUnit::ZERO)
+}
+
+fn parse_css_number(value: &str) -> Option<f64> {
+    if value.ends_with(|ch: char| ch.is_ascii_alphabetic() || ch == '%') {
+        return None;
+    }
+    parse_css_number_value(value)
+}
+
+fn parse_css_number_value(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn scale_layout_unit(value: LayoutUnit, factor: f64) -> LayoutUnit {
+    LayoutUnit::from_f64_px(value.to_f64_px() * factor)
+}
+
+fn default_font_size_for_element(element_name: &str) -> LayoutUnit {
+    let pixels = match element_name {
+        "h1" => 30,
+        "h2" => 27,
+        "h3" => 24,
+        "h4" => 21,
+        "h5" | "h6" => 18,
+        _ => 16,
+    };
+    LayoutUnit::from_px(pixels)
+}
+
+fn format_css_px(value: LayoutUnit) -> String {
+    if value.raw() % LayoutUnit::SCALE == 0 {
+        return format!("{}px", value.raw() / LayoutUnit::SCALE);
+    }
+    let mut number = format!("{:.6}", value.to_f64_px());
+    while number.ends_with('0') {
+        number.pop();
+    }
+    if number.ends_with('.') {
+        number.pop();
+    }
+    format!("{number}px")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3963,6 +4192,65 @@ mod tests {
     }
 
     #[test]
+    fn standalone_anchor_elements_keep_link_metadata() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::FootnoteCollision,
+            "Standalone links",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"
+            <a id="jump" href="#target">Jump to target</a>
+            <a href="https://example.com/reference">External reference</a>
+            <a epub:type="noteref" href="#fn1">Footnote</a>
+            <p id="target">Target paragraph.</p>
+            <aside epub:type="footnote" id="fn1"><p>Footnote body.</p></aside>
+            "##,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+
+        assert_eq!(chapter.links.len(), 3);
+        let internal = chapter
+            .links
+            .iter()
+            .find(|link| link.href.as_ref() == "#target")
+            .expect("internal link");
+        assert_eq!(internal.kind, document::LinkKind::Internal);
+        assert_eq!(internal.fragment.as_deref(), Some("target"));
+        assert_eq!(
+            internal.resolved_document.as_deref(),
+            Some("EPUB/chapter-1.xhtml")
+        );
+
+        let external = chapter
+            .links
+            .iter()
+            .find(|link| link.href.as_ref() == "https://example.com/reference")
+            .expect("external link");
+        assert_eq!(external.kind, document::LinkKind::External);
+        assert!(external.resolved_document.is_none());
+
+        let footnote = chapter
+            .links
+            .iter()
+            .find(|link| link.href.as_ref() == "#fn1")
+            .expect("footnote link");
+        assert_eq!(footnote.kind, document::LinkKind::Footnote);
+        assert_eq!(footnote.fragment.as_deref(), Some("fn1"));
+
+        for link in &chapter.links {
+            assert!(matches!(
+                chapter.nodes.get(link.source_node),
+                Some(document::DocumentNode::Paragraph(_))
+            ));
+            assert!(link.source_range.is_some());
+        }
+        assert!(chapter.anchors.get("EPUB/chapter-1.xhtml#jump").is_some());
+    }
+
+    #[test]
     fn compatible_mode_salvages_malformed_xhtml_without_panic() {
         let bytes = crate::testkit::GeneratedEpubFixture::preset(
             crate::testkit::FixtureKind::MalformedXhtml,
@@ -4013,6 +4301,65 @@ mod tests {
         assert_eq!(style_value(&computed, "font-weight"), Some("bold"));
         assert_eq!(style_value(&computed, "font-style"), Some("italic"));
         assert_eq!(style_value(&computed, "text-indent"), Some("2em"));
+    }
+
+    #[test]
+    fn chapter_styles_resolve_relative_font_metrics_to_px() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Relative font metrics",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml">
+              <head>
+                <title>Chapter 1</title>
+                <style>
+                  html { font-size: 20px; }
+                  section { font-size: 150%; line-height: 1.5; }
+                  p.em { font-size: 2em; line-height: 125%; }
+                  p.rem { font-size: 2rem; }
+                </style>
+              </head>
+              <body>
+                <section>
+                  <p class="em">EM paragraph.</p>
+                  <p class="rem">REM paragraph.</p>
+                </section>
+              </body>
+            </html>"#,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let styles = paragraph_styles(&chapter);
+
+        assert_eq!(styles.len(), 2);
+        assert_eq!(style_value(styles[0], "font-size"), Some("60px"));
+        assert_eq!(style_value(styles[0], "line-height"), Some("75px"));
+        assert_eq!(style_value(styles[1], "font-size"), Some("40px"));
+        assert_eq!(style_value(styles[1], "line-height"), Some("60px"));
+
+        let pages = crate::layout::paginate_chapter(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutConstraints::default(),
+        )
+        .expect("pagination");
+        let line_heights = pages
+            .pages
+            .iter()
+            .flat_map(|page| {
+                page.fragments.iter().filter_map(|fragment| {
+                    (fragment.kind == crate::layout::SceneFragmentKind::TextLine)
+                        .then_some(fragment.rect.height)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(line_heights.first(), Some(&LayoutUnit::from_px(75)));
+        assert_eq!(line_heights.last(), Some(&LayoutUnit::from_px(60)));
     }
 
     #[test]
@@ -4217,6 +4564,20 @@ mod tests {
             }
             None
         })
+    }
+
+    fn paragraph_styles(chapter: &document::ChapterIr) -> Vec<&document::ComputedStyle> {
+        chapter
+            .nodes
+            .iter_with_ids()
+            .filter_map(|(_, node)| {
+                if let document::DocumentNode::Paragraph(block) = node {
+                    chapter.styles.get(block.style)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn footnote_nodes(chapter: &document::ChapterIr) -> Vec<&document::FootnoteNode> {

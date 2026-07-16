@@ -805,10 +805,10 @@ pub struct EngineVersions {
 impl EngineVersions {
     /// Current pre-alpha version set.
     pub const CURRENT: Self = Self {
-        parser_schema: 1,
-        style_schema: 1,
+        parser_schema: 2,
+        style_schema: 2,
         text_schema: 1,
-        pagination_algorithm: 1,
+        pagination_algorithm: 2,
         scene_wire: 1,
         disk_cache: 1,
     };
@@ -1009,7 +1009,9 @@ mod tests {
         let versions = EngineVersions::default();
 
         assert_eq!(versions, EngineVersions::CURRENT);
-        assert!(versions.parser_schema > 0);
+        assert_eq!(versions.parser_schema, 2);
+        assert_eq!(versions.style_schema, 2);
+        assert_eq!(versions.pagination_algorithm, 2);
         assert!(versions.disk_cache > 0);
     }
 }

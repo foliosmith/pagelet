@@ -13,8 +13,8 @@ use crate::{
         LinkKind, LinkTarget, StyleTable,
     },
     text::{
-        LineMetrics, MeasureBatch, MeasureRequest, MeasuredText, TextBackend, TextCluster,
-        TextDirection,
+        HeightBehavior, LineMetrics, MeasureBatch, MeasureRequest, MeasuredText, StrutStyle,
+        TextBackend, TextCluster, TextDirection,
     },
 };
 
@@ -228,19 +228,12 @@ impl ComputedLayoutStyle {
     }
 
     fn apply_document_style(&mut self, document_style: &DocumentComputedStyle) {
+        // PageScene owns fragment geometry. Author CSS may affect typography and
+        // pagination policy, but not margins, padding, dimensions, or text indent.
         for (name, value) in &document_style.properties {
             match &**name {
                 "font-size" => set_unit(&mut self.font_size, value),
                 "line-height" => set_unit(&mut self.line_height, value),
-                "margin-top" | "margin-before" => set_unit(&mut self.margin_before, value),
-                "margin-bottom" | "margin-after" => set_unit(&mut self.margin_after, value),
-                "padding-left" | "padding-inline-start" => {
-                    set_unit(&mut self.padding_start, value);
-                }
-                "padding-right" | "padding-inline-end" => {
-                    set_unit(&mut self.padding_end, value);
-                }
-                "text-indent" => set_unit(&mut self.text_indent, value),
                 "text-align" => {
                     self.alignment = match &**value {
                         "center" => TextAlignment::Center,
@@ -1717,7 +1710,7 @@ fn collect_blocks(
                 collect_blocks(chapter, *child, depth + 1, None, blocks);
             }
         }
-        DocumentNode::Figure(container) | DocumentNode::Container(container) => {
+        DocumentNode::Figure(container) => {
             if container.children.is_empty() {
                 blocks.push(layout_placeholder(
                     chapter,
@@ -1728,6 +1721,11 @@ fn collect_blocks(
                     depth,
                 ));
             }
+            for child in &container.children {
+                collect_blocks(chapter, *child, depth, None, blocks);
+            }
+        }
+        DocumentNode::Container(container) => {
             for child in &container.children {
                 collect_blocks(chapter, *child, depth, None, blocks);
             }
@@ -1856,6 +1854,8 @@ fn measure_text(
 ) -> Result<MeasuredText, PageletError> {
     let mut request = MeasureRequest::new(request_id, text, style.font_size, width);
     request.direction = TextDirection::Auto;
+    request.height_behavior = HeightBehavior::IncludeStrut;
+    request.strut = line_height_strut(style);
     request.request_fingerprint = request_fingerprint(text, style, width);
     let batch = text_backend.measure_batch(&MeasureBatch::new(vec![request]), cancel)?;
     let mut measured = batch
@@ -1864,8 +1864,37 @@ fn measure_text(
         .ok_or_else(|| layout_error("text backend did not return requested measurement"))?;
     if measured.lines.is_empty() {
         measured = synthesize_lines(text, request_id, style, width);
+    } else {
+        apply_resolved_line_height(&mut measured, style.line_height);
     }
     Ok(measured)
+}
+
+fn line_height_strut(style: ComputedLayoutStyle) -> StrutStyle {
+    let font_size = style.font_size.max(LayoutUnit::from_px(1));
+    let ascent = LayoutUnit::from_raw((font_size.raw() * 4) / 5);
+    let descent = font_size - ascent;
+    let leading = (style.line_height - font_size).max(LayoutUnit::ZERO);
+    StrutStyle {
+        ascent,
+        descent,
+        leading,
+    }
+}
+
+fn apply_resolved_line_height(measured: &mut MeasuredText, line_height: LayoutUnit) {
+    let line_height = line_height.max(LayoutUnit::from_px(1));
+    for line in &mut measured.lines {
+        let glyph_height = line.ascent + line.descent;
+        let half_leading = LayoutUnit::from_raw((line_height - glyph_height).raw() / 2);
+        line.baseline = line.ascent + half_leading;
+        line.line_height = line_height;
+    }
+    measured.height = LayoutUnit::from_raw(
+        line_height
+            .raw()
+            .saturating_mul(i64::try_from(measured.lines.len()).unwrap_or(i64::MAX)),
+    );
 }
 
 fn synthesize_lines(
@@ -2557,6 +2586,138 @@ mod tests {
             pages.pages[0].fragments[0].kind,
             SceneFragmentKind::UnsupportedPlaceholder
         );
+    }
+
+    #[test]
+    fn empty_container_does_not_emit_placeholder() {
+        let mut chapter = empty_chapter();
+        let empty_container = chapter
+            .nodes
+            .push(DocumentNode::Container(ContainerNode::default()))
+            .expect("container");
+        let paragraph = push_paragraph(&mut chapter, "visible text");
+        set_root_children(&mut chapter, vec![empty_container, paragraph]);
+
+        let pages = paginate_chapter(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("paginate");
+
+        assert!(pages.pages.iter().all(|page| {
+            page.fragments
+                .iter()
+                .all(|fragment| fragment.kind != SceneFragmentKind::UnsupportedPlaceholder)
+        }));
+    }
+
+    #[test]
+    fn page_scene_ignores_document_geometry_css() {
+        let plain = chapter_with_paragraph("geometry must stay stable");
+        let mut styled = chapter_with_paragraph("geometry must stay stable");
+        let style = document::ComputedStyle::new()
+            .with_property("margin-top", "120px")
+            .with_property("margin-bottom", "80px")
+            .with_property("padding-left", "90px")
+            .with_property("padding-right", "70px")
+            .with_property("text-indent", "60px")
+            .with_property("width", "1px")
+            .with_property("height", "1px");
+        let style_id = styled.styles.intern(style).expect("style");
+        let paragraph = styled
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                matches!(node, DocumentNode::Paragraph(_)).then_some(node_id)
+            })
+            .expect("paragraph");
+        if let Some(DocumentNode::Paragraph(text)) = styled.nodes.get_mut(paragraph) {
+            text.style = style_id;
+        }
+
+        let plain_pages = paginate_chapter(
+            &plain,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("plain pagination");
+        let styled_pages = paginate_chapter(
+            &styled,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("styled pagination");
+        let plain_rects = plain_pages
+            .pages
+            .iter()
+            .flat_map(|page| page.fragments.iter().map(|fragment| fragment.rect))
+            .collect::<Vec<_>>();
+        let styled_rects = styled_pages
+            .pages
+            .iter()
+            .flat_map(|page| page.fragments.iter().map(|fragment| fragment.rect))
+            .collect::<Vec<_>>();
+
+        assert_eq!(styled_rects, plain_rects);
+    }
+
+    #[test]
+    fn resolved_font_metrics_drive_page_scene_line_boxes() {
+        let mut chapter = chapter_with_paragraph("resolved metrics");
+        let style = document::ComputedStyle::new()
+            .with_property("font-size", "20px")
+            .with_property("line-height", "30px");
+        let style_id = chapter.styles.intern(style).expect("style");
+        let paragraph = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                matches!(node, DocumentNode::Paragraph(_)).then_some(node_id)
+            })
+            .expect("paragraph");
+        if let Some(DocumentNode::Paragraph(text)) = chapter.nodes.get_mut(paragraph) {
+            text.style = style_id;
+        }
+
+        let pages = paginate_chapter(
+            &chapter,
+            &StrutCheckingBackend,
+            LayoutConstraints::default(),
+        )
+        .expect("pagination");
+        let line = pages.pages[0]
+            .fragments
+            .iter()
+            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
+            .expect("text line");
+
+        assert_eq!(line.rect.height, LayoutUnit::from_px(30));
+    }
+
+    struct StrutCheckingBackend;
+
+    impl TextBackend for StrutCheckingBackend {
+        fn backend_id(&self) -> crate::text::TextBackendId {
+            crate::text::TextBackendId(1)
+        }
+
+        fn font_fingerprint(&self) -> crate::text::FontSetFingerprint {
+            crate::text::FontSetFingerprint(2)
+        }
+
+        fn measure_batch(
+            &self,
+            batch: &MeasureBatch,
+            cancel: &CancellationToken,
+        ) -> Result<crate::text::MeasuredBatch, PageletError> {
+            let request = batch.requests.first().expect("measure request");
+            assert_eq!(request.height_behavior, HeightBehavior::IncludeStrut);
+            assert_eq!(request.strut.ascent, LayoutUnit::from_px(16));
+            assert_eq!(request.strut.descent, LayoutUnit::from_px(4));
+            assert_eq!(request.strut.leading, LayoutUnit::from_px(10));
+            DefaultTextBackend::new().measure_batch(batch, cancel)
+        }
     }
 
     #[test]
