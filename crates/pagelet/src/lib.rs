@@ -15,7 +15,7 @@ pub mod layout;
 #[cfg(test)]
 mod testkit;
 pub mod text;
-mod wire;
+pub mod wire;
 
 /// Static build metadata for the pagelet crate.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

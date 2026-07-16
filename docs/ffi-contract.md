@@ -23,3 +23,7 @@ threads unless the backend contract allows it.
 
 Every wire payload carries a schema version. Incompatible cache, wire, or handle
 changes require a documented version bump and migration or invalidation policy.
+
+The active binary contract is documented in
+[`schemas/pageletScene/v1.md`](../schemas/pageletScene/v1.md). It uses a fixed
+little-endian envelope with an exact payload length and CRC-32 checksum.
