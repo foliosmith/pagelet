@@ -1,6 +1,6 @@
 //! Text measurement and shaping contracts.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::core::{CancellationToken, FontId, LayoutUnit, PageletError};
 
@@ -219,6 +219,8 @@ impl MeasureBatch {
 pub struct MeasuredText {
     /// Request id copied from [`MeasureRequest::id`].
     pub request_id: u32,
+    /// Request fingerprint copied from [`MeasureRequest::request_fingerprint`].
+    pub request_fingerprint: u64,
     /// Measured width.
     pub width: LayoutUnit,
     /// Measured height.
@@ -238,8 +240,10 @@ pub struct MeasuredText {
 impl MeasuredText {
     /// Create measured text from line and cluster details.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_id: u32,
+        request_fingerprint: u64,
         width: LayoutUnit,
         height: LayoutUnit,
         utf8_len: u32,
@@ -249,6 +253,7 @@ impl MeasuredText {
     ) -> Self {
         Self {
             request_id,
+            request_fingerprint,
             width,
             height,
             line_count: u32::try_from(lines.len()).unwrap_or(u32::MAX),
@@ -299,6 +304,10 @@ pub struct TextCluster {
 /// Batch of measured text results.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct MeasuredBatch {
+    /// Stable identity of the host backend that produced the results.
+    pub backend_id: TextBackendId,
+    /// Stable fingerprint of the font set used for measurement.
+    pub font_fingerprint: FontSetFingerprint,
     /// Measurement results in request order.
     pub results: Vec<MeasuredText>,
 }
@@ -306,8 +315,16 @@ pub struct MeasuredBatch {
 impl MeasuredBatch {
     /// Create a batch from results.
     #[must_use]
-    pub fn new(results: Vec<MeasuredText>) -> Self {
-        Self { results }
+    pub fn new(
+        backend_id: TextBackendId,
+        font_fingerprint: FontSetFingerprint,
+        results: Vec<MeasuredText>,
+    ) -> Self {
+        Self {
+            backend_id,
+            font_fingerprint,
+            results,
+        }
     }
 
     /// Find a result by request id.
@@ -317,6 +334,190 @@ impl MeasuredBatch {
             .iter()
             .find(|result| result.request_id == request_id)
     }
+}
+
+/// Host-provided text backend after one complete measurement batch is submitted.
+///
+/// Construction validates backend identity, request identity, and all UTF-8 line
+/// and cluster ranges before the results can reach layout.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostMeasuredTextBackend {
+    backend_id: TextBackendId,
+    font_fingerprint: FontSetFingerprint,
+    measurements: BTreeMap<u32, (MeasureRequest, MeasuredText)>,
+}
+
+impl HostMeasuredTextBackend {
+    /// Validate a host response and create a backend that serves those metrics.
+    pub fn new(requested: &MeasureBatch, measured: MeasuredBatch) -> Result<Self, PageletError> {
+        let mut requested_by_id = BTreeMap::new();
+        for request in &requested.requests {
+            if requested_by_id.insert(request.id, request).is_some() {
+                return Err(protocol_error(
+                    "measurement batch contains duplicate request ids",
+                ));
+            }
+        }
+
+        let mut measurements = BTreeMap::new();
+        for result in measured.results {
+            let Some(request) = requested_by_id.get(&result.request_id) else {
+                return Err(protocol_error(
+                    "measured batch contains an unknown request id",
+                ));
+            };
+            validate_measured_text(request, &result)?;
+            if measurements
+                .insert(result.request_id, ((*request).clone(), result))
+                .is_some()
+            {
+                return Err(protocol_error(
+                    "measured batch contains duplicate request ids",
+                ));
+            }
+        }
+        if measurements.len() != requested_by_id.len() {
+            return Err(protocol_error(
+                "measured batch does not contain every requested measurement",
+            ));
+        }
+
+        Ok(Self {
+            backend_id: measured.backend_id,
+            font_fingerprint: measured.font_fingerprint,
+            measurements,
+        })
+    }
+}
+
+impl TextBackend for HostMeasuredTextBackend {
+    fn backend_id(&self) -> TextBackendId {
+        self.backend_id
+    }
+
+    fn font_fingerprint(&self) -> FontSetFingerprint {
+        self.font_fingerprint
+    }
+
+    fn measure_batch(
+        &self,
+        request: &MeasureBatch,
+        cancel: &CancellationToken,
+    ) -> Result<MeasuredBatch, PageletError> {
+        let mut results = Vec::with_capacity(request.requests.len());
+        for item in &request.requests {
+            if cancel.is_cancelled() {
+                return Err(PageletError::Cancelled);
+            }
+            let Some((expected, measured)) = self.measurements.get(&item.id) else {
+                return Err(protocol_error(
+                    "layout requested text that was not present in the host batch",
+                ));
+            };
+            if expected != item {
+                return Err(protocol_error(
+                    "layout measurement request differs from the prepared host batch",
+                ));
+            }
+            results.push(measured.clone());
+        }
+        Ok(MeasuredBatch::new(
+            self.backend_id,
+            self.font_fingerprint,
+            results,
+        ))
+    }
+}
+
+fn validate_measured_text(
+    request: &MeasureRequest,
+    measured: &MeasuredText,
+) -> Result<(), PageletError> {
+    if measured.request_fingerprint != request.request_fingerprint {
+        return Err(protocol_error(
+            "measured text request fingerprint does not match",
+        ));
+    }
+    let text_start = usize::try_from(request.text_range.start).unwrap_or(usize::MAX);
+    let text_end = usize::try_from(request.text_range.end).unwrap_or(usize::MAX);
+    let Some(text) = request.text.get(text_start..text_end) else {
+        return Err(protocol_error(
+            "measurement request has an invalid text range",
+        ));
+    };
+    if measured.utf8_len != u32::try_from(text.len()).unwrap_or(u32::MAX) {
+        return Err(protocol_error(
+            "measured text length does not match request",
+        ));
+    }
+    if measured.line_count != u32::try_from(measured.lines.len()).unwrap_or(u32::MAX) {
+        return Err(protocol_error(
+            "measured text line count does not match lines",
+        ));
+    }
+
+    let mut previous_line_end = 0_u32;
+    for line in &measured.lines {
+        validate_relative_range(text, line.text_start, line.text_end, "line")?;
+        if line.text_start < previous_line_end {
+            return Err(protocol_error("measured text lines are not ordered"));
+        }
+        previous_line_end = line.text_end;
+        if line.width.raw() < 0
+            || line.ascent.raw() < 0
+            || line.descent.raw() < 0
+            || line.line_height.raw() < 0
+            || line.baseline.raw() < 0
+        {
+            return Err(protocol_error("measured line metrics must not be negative"));
+        }
+    }
+
+    let mut previous_cluster: Option<(u32, LayoutUnit)> = None;
+    for cluster in &measured.clusters {
+        validate_relative_range(text, cluster.text_start, cluster.text_end, "cluster")?;
+        if usize::try_from(cluster.line_index).unwrap_or(usize::MAX) >= measured.lines.len() {
+            return Err(protocol_error("measured cluster refers to an unknown line"));
+        }
+        if cluster.x_start.raw() < 0 || cluster.x_end < cluster.x_start {
+            return Err(protocol_error("measured cluster bounds are invalid"));
+        }
+        if let Some((previous_line, previous_x_start)) = previous_cluster {
+            if cluster.line_index < previous_line
+                || (cluster.line_index == previous_line && cluster.x_start < previous_x_start)
+            {
+                return Err(protocol_error("measured clusters are not visually ordered"));
+            }
+        }
+        previous_cluster = Some((cluster.line_index, cluster.x_start));
+    }
+    Ok(())
+}
+
+fn validate_relative_range(
+    text: &str,
+    start: u32,
+    end: u32,
+    kind: &'static str,
+) -> Result<(), PageletError> {
+    let start = usize::try_from(start).unwrap_or(usize::MAX);
+    let end = usize::try_from(end).unwrap_or(usize::MAX);
+    if start <= end
+        && end <= text.len()
+        && text.is_char_boundary(start)
+        && text.is_char_boundary(end)
+    {
+        Ok(())
+    } else {
+        Err(protocol_error(match kind {
+            "line" => "measured line range is not a valid UTF-8 range",
+            _ => "measured cluster range is not a valid UTF-8 range",
+        }))
+    }
+}
+
+fn protocol_error(message: &'static str) -> PageletError {
+    PageletError::Protocol(crate::core::ProtocolError::new(message))
 }
 
 /// Text measurement backend used by the layout engine.
@@ -380,7 +581,11 @@ impl TextBackend for DefaultTextBackend {
             }
             results.push(measure_deterministic(item, self.font_fingerprint));
         }
-        Ok(MeasuredBatch::new(results))
+        Ok(MeasuredBatch::new(
+            self.backend_id,
+            self.font_fingerprint,
+            results,
+        ))
     }
 }
 
@@ -488,6 +693,7 @@ fn measure_deterministic(
 
     MeasuredText::new(
         item.id,
+        item.request_fingerprint,
         max_line_width,
         height,
         u32::try_from(text.len()).unwrap_or(u32::MAX),
@@ -540,5 +746,88 @@ mod tests {
         assert!(!result.lines.is_empty());
         assert!(!result.clusters.is_empty());
         assert_eq!(result.utf8_len, "hello pagelet".len() as u32);
+    }
+
+    #[test]
+    fn host_backend_rejects_stale_request_fingerprints() {
+        let requested = MeasureBatch::new(vec![MeasureRequest::new(
+            7,
+            "host measured",
+            LayoutUnit::from_px(16),
+            LayoutUnit::from_px(120),
+        )]);
+        let fallback = DefaultTextBackend::new();
+        let mut measured = fallback
+            .measure_batch(&requested, &CancellationToken::new())
+            .expect("measure");
+        measured.results[0].request_fingerprint ^= 1;
+
+        let error = HostMeasuredTextBackend::new(&requested, measured).expect_err("stale batch");
+        assert_eq!(error.code(), crate::core::DiagnosticCode::Protocol);
+        assert!(error.to_string().contains("fingerprint"));
+    }
+
+    #[test]
+    fn host_backend_rejects_incomplete_batches() {
+        let requested = MeasureBatch::new(vec![MeasureRequest::new(
+            9,
+            "missing",
+            LayoutUnit::from_px(16),
+            LayoutUnit::from_px(120),
+        )]);
+        let measured = MeasuredBatch::new(TextBackendId(41), FontSetFingerprint(42), Vec::new());
+
+        let error = HostMeasuredTextBackend::new(&requested, measured).expect_err("missing result");
+        assert_eq!(error.code(), crate::core::DiagnosticCode::Protocol);
+        assert!(error.to_string().contains("every requested"));
+    }
+
+    #[test]
+    fn host_backend_accepts_visually_ordered_rtl_clusters() {
+        let mut request =
+            MeasureRequest::new(11, "אב", LayoutUnit::from_px(16), LayoutUnit::from_px(120));
+        request.direction = TextDirection::Rtl;
+        let requested = MeasureBatch::new(vec![request.clone()]);
+        let line_height = LayoutUnit::from_px(20);
+        let measured = MeasuredBatch::new(
+            TextBackendId(51),
+            FontSetFingerprint(52),
+            vec![MeasuredText::new(
+                request.id,
+                request.request_fingerprint,
+                LayoutUnit::from_px(16),
+                line_height,
+                4,
+                vec![LineMetrics {
+                    text_start: 0,
+                    text_end: 4,
+                    baseline: LayoutUnit::from_px(15),
+                    ascent: LayoutUnit::from_px(15),
+                    descent: LayoutUnit::from_px(5),
+                    line_height,
+                    width: LayoutUnit::from_px(16),
+                    hard_break: false,
+                }],
+                vec![
+                    TextCluster {
+                        text_start: 2,
+                        text_end: 4,
+                        line_index: 0,
+                        x_start: LayoutUnit::ZERO,
+                        x_end: LayoutUnit::from_px(8),
+                    },
+                    TextCluster {
+                        text_start: 0,
+                        text_end: 2,
+                        line_index: 0,
+                        x_start: LayoutUnit::from_px(8),
+                        x_end: LayoutUnit::from_px(16),
+                    },
+                ],
+                53,
+            )],
+        );
+
+        HostMeasuredTextBackend::new(&requested, measured).expect("valid RTL clusters");
     }
 }

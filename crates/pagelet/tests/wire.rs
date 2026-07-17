@@ -11,10 +11,13 @@ use pagelet::{
         SceneFragment, SceneFragmentKind, SelectionMap, SemanticNode, TextAnchorRange,
     },
     text::{
-        FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
-        MeasureRequest, StrutStyle, TextBackendId, TextDirection, TextStyleRun,
+        DefaultTextBackend, FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle,
+        HeightBehavior, MeasureRequest, StrutStyle, TextBackend, TextBackendId, TextDirection,
+        TextStyleRun,
     },
-    wire::{MeasureBatch, PageBatch, SchemaVersion, WireError, CURRENT_SCHEMA_VERSION},
+    wire::{
+        MeasureBatch, MeasuredBatch, PageBatch, SchemaVersion, WireError, CURRENT_SCHEMA_VERSION,
+    },
 };
 
 const HEADER_LEN: usize = 20;
@@ -40,6 +43,23 @@ fn measure_batch_round_trip_preserves_all_fields_and_is_canonical() {
     assert_eq!(decoded, batch);
     assert_eq!(decoded.encode().expect("re-encode measure batch"), encoded);
     assert_eq!(decoded.clone().into_text_batch().requests, decoded.requests);
+}
+
+#[test]
+fn measured_batch_round_trip_preserves_backend_and_result_identity() {
+    let requested = rich_measure_batch().into_text_batch();
+    let measured = DefaultTextBackend::new()
+        .measure_batch(&requested, &pagelet::core::CancellationToken::new())
+        .expect("measure fixture");
+    let batch = MeasuredBatch::from(measured);
+
+    let encoded = batch.encode().expect("encode measured batch");
+    assert_envelope(&encoded, 3);
+    let decoded = MeasuredBatch::decode(&encoded).expect("decode measured batch");
+
+    assert_eq!(decoded, batch);
+    assert_eq!(decoded.encode().expect("re-encode measured batch"), encoded);
+    assert_eq!(decoded.clone().into_text_batch().results, decoded.results);
 }
 
 #[test]

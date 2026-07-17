@@ -13,8 +13,8 @@ use crate::{
         LinkKind, LinkTarget, StyleTable,
     },
     text::{
-        HeightBehavior, LineMetrics, MeasureBatch, MeasureRequest, MeasuredText, StrutStyle,
-        TextBackend, TextCluster, TextDirection,
+        HeightBehavior, HostMeasuredTextBackend, LineMetrics, MeasureBatch, MeasureRequest,
+        MeasuredBatch, MeasuredText, StrutStyle, TextBackend, TextCluster, TextDirection,
     },
 };
 
@@ -708,6 +708,61 @@ pub struct PaginatedDocument {
     pub complete: bool,
 }
 
+/// Prepared two-phase layout that requests all host text metrics in one batch.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostMeasuredLayout {
+    chapter: ChapterIr,
+    options: LayoutOptions,
+    measure_batch: MeasureBatch,
+}
+
+impl HostMeasuredLayout {
+    /// Prepare a chapter for one batched host measurement round trip.
+    #[must_use]
+    pub fn prepare(chapter: ChapterIr, options: LayoutOptions) -> Self {
+        let measure_batch = prepare_measure_batch(&chapter, options);
+        Self {
+            chapter,
+            options,
+            measure_batch,
+        }
+    }
+
+    /// Return the complete paragraph/run measurement request batch.
+    #[must_use]
+    pub const fn measure_batch(&self) -> &MeasureBatch {
+        &self.measure_batch
+    }
+
+    /// Validate host metrics and resume layout to completion.
+    pub fn resume(self, measured: MeasuredBatch) -> Result<PaginatedDocument, PageletError> {
+        let backend = HostMeasuredTextBackend::new(&self.measure_batch, measured)?;
+        paginate_chapter_with_options(&self.chapter, &backend, self.options)
+    }
+}
+
+/// Build the single host measurement batch required to paginate a chapter.
+#[must_use]
+pub fn prepare_measure_batch(chapter: &ChapterIr, options: LayoutOptions) -> MeasureBatch {
+    let requests = layout_blocks(chapter)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            let LayoutBlockContent::Text { text, .. } = block.content else {
+                return None;
+            };
+            Some(measure_request(
+                u32::try_from(index).unwrap_or(u32::MAX),
+                block.node_id.get(),
+                &text,
+                block.style,
+                block_available_width(options.constraints, block.style),
+            ))
+        })
+        .collect();
+    MeasureBatch::new(requests)
+}
+
 impl PaginatedDocument {
     /// Serialize all pages to stable normalized JSON.
     #[must_use]
@@ -950,6 +1005,7 @@ impl Fragmentable for ParagraphLayout {
             context.text_backend,
             context.cancel,
             0,
+            self.node_id.get(),
             &self.text,
             self.style,
             context.options.constraints.content_width(),
@@ -971,6 +1027,7 @@ impl Fragmentable for ParagraphLayout {
             context.text_backend,
             context.cancel,
             0,
+            self.node_id.get(),
             &self.text,
             self.style,
             context.options.constraints.content_width(),
@@ -1097,6 +1154,7 @@ fn paginate_page_from_blocks(
                     text_backend,
                     cancel,
                     u32::try_from(index).unwrap_or(u32::MAX),
+                    block.node_id.get(),
                     text,
                     block.style,
                     available_width,
@@ -1848,15 +1906,12 @@ fn measure_text(
     text_backend: &dyn TextBackend,
     cancel: &CancellationToken,
     request_id: u32,
+    paragraph_id: u32,
     text: &str,
     style: ComputedLayoutStyle,
     width: LayoutUnit,
 ) -> Result<MeasuredText, PageletError> {
-    let mut request = MeasureRequest::new(request_id, text, style.font_size, width);
-    request.direction = TextDirection::Auto;
-    request.height_behavior = HeightBehavior::IncludeStrut;
-    request.strut = line_height_strut(style);
-    request.request_fingerprint = request_fingerprint(text, style, width);
+    let request = measure_request(request_id, paragraph_id, text, style, width);
     let batch = text_backend.measure_batch(&MeasureBatch::new(vec![request]), cancel)?;
     let mut measured = batch
         .get(request_id)
@@ -1868,6 +1923,22 @@ fn measure_text(
         apply_resolved_line_height(&mut measured, style.line_height);
     }
     Ok(measured)
+}
+
+fn measure_request(
+    request_id: u32,
+    paragraph_id: u32,
+    text: &str,
+    style: ComputedLayoutStyle,
+    width: LayoutUnit,
+) -> MeasureRequest {
+    let mut request = MeasureRequest::new(request_id, text, style.font_size, width);
+    request.paragraph_id = paragraph_id;
+    request.direction = TextDirection::Auto;
+    request.height_behavior = HeightBehavior::IncludeStrut;
+    request.strut = line_height_strut(style);
+    request.request_fingerprint = request_fingerprint(text, style, width);
+    request
 }
 
 fn line_height_strut(style: ComputedLayoutStyle) -> StrutStyle {
@@ -1956,6 +2027,7 @@ fn synthesize_lines(
     );
     MeasuredText::new(
         request_id,
+        request_fingerprint(text, style, width),
         width,
         height,
         u32::try_from(text.len()).unwrap_or(u32::MAX),
@@ -2476,8 +2548,45 @@ mod tests {
         document::{
             self, BlockText, ChapterIr, ContainerNode, ImageNode, ListItemNode, ListNode, TextRange,
         },
-        text::DefaultTextBackend,
+        text::{DefaultTextBackend, FontSetFingerprint, MeasuredBatch, TextBackend, TextBackendId},
     };
+
+    #[test]
+    fn host_measured_layout_prepares_one_batch_and_resumes_with_host_identity() {
+        let chapter = chapter_with_paragraph("host metrics must drive the page scene");
+        let options = LayoutOptions::new(
+            LayoutConstraints::new(LayoutUnit::from_px(180), LayoutUnit::from_px(100))
+                .with_margin(LayoutUnit::from_px(8)),
+        );
+        let prepared = HostMeasuredLayout::prepare(chapter.clone(), options);
+        assert_eq!(prepared.measure_batch().requests.len(), 1);
+        assert_eq!(
+            prepared.measure_batch().requests[0].paragraph_id,
+            NodeId::new(1).get()
+        );
+
+        let fallback = DefaultTextBackend::new();
+        let fallback_measured = fallback
+            .measure_batch(prepared.measure_batch(), &CancellationToken::new())
+            .expect("measure batch");
+        let fallback_pages =
+            paginate_chapter_with_options(&chapter, &fallback, options).expect("fallback layout");
+        let host_measured = MeasuredBatch::new(
+            TextBackendId(0x686f_7374),
+            FontSetFingerprint(0x666f_6e74),
+            fallback_measured.results,
+        );
+        let pages = prepared.resume(host_measured).expect("resume layout");
+
+        assert_ne!(
+            pages.pages[0].fingerprint, fallback_pages.pages[0].fingerprint,
+            "host backend identity must participate in the page fingerprint"
+        );
+        if let Some(token) = pages.pages[0].next_break_token.as_ref() {
+            assert_eq!(token.text_backend_id, TextBackendId(0x686f_7374));
+            assert_eq!(token.font_fingerprint, FontSetFingerprint(0x666f_6e74));
+        }
+    }
 
     #[test]
     fn paragraph_splits_across_pages_with_break_token() {

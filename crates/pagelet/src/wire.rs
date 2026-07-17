@@ -17,8 +17,9 @@ use crate::{
     },
     text::{
         FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
-        MeasureBatch as TextMeasureBatch, MeasureRequest, StrutStyle, TextBackendId, TextDirection,
-        TextStyleRun,
+        LineMetrics, MeasureBatch as TextMeasureBatch, MeasureRequest,
+        MeasuredBatch as TextMeasuredBatch, MeasuredText, StrutStyle, TextBackendId, TextCluster,
+        TextDirection, TextStyleRun,
     },
 };
 
@@ -80,12 +81,12 @@ impl PageBatch {
         for page in &self.pages {
             write_page_scene(&mut writer, page)?;
         }
-        encode_envelope(PayloadKind::PageBatch, self.schema_version, writer.finish())
+        encode_envelope(PayloadKind::Page, self.schema_version, writer.finish())
     }
 
     /// Decode and validate a `pageletScene` page batch.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let (schema_version, payload) = decode_envelope(bytes, PayloadKind::PageBatch)?;
+        let (schema_version, payload) = decode_envelope(bytes, PayloadKind::Page)?;
         let mut reader = Reader::new(payload);
         let page_count = reader.read_collection_len("pages")?;
         let mut pages = Vec::new();
@@ -127,16 +128,12 @@ impl MeasureBatch {
         for request in &self.requests {
             write_measure_request(&mut writer, request)?;
         }
-        encode_envelope(
-            PayloadKind::MeasureBatch,
-            self.schema_version,
-            writer.finish(),
-        )
+        encode_envelope(PayloadKind::Measure, self.schema_version, writer.finish())
     }
 
     /// Decode and validate a host text-measurement request batch.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let (schema_version, payload) = decode_envelope(bytes, PayloadKind::MeasureBatch)?;
+        let (schema_version, payload) = decode_envelope(bytes, PayloadKind::Measure)?;
         let mut reader = Reader::new(payload);
         let request_count = reader.read_collection_len("measure requests")?;
         let mut requests = Vec::new();
@@ -160,6 +157,81 @@ impl MeasureBatch {
 impl From<TextMeasureBatch> for MeasureBatch {
     fn from(value: TextMeasureBatch) -> Self {
         Self::new(value.requests)
+    }
+}
+
+/// Versioned host text-measurement response batch.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MeasuredBatch {
+    /// Binary schema version used by this DTO.
+    pub schema_version: SchemaVersion,
+    /// Stable identity of the host backend that produced the results.
+    pub backend_id: TextBackendId,
+    /// Stable fingerprint of the font set used for measurement.
+    pub font_fingerprint: FontSetFingerprint,
+    /// Results in request order.
+    pub results: Vec<MeasuredText>,
+}
+
+impl MeasuredBatch {
+    /// Create a batch using the current schema version.
+    #[must_use]
+    pub fn new(
+        backend_id: TextBackendId,
+        font_fingerprint: FontSetFingerprint,
+        results: Vec<MeasuredText>,
+    ) -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            backend_id,
+            font_fingerprint,
+            results,
+        }
+    }
+
+    /// Encode the batch as a canonical little-endian payload.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        require_current_version(self.schema_version)?;
+        let mut writer = Writer::default();
+        writer.write_u64(self.backend_id.0);
+        writer.write_u64(self.font_fingerprint.0);
+        writer.write_collection_len("measured results", self.results.len())?;
+        for result in &self.results {
+            write_measured_text(&mut writer, result)?;
+        }
+        encode_envelope(PayloadKind::Measured, self.schema_version, writer.finish())
+    }
+
+    /// Decode and validate a host text-measurement response batch.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let (schema_version, payload) = decode_envelope(bytes, PayloadKind::Measured)?;
+        let mut reader = Reader::new(payload);
+        let backend_id = TextBackendId(reader.read_u64("text backend id")?);
+        let font_fingerprint = FontSetFingerprint(reader.read_u64("text font fingerprint")?);
+        let result_count = reader.read_collection_len("measured results")?;
+        let mut results = Vec::new();
+        for _ in 0..result_count {
+            results.push(read_measured_text(&mut reader)?);
+        }
+        reader.finish()?;
+        Ok(Self {
+            schema_version,
+            backend_id,
+            font_fingerprint,
+            results,
+        })
+    }
+
+    /// Convert to the layout text backend response batch.
+    #[must_use]
+    pub fn into_text_batch(self) -> TextMeasuredBatch {
+        TextMeasuredBatch::new(self.backend_id, self.font_fingerprint, self.results)
+    }
+}
+
+impl From<TextMeasuredBatch> for MeasuredBatch {
+    fn from(value: TextMeasuredBatch) -> Self {
+        Self::new(value.backend_id, value.font_fingerprint, value.results)
     }
 }
 
@@ -290,8 +362,9 @@ impl std::error::Error for WireError {}
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PayloadKind {
-    PageBatch = 1,
-    MeasureBatch = 2,
+    Page = 1,
+    Measure = 2,
+    Measured = 3,
 }
 
 impl PayloadKind {
@@ -634,6 +707,93 @@ fn read_measure_request(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireE
         },
         height_behavior: height_behavior_from_wire(reader.read_u8("height behavior")?)?,
         request_fingerprint: reader.read_u64("request fingerprint")?,
+    })
+}
+
+fn write_measured_text(writer: &mut Writer, measured: &MeasuredText) -> Result<(), WireError> {
+    if measured.line_count != u32::try_from(measured.lines.len()).unwrap_or(u32::MAX) {
+        return Err(WireError::LengthMismatch {
+            declared: usize::try_from(measured.line_count).unwrap_or(usize::MAX),
+            actual: measured.lines.len(),
+        });
+    }
+    writer.write_u32(measured.request_id);
+    writer.write_u64(measured.request_fingerprint);
+    writer.write_layout_unit(measured.width);
+    writer.write_layout_unit(measured.height);
+    writer.write_u32(measured.line_count);
+    writer.write_u32(measured.utf8_len);
+    writer.write_collection_len("measured lines", measured.lines.len())?;
+    for line in &measured.lines {
+        writer.write_u32(line.text_start);
+        writer.write_u32(line.text_end);
+        writer.write_layout_unit(line.baseline);
+        writer.write_layout_unit(line.ascent);
+        writer.write_layout_unit(line.descent);
+        writer.write_layout_unit(line.line_height);
+        writer.write_layout_unit(line.width);
+        writer.write_bool(line.hard_break);
+    }
+    writer.write_collection_len("measured clusters", measured.clusters.len())?;
+    for cluster in &measured.clusters {
+        writer.write_u32(cluster.text_start);
+        writer.write_u32(cluster.text_end);
+        writer.write_u32(cluster.line_index);
+        writer.write_layout_unit(cluster.x_start);
+        writer.write_layout_unit(cluster.x_end);
+    }
+    writer.write_u64(measured.measurement_fingerprint);
+    Ok(())
+}
+
+fn read_measured_text(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError> {
+    let request_id = reader.read_u32("measured request id")?;
+    let request_fingerprint = reader.read_u64("measured request fingerprint")?;
+    let width = reader.read_layout_unit("measured width")?;
+    let height = reader.read_layout_unit("measured height")?;
+    let line_count = reader.read_u32("measured line count")?;
+    let utf8_len = reader.read_u32("measured utf8 length")?;
+    let encoded_line_count = reader.read_collection_len("measured lines")?;
+    if usize::try_from(line_count).unwrap_or(usize::MAX) != encoded_line_count {
+        return Err(WireError::LengthMismatch {
+            declared: usize::try_from(line_count).unwrap_or(usize::MAX),
+            actual: encoded_line_count,
+        });
+    }
+    let mut lines = Vec::new();
+    for _ in 0..encoded_line_count {
+        lines.push(LineMetrics {
+            text_start: reader.read_u32("measured line start")?,
+            text_end: reader.read_u32("measured line end")?,
+            baseline: reader.read_layout_unit("measured line baseline")?,
+            ascent: reader.read_layout_unit("measured line ascent")?,
+            descent: reader.read_layout_unit("measured line descent")?,
+            line_height: reader.read_layout_unit("measured line height")?,
+            width: reader.read_layout_unit("measured line width")?,
+            hard_break: reader.read_bool("measured line hard break")?,
+        });
+    }
+    let cluster_count = reader.read_collection_len("measured clusters")?;
+    let mut clusters = Vec::new();
+    for _ in 0..cluster_count {
+        clusters.push(TextCluster {
+            text_start: reader.read_u32("measured cluster start")?,
+            text_end: reader.read_u32("measured cluster end")?,
+            line_index: reader.read_u32("measured cluster line")?,
+            x_start: reader.read_layout_unit("measured cluster x start")?,
+            x_end: reader.read_layout_unit("measured cluster x end")?,
+        });
+    }
+    Ok(MeasuredText {
+        request_id,
+        request_fingerprint,
+        width,
+        height,
+        line_count,
+        utf8_len,
+        lines,
+        clusters,
+        measurement_fingerprint: reader.read_u64("measurement fingerprint")?,
     })
 }
 

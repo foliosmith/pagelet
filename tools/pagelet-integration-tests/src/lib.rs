@@ -9,7 +9,11 @@ pub fn public_pagelet_facade_is_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pagelet::epub::{open_book, resolve_resource_path, NavigationSource, OpenOptions};
+    use pagelet::{
+        core::CancellationToken,
+        epub::{open_book, resolve_resource_path, NavigationSource, OpenOptions},
+        text::{DefaultTextBackend, TextBackend},
+    };
     use pagelet_testkit::{FixtureEntry, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
     use super::*;
@@ -140,6 +144,44 @@ mod tests {
         assert!(json.contains(r#""complete": true"#));
         assert!(json.contains(r#""pages": ["#));
         assert!(json.contains(r#""page_index": 0"#));
+        assert!(json.contains(r#""fragments": ["#));
+    }
+
+    #[test]
+    fn host_measurement_wire_round_trip_resumes_public_pagination() {
+        let fixture = wasm_contract_fixture();
+        let options = pagelet::cli::layout_options_from_px(360, 480);
+        let requested_wire = pagelet::cli::prepare_spine_item_measure_batch_with_options(
+            fixture.bytes().to_vec(),
+            0,
+            OpenOptions::default(),
+            options,
+        )
+        .expect("prepare host measurement batch");
+        let requested = pagelet::wire::MeasureBatch::decode(&requested_wire)
+            .expect("decode requested batch")
+            .into_text_batch();
+        assert!(
+            requested.requests.len() > 1,
+            "all paragraphs share one batch"
+        );
+
+        let measured = DefaultTextBackend::new()
+            .measure_batch(&requested, &CancellationToken::new())
+            .expect("host fixture measurements");
+        let measured_wire = pagelet::wire::MeasuredBatch::from(measured)
+            .encode()
+            .expect("encode measured batch");
+        let json = pagelet::cli::paginate_spine_item_bytes_json_with_host_measurements(
+            fixture.bytes().to_vec(),
+            0,
+            OpenOptions::default(),
+            options,
+            &measured_wire,
+        )
+        .expect("resume host measured pagination");
+
+        assert!(json.contains(r#""complete": true"#));
         assert!(json.contains(r#""fragments": ["#));
     }
 

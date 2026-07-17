@@ -9,8 +9,9 @@ use crate::{
         BookSummary, CapabilityStatus, CompatibilityMode, NavigationItem, NavigationSource,
         OpenOptions,
     },
-    layout::{self, LayoutConstraints, LayoutOptions},
+    layout::{self, HostMeasuredLayout, LayoutConstraints, LayoutOptions},
     text::DefaultTextBackend,
+    wire::{MeasureBatch as WireMeasureBatch, MeasuredBatch as WireMeasuredBatch},
 };
 
 /// Inspect EPUB bytes and return a deterministic JSON document.
@@ -67,6 +68,43 @@ pub fn paginate_spine_item_bytes_json_with_options(
     let backend = DefaultTextBackend::new();
     let pages = layout::paginate_chapter_with_options(&chapter, &backend, layout_options)?;
     Ok(paginated_chapter_json(&chapter, &pages))
+}
+
+/// Prepare one spine item and encode every host text request as one wire batch.
+pub fn prepare_spine_item_measure_batch_with_options(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+    open_options: OpenOptions,
+    layout_options: LayoutOptions,
+) -> Result<Vec<u8>, crate::core::PageletError> {
+    let chapter =
+        crate::epub::open_spine_item_chapter_ir_with_options(bytes, spine_index, open_options)?;
+    let layout = HostMeasuredLayout::prepare(chapter, layout_options);
+    WireMeasureBatch::from(layout.measure_batch().clone())
+        .encode()
+        .map_err(wire_protocol_error)
+}
+
+/// Resume one spine item with a host `MeasuredBatch` and return PageScene JSON.
+pub fn paginate_spine_item_bytes_json_with_host_measurements(
+    bytes: impl Into<Vec<u8>>,
+    spine_index: usize,
+    open_options: OpenOptions,
+    layout_options: LayoutOptions,
+    measured_batch: &[u8],
+) -> Result<String, crate::core::PageletError> {
+    let chapter =
+        crate::epub::open_spine_item_chapter_ir_with_options(bytes, spine_index, open_options)?;
+    let layout = HostMeasuredLayout::prepare(chapter.clone(), layout_options);
+    let measured = WireMeasuredBatch::decode(measured_batch)
+        .map_err(wire_protocol_error)?
+        .into_text_batch();
+    let pages = layout.resume(measured)?;
+    Ok(paginated_chapter_json(&chapter, &pages))
+}
+
+fn wire_protocol_error(error: crate::wire::WireError) -> crate::core::PageletError {
+    crate::core::PageletError::Protocol(crate::core::ProtocolError::new(error.to_string()))
 }
 
 /// Paginate EPUB bytes and return debug SVG for the first page.

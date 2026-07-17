@@ -680,6 +680,7 @@ impl TextBackend for FakeTextBackend {
 
             results.push(MeasuredText::new(
                 item.id,
+                item.request_fingerprint,
                 width,
                 height,
                 u32::try_from(item.text.len()).unwrap_or(u32::MAX),
@@ -689,7 +690,11 @@ impl TextBackend for FakeTextBackend {
             ));
         }
 
-        Ok(MeasuredBatch::new(results))
+        Ok(MeasuredBatch::new(
+            self.backend_id,
+            self.font_fingerprint,
+            results,
+        ))
     }
 }
 
