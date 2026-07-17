@@ -34,7 +34,10 @@ const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// This value is advanced only when the binary schema changes and is not
 /// derived from `CARGO_PKG_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
+
+/// Frozen `pageletScene` schema version used by exact text replay.
+pub const SCHEMA_VERSION_V2: SchemaVersion = SchemaVersion::new(2);
 
 /// Frozen legacy `pageletScene` schema version.
 pub const SCHEMA_VERSION_V1: SchemaVersion = SchemaVersion::new(1);
@@ -85,7 +88,8 @@ impl PageBatch {
         for page in &self.pages {
             match self.schema_version {
                 SCHEMA_VERSION_V1 => write_page_scene_v1(&mut writer, page)?,
-                CURRENT_SCHEMA_VERSION => write_page_scene_v2(&mut writer, page)?,
+                SCHEMA_VERSION_V2 => write_page_scene_v2(&mut writer, page)?,
+                CURRENT_SCHEMA_VERSION => write_page_scene_v3(&mut writer, page)?,
                 _ => unreachable!("schema version was validated"),
             }
         }
@@ -101,7 +105,8 @@ impl PageBatch {
         for _ in 0..page_count {
             pages.push(match schema_version {
                 SCHEMA_VERSION_V1 => read_page_scene_v1(&mut reader)?,
-                CURRENT_SCHEMA_VERSION => read_page_scene_v2(&mut reader)?,
+                SCHEMA_VERSION_V2 => read_page_scene_v2(&mut reader)?,
+                CURRENT_SCHEMA_VERSION => read_page_scene_v3(&mut reader)?,
                 _ => unreachable!("schema version was validated"),
             });
         }
@@ -140,7 +145,9 @@ impl MeasureBatch {
         for request in &self.requests {
             match self.schema_version {
                 SCHEMA_VERSION_V1 => write_measure_request_v1(&mut writer, request)?,
-                CURRENT_SCHEMA_VERSION => write_measure_request_v2(&mut writer, request)?,
+                SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => {
+                    write_measure_request_v2(&mut writer, request)?
+                }
                 _ => unreachable!("schema version was validated"),
             }
         }
@@ -156,7 +163,7 @@ impl MeasureBatch {
         for _ in 0..request_count {
             requests.push(match schema_version {
                 SCHEMA_VERSION_V1 => read_measure_request_v1(&mut reader)?,
-                CURRENT_SCHEMA_VERSION => read_measure_request_v2(&mut reader)?,
+                SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => read_measure_request_v2(&mut reader)?,
                 _ => unreachable!("schema version was validated"),
             });
         }
@@ -219,7 +226,9 @@ impl MeasuredBatch {
         for result in &self.results {
             match self.schema_version {
                 SCHEMA_VERSION_V1 => write_measured_text_v1(&mut writer, result)?,
-                CURRENT_SCHEMA_VERSION => write_measured_text_v2(&mut writer, result)?,
+                SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => {
+                    write_measured_text_v2(&mut writer, result)?
+                }
                 _ => unreachable!("schema version was validated"),
             }
         }
@@ -237,7 +246,7 @@ impl MeasuredBatch {
         for _ in 0..result_count {
             results.push(match schema_version {
                 SCHEMA_VERSION_V1 => read_measured_text_v1(&mut reader)?,
-                CURRENT_SCHEMA_VERSION => read_measured_text_v2(&mut reader)?,
+                SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => read_measured_text_v2(&mut reader)?,
                 _ => unreachable!("schema version was validated"),
             });
         }
@@ -402,7 +411,10 @@ impl PayloadKind {
 }
 
 fn require_supported_version(version: SchemaVersion) -> Result<(), WireError> {
-    if matches!(version, SCHEMA_VERSION_V1 | CURRENT_SCHEMA_VERSION) {
+    if matches!(
+        version,
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION
+    ) {
         Ok(())
     } else {
         Err(WireError::UnsupportedVersion {
@@ -681,7 +693,7 @@ fn write_measure_request_v2(
     writer: &mut Writer,
     request: &MeasureRequest,
 ) -> Result<(), WireError> {
-    write_measure_request(writer, request, CURRENT_SCHEMA_VERSION)
+    write_measure_request(writer, request, SCHEMA_VERSION_V2)
 }
 
 fn write_measure_request(
@@ -699,7 +711,9 @@ fn write_measure_request(
     for style_run in &request.style_runs {
         match version {
             SCHEMA_VERSION_V1 => write_text_style_run_v1(writer, style_run)?,
-            CURRENT_SCHEMA_VERSION => write_text_style_run_v2(writer, style_run)?,
+            SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => {
+                write_text_style_run_v2(writer, style_run)?
+            }
             _ => unreachable!("schema version was validated"),
         }
     }
@@ -723,7 +737,7 @@ fn read_measure_request_v1(reader: &mut Reader<'_>) -> Result<MeasureRequest, Wi
 }
 
 fn read_measure_request_v2(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireError> {
-    read_measure_request(reader, CURRENT_SCHEMA_VERSION)
+    read_measure_request(reader, SCHEMA_VERSION_V2)
 }
 
 fn read_measure_request(
@@ -741,7 +755,7 @@ fn read_measure_request(
     for _ in 0..style_run_count {
         let style_run = match version {
             SCHEMA_VERSION_V1 => read_text_style_run_v1(reader)?,
-            CURRENT_SCHEMA_VERSION => read_text_style_run_v2(reader)?,
+            SCHEMA_VERSION_V2 | CURRENT_SCHEMA_VERSION => read_text_style_run_v2(reader)?,
             _ => unreachable!("schema version was validated"),
         };
         validate_utf8_range("text style run", &text, style_run.start, style_run.end)?;
@@ -780,7 +794,7 @@ fn write_measured_text_v1(writer: &mut Writer, measured: &MeasuredText) -> Resul
 }
 
 fn write_measured_text_v2(writer: &mut Writer, measured: &MeasuredText) -> Result<(), WireError> {
-    write_measured_text(writer, measured, CURRENT_SCHEMA_VERSION)
+    write_measured_text(writer, measured, SCHEMA_VERSION_V2)
 }
 
 fn write_measured_text(
@@ -809,7 +823,7 @@ fn write_measured_text(
         writer.write_layout_unit(line.descent);
         writer.write_layout_unit(line.line_height);
         writer.write_layout_unit(line.width);
-        if version == CURRENT_SCHEMA_VERSION {
+        if version != SCHEMA_VERSION_V1 {
             writer.write_layout_unit(line.ink_bounds.x);
             writer.write_layout_unit(line.ink_bounds.y);
             writer.write_layout_unit(line.ink_bounds.width);
@@ -834,7 +848,7 @@ fn read_measured_text_v1(reader: &mut Reader<'_>) -> Result<MeasuredText, WireEr
 }
 
 fn read_measured_text_v2(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError> {
-    read_measured_text(reader, CURRENT_SCHEMA_VERSION)
+    read_measured_text(reader, SCHEMA_VERSION_V2)
 }
 
 fn read_measured_text(
@@ -863,7 +877,7 @@ fn read_measured_text(
         let descent = reader.read_layout_unit("measured line descent")?;
         let line_height = reader.read_layout_unit("measured line height")?;
         let line_width = reader.read_layout_unit("measured line width")?;
-        let ink_bounds = if version == CURRENT_SCHEMA_VERSION {
+        let ink_bounds = if version != SCHEMA_VERSION_V1 {
             TextBounds {
                 x: reader.read_layout_unit("measured line ink x")?,
                 y: reader.read_layout_unit("measured line ink y")?,
@@ -1067,6 +1081,18 @@ fn validate_utf8_range(
 }
 
 fn write_page_scene_v2(writer: &mut Writer, page: &PageScene) -> Result<(), WireError> {
+    write_page_scene_modern(writer, page, SCHEMA_VERSION_V2)
+}
+
+fn write_page_scene_v3(writer: &mut Writer, page: &PageScene) -> Result<(), WireError> {
+    write_page_scene_modern(writer, page, CURRENT_SCHEMA_VERSION)
+}
+
+fn write_page_scene_modern(
+    writer: &mut Writer,
+    page: &PageScene,
+    version: SchemaVersion,
+) -> Result<(), WireError> {
     validate_page_text_tables(page)?;
     writer.write_u32(page.page_index);
     write_page_size(writer, page.size);
@@ -1094,7 +1120,7 @@ fn write_page_scene_v2(writer: &mut Writer, page: &PageScene) -> Result<(), Wire
     }
     writer.write_collection_len("link regions", page.links.len())?;
     for link in &page.links {
-        write_link_region(writer, link)?;
+        write_link_region(writer, link, version)?;
     }
     writer.write_collection_len("anchor regions", page.anchors.len())?;
     for anchor in &page.anchors {
@@ -1121,6 +1147,17 @@ fn write_page_scene_v2(writer: &mut Writer, page: &PageScene) -> Result<(), Wire
 }
 
 fn read_page_scene_v2(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
+    read_page_scene_modern(reader, SCHEMA_VERSION_V2)
+}
+
+fn read_page_scene_v3(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
+    read_page_scene_modern(reader, CURRENT_SCHEMA_VERSION)
+}
+
+fn read_page_scene_modern(
+    reader: &mut Reader<'_>,
+    version: SchemaVersion,
+) -> Result<PageScene, WireError> {
     let page_index = reader.read_u32("page index")?;
     let size = read_page_size(reader)?;
     let start_anchor = read_option(reader, "start anchor", read_text_anchor)?;
@@ -1145,7 +1182,7 @@ fn read_page_scene_v2(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
     let link_count = reader.read_collection_len("link regions")?;
     let mut links = Vec::new();
     for _ in 0..link_count {
-        links.push(read_link_region(reader)?);
+        links.push(read_link_region(reader, version)?);
     }
     let anchor_count = reader.read_collection_len("anchor regions")?;
     let mut anchors = Vec::new();
@@ -1622,7 +1659,7 @@ fn write_page_scene_v1(writer: &mut Writer, page: &PageScene) -> Result<(), Wire
 
     writer.write_collection_len("link regions", page.links.len())?;
     for link in &page.links {
-        write_link_region(writer, link)?;
+        write_link_region(writer, link, SCHEMA_VERSION_V1)?;
     }
 
     writer.write_collection_len("anchor regions", page.anchors.len())?;
@@ -1668,7 +1705,7 @@ fn read_page_scene_v1(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
     let link_count = reader.read_collection_len("link regions")?;
     let mut links = Vec::new();
     for _ in 0..link_count {
-        links.push(read_link_region(reader)?);
+        links.push(read_link_region(reader, SCHEMA_VERSION_V1)?);
     }
 
     let anchor_count = reader.read_collection_len("anchor regions")?;
@@ -1759,7 +1796,11 @@ fn read_scene_fragment(reader: &mut Reader<'_>) -> Result<SceneFragment, WireErr
     })
 }
 
-fn write_link_region(writer: &mut Writer, link: &LinkRegion) -> Result<(), WireError> {
+fn write_link_region(
+    writer: &mut Writer,
+    link: &LinkRegion,
+    version: SchemaVersion,
+) -> Result<(), WireError> {
     write_rect(writer, link.rect);
     writer.write_u32(link.node_id.get());
     writer.write_string("link href", &link.href)?;
@@ -1772,21 +1813,57 @@ fn write_link_region(writer: &mut Writer, link: &LinkRegion) -> Result<(), WireE
         writer.write_string("link fragment", fragment)
     })?;
     writer.write_u8(link_kind_to_wire(&link.kind));
+    if version == CURRENT_SCHEMA_VERSION {
+        write_option(writer, link.text_range.as_ref(), |writer, range| {
+            if range.start > range.end {
+                return Err(WireError::InvalidRange {
+                    field: "link text range",
+                });
+            }
+            writer.write_u32(range.start);
+            writer.write_u32(range.end);
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 
-fn read_link_region(reader: &mut Reader<'_>) -> Result<LinkRegion, WireError> {
+fn read_link_region(
+    reader: &mut Reader<'_>,
+    version: SchemaVersion,
+) -> Result<LinkRegion, WireError> {
+    let rect = read_rect(reader)?;
+    let node_id = NodeId::new(reader.read_u32("link node id")?);
+    let href = reader.read_string("link href")?;
+    let resolved_document = read_option(reader, "resolved link document", |reader| {
+        reader.read_string("resolved link document")
+    })?;
+    let fragment = read_option(reader, "link fragment", |reader| {
+        reader.read_string("link fragment")
+    })?;
+    let kind = link_kind_from_wire(reader.read_u8("link kind")?)?;
+    let text_range = if version == CURRENT_SCHEMA_VERSION {
+        read_option(reader, "link text range", |reader| {
+            let start = reader.read_u32("link text range start")?;
+            let end = reader.read_u32("link text range end")?;
+            if start > end {
+                return Err(WireError::InvalidRange {
+                    field: "link text range",
+                });
+            }
+            Ok(start..end)
+        })?
+    } else {
+        None
+    };
     Ok(LinkRegion {
-        rect: read_rect(reader)?,
-        node_id: NodeId::new(reader.read_u32("link node id")?),
-        href: reader.read_string("link href")?,
-        resolved_document: read_option(reader, "resolved link document", |reader| {
-            reader.read_string("resolved link document")
-        })?,
-        fragment: read_option(reader, "link fragment", |reader| {
-            reader.read_string("link fragment")
-        })?,
-        kind: link_kind_from_wire(reader.read_u8("link kind")?)?,
+        rect,
+        node_id,
+        text_range,
+        href,
+        resolved_document,
+        fragment,
+        kind,
     })
 }
 

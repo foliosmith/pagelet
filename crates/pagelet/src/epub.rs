@@ -4769,8 +4769,21 @@ mod tests {
             .iter()
             .find(|link| link.href.as_ref() == "#target")
             .expect("precise link region");
+        assert_eq!(link_region.node_id, paragraph_id);
+        assert_eq!(link_region.kind, document::LinkKind::Internal);
+        assert_eq!(link_region.text_range, inline_link.text_range);
         assert!(link_region.rect.x > paint.layout_rect.x);
         assert!(link_region.rect.width < paint.layout_rect.width);
+        let link_range = inline_link.text_range.as_ref().expect("inline link range");
+        let page_json = page.to_normalized_json();
+        assert!(page_json.contains(&format!(r#""node_id": {}"#, paragraph_id.get())));
+        assert!(page_json.contains(r#""resolved_document": "EPUB/chapter-1.xhtml""#));
+        assert!(page_json.contains(r#""fragment": "target""#));
+        assert!(page_json.contains(r#""kind": "internal""#));
+        assert!(page_json.contains(&format!(
+            r#""text_range": {{"start": {}, "end": {}}}"#,
+            link_range.start, link_range.end
+        )));
         let anchor_region = page
             .anchors
             .iter()

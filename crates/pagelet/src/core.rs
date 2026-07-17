@@ -809,7 +809,7 @@ impl EngineVersions {
         style_schema: 4,
         text_schema: 2,
         pagination_algorithm: 4,
-        scene_wire: 2,
+        scene_wire: 3,
         disk_cache: 2,
     };
 }
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(versions.style_schema, 4);
         assert_eq!(versions.text_schema, 2);
         assert_eq!(versions.pagination_algorithm, 4);
-        assert_eq!(versions.scene_wire, 2);
+        assert_eq!(versions.scene_wire, 3);
         assert_eq!(versions.disk_cache, 2);
         assert!(versions.disk_cache > 0);
     }

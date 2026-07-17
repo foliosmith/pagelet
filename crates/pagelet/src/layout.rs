@@ -1113,6 +1113,8 @@ pub struct LinkRegion {
     pub rect: Rect,
     /// Source node.
     pub node_id: NodeId,
+    /// Paragraph-local UTF-8 range covered by the link.
+    pub text_range: Option<std::ops::Range<u32>>,
     /// Original href.
     pub href: Arc<str>,
     /// Resolved document target.
@@ -3354,6 +3356,7 @@ fn link_region(link: &LinkTarget, rect: Rect) -> LinkRegion {
     LinkRegion {
         rect,
         node_id: link.source_node,
+        text_range: link.text_range.clone(),
         href: link.href.clone(),
         resolved_document: link.resolved_document.clone(),
         fragment: link.fragment.clone(),
@@ -3876,7 +3879,17 @@ fn push_page_json(out: &mut String, page: &PageScene, level: usize, trailing: bo
     for (index, link) in page.links.iter().enumerate() {
         indent(out, level + 2);
         out.push('{');
+        push_inline_u32(out, "node_id", link.node_id.get(), true);
         push_inline_string(out, "href", &link.href, true);
+        push_inline_opt_string(
+            out,
+            "resolved_document",
+            link.resolved_document.as_deref(),
+            true,
+        );
+        push_inline_opt_string(out, "fragment", link.fragment.as_deref(), true);
+        push_inline_string(out, "kind", link_kind_name(link.kind), true);
+        push_inline_opt_text_range(out, "text_range", link.text_range.as_ref(), true);
         push_inline_rect(out, "rect", link.rect);
         out.push('}');
         if index + 1 < page.links.len() {
@@ -4123,6 +4136,16 @@ fn fragment_kind_name(kind: &SceneFragmentKind) -> &'static str {
     }
 }
 
+const fn link_kind_name(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::Internal => "internal",
+        LinkKind::External => "external",
+        LinkKind::Resource => "resource",
+        LinkKind::Footnote => "footnote",
+        LinkKind::Unknown => "unknown",
+    }
+}
+
 fn push_string(out: &mut String, level: usize, name: &str, value: &str, trailing: bool) {
     indent(out, level);
     out.push('"');
@@ -4166,6 +4189,44 @@ fn push_inline_string(out: &mut String, name: &str, value: &str, trailing: bool)
     out.push_str("\": \"");
     out.push_str(&escape_json(value));
     out.push('"');
+    if trailing {
+        out.push_str(", ");
+    }
+}
+
+fn push_inline_opt_string(out: &mut String, name: &str, value: Option<&str>, trailing: bool) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": ");
+    if let Some(value) = value {
+        out.push('"');
+        out.push_str(&escape_json(value));
+        out.push('"');
+    } else {
+        out.push_str("null");
+    }
+    if trailing {
+        out.push_str(", ");
+    }
+}
+
+fn push_inline_opt_text_range(
+    out: &mut String,
+    name: &str,
+    range: Option<&std::ops::Range<u32>>,
+    trailing: bool,
+) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": ");
+    if let Some(range) = range {
+        out.push('{');
+        push_inline_u32(out, "start", range.start, true);
+        push_inline_u32(out, "end", range.end, false);
+        out.push('}');
+    } else {
+        out.push_str("null");
+    }
     if trailing {
         out.push_str(", ");
     }

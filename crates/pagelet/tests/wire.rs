@@ -18,7 +18,7 @@ use pagelet::{
     },
     wire::{
         MeasureBatch, MeasuredBatch, PageBatch, SchemaVersion, WireError, CURRENT_SCHEMA_VERSION,
-        SCHEMA_VERSION_V1,
+        SCHEMA_VERSION_V1, SCHEMA_VERSION_V2,
     },
 };
 
@@ -26,8 +26,8 @@ const HEADER_LEN: usize = 20;
 
 #[test]
 fn schema_version_is_independent_from_crate_semver() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(2));
-    assert_eq!(CURRENT_SCHEMA_VERSION.get(), 2);
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(3));
+    assert_eq!(CURRENT_SCHEMA_VERSION.get(), 3);
     assert_ne!(
         CURRENT_SCHEMA_VERSION.get().to_string(),
         env!("CARGO_PKG_VERSION")
@@ -139,7 +139,24 @@ fn v1_page_projection_is_explicit_and_canonical() {
 }
 
 #[test]
-fn empty_page_batch_has_a_fixed_v2_encoding() {
+fn v2_page_projection_drops_v3_link_ranges_and_is_canonical() {
+    let batch = PageBatch {
+        schema_version: SCHEMA_VERSION_V2,
+        pages: vec![rich_page_scene()],
+    };
+    let encoded = batch.encode().expect("encode v2 page projection");
+    let decoded = PageBatch::decode(&encoded).expect("decode v2 page projection");
+
+    assert_eq!(decoded.schema_version, SCHEMA_VERSION_V2);
+    assert!(decoded.pages[0]
+        .links
+        .iter()
+        .all(|link| link.text_range.is_none()));
+    assert_eq!(decoded.encode().expect("re-encode v2 page batch"), encoded);
+}
+
+#[test]
+fn empty_page_batch_has_a_fixed_v3_encoding() {
     let encoded = PageBatch::new(Vec::new())
         .encode()
         .expect("encode empty page batch");
@@ -148,11 +165,29 @@ fn empty_page_batch_has_a_fixed_v2_encoding() {
         encoded,
         [
             0x50, 0x47, 0x4c, 0x54, 0x53, 0x43, 0x4e, 0x00, // magic
-            0x02, 0x00, // schema v2
+            0x03, 0x00, // schema v3
             0x01, 0x00, // PageBatch
             0x04, 0x00, 0x00, 0x00, // payload length
             0x1c, 0xdf, 0x44, 0x21, // CRC-32 of four zero bytes
             0x00, 0x00, 0x00, 0x00, // zero pages
+        ]
+    );
+}
+
+#[test]
+fn empty_page_batch_preserves_the_frozen_v2_encoding() {
+    let encoded = PageBatch {
+        schema_version: SCHEMA_VERSION_V2,
+        pages: Vec::new(),
+    }
+    .encode()
+    .expect("encode empty v2 page batch");
+
+    assert_eq!(
+        encoded,
+        [
+            0x50, 0x47, 0x4c, 0x54, 0x53, 0x43, 0x4e, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x1c, 0xdf, 0x44, 0x21, 0x00, 0x00, 0x00, 0x00,
         ]
     );
 }
@@ -211,12 +246,12 @@ fn decoder_rejects_unknown_schema_version_and_payload_kind() {
     let mut pages = PageBatch::new(Vec::new())
         .encode()
         .expect("encode empty page batch");
-    pages[8..10].copy_from_slice(&3_u16.to_le_bytes());
+    pages[8..10].copy_from_slice(&4_u16.to_le_bytes());
     assert_eq!(
         PageBatch::decode(&pages),
         Err(WireError::UnsupportedVersion {
-            expected: 2,
-            actual: 3,
+            expected: 3,
+            actual: 4,
         })
     );
 
@@ -309,6 +344,17 @@ fn encoder_rejects_invalid_utf8_boundaries_and_reversed_ranges() {
         PageBatch::new(vec![page]).encode(),
         Err(WireError::InvalidRange {
             field: "source range",
+        })
+    );
+
+    let mut page = rich_page_scene();
+    let mut invalid_link_range = 2..9;
+    std::mem::swap(&mut invalid_link_range.start, &mut invalid_link_range.end);
+    page.links[0].text_range = Some(invalid_link_range);
+    assert_eq!(
+        PageBatch::new(vec![page]).encode(),
+        Err(WireError::InvalidRange {
+            field: "link text range",
         })
     );
 }
@@ -417,6 +463,10 @@ fn rich_page_scene() -> PageScene {
                 height: LayoutUnit::from_px(10),
             },
             node_id: NodeId::new(u32::try_from(index + 1).expect("link node id")),
+            text_range: Some(
+                u32::try_from(index).expect("link range start")
+                    ..u32::try_from(index + 1).expect("link range end"),
+            ),
             href: Arc::from(format!("chapter.xhtml#link-{index}")),
             resolved_document: (index == 0).then(|| Arc::from("OPS/chapter.xhtml")),
             fragment: (index == 0).then(|| Arc::from("link-0")),
