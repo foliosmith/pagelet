@@ -806,11 +806,11 @@ impl EngineVersions {
     /// Current pre-alpha version set.
     pub const CURRENT: Self = Self {
         parser_schema: 2,
-        style_schema: 2,
-        text_schema: 1,
-        pagination_algorithm: 2,
-        scene_wire: 1,
-        disk_cache: 1,
+        style_schema: 3,
+        text_schema: 2,
+        pagination_algorithm: 3,
+        scene_wire: 2,
+        disk_cache: 2,
     };
 }
 
@@ -1010,8 +1010,11 @@ mod tests {
 
         assert_eq!(versions, EngineVersions::CURRENT);
         assert_eq!(versions.parser_schema, 2);
-        assert_eq!(versions.style_schema, 2);
-        assert_eq!(versions.pagination_algorithm, 2);
+        assert_eq!(versions.style_schema, 3);
+        assert_eq!(versions.text_schema, 2);
+        assert_eq!(versions.pagination_algorithm, 3);
+        assert_eq!(versions.scene_wire, 2);
+        assert_eq!(versions.disk_cache, 2);
         assert!(versions.disk_cache > 0);
     }
 }

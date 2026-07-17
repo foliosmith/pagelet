@@ -75,7 +75,7 @@ impl Default for FontDescriptor {
 }
 
 /// Ordered fallback chain supplied to a text backend.
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub struct FontFallbackChain {
     /// Primary requested font.
     pub primary: FontDescriptor,
@@ -84,7 +84,7 @@ pub struct FontFallbackChain {
 }
 
 /// Per-run style inside a measurement request.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct TextStyleRun {
     /// UTF-8 byte offset into [`MeasureRequest::text`].
     pub start: u32,
@@ -92,6 +92,8 @@ pub struct TextStyleRun {
     pub end: u32,
     /// Font size in logical pixels.
     pub font_size: LayoutUnit,
+    /// Additional advance between text clusters.
+    pub letter_spacing: LayoutUnit,
     /// Requested font fallback chain.
     pub fonts: FontFallbackChain,
 }
@@ -104,9 +106,23 @@ impl TextStyleRun {
             start,
             end,
             font_size,
+            letter_spacing: LayoutUnit::ZERO,
             fonts,
         }
     }
+}
+
+/// Paragraph-local ink bounds reported by the shaping adapter.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TextBounds {
+    /// Left edge relative to the line origin.
+    pub x: LayoutUnit,
+    /// Top edge relative to the line top.
+    pub y: LayoutUnit,
+    /// Ink width, which may exceed the line advance.
+    pub width: LayoutUnit,
+    /// Ink height.
+    pub height: LayoutUnit,
 }
 
 /// Height and strut handling requested by layout.
@@ -282,6 +298,8 @@ pub struct LineMetrics {
     pub line_height: LayoutUnit,
     /// Measured line width.
     pub width: LayoutUnit,
+    /// Actual glyph ink relative to the line origin and line top.
+    pub ink_bounds: TextBounds,
     /// True when the range ends at a hard line break.
     pub hard_break: bool,
 }
@@ -468,6 +486,8 @@ fn validate_measured_text(
             || line.descent.raw() < 0
             || line.line_height.raw() < 0
             || line.baseline.raw() < 0
+            || line.ink_bounds.width.raw() < 0
+            || line.ink_bounds.height.raw() < 0
         {
             return Err(protocol_error("measured line metrics must not be negative"));
         }
@@ -593,12 +613,23 @@ fn measure_deterministic(
     item: &MeasureRequest,
     font_fingerprint: FontSetFingerprint,
 ) -> MeasuredText {
-    let font_raw = item.font_size.raw().max(LayoutUnit::SCALE);
-    let ascent = LayoutUnit::from_raw((font_raw * 4) / 5);
-    let descent = LayoutUnit::from_raw((font_raw / 5).max(1));
-    let leading = LayoutUnit::from_raw((font_raw / 8).max(1));
+    let primary_run = item.style_runs.first();
+    let font_raw = primary_run
+        .map_or(item.font_size, |run| run.font_size)
+        .raw()
+        .max(LayoutUnit::SCALE);
+    let mut ascent = LayoutUnit::from_raw((font_raw * 4) / 5);
+    let mut descent = LayoutUnit::from_raw((font_raw / 5).max(1));
+    let mut leading = LayoutUnit::from_raw((font_raw / 8).max(1));
+    if item.height_behavior == HeightBehavior::IncludeStrut {
+        ascent = ascent.max(item.strut.ascent);
+        descent = descent.max(item.strut.descent);
+        leading = leading.max(item.strut.leading);
+    }
     let line_height = LayoutUnit::from_raw(ascent.raw() + descent.raw() + leading.raw());
-    let advance = LayoutUnit::from_raw((font_raw / 2).max(1));
+    let letter_spacing = primary_run.map_or(LayoutUnit::ZERO, |run| run.letter_spacing);
+    let advance =
+        (LayoutUnit::from_raw((font_raw / 2).max(1)) + letter_spacing).max(LayoutUnit::from_raw(1));
     let width_limit = item.max_width.raw().max(advance.raw());
     let mut lines = Vec::new();
     let mut clusters = Vec::new();
@@ -715,11 +746,17 @@ fn line_metrics(
     LineMetrics {
         text_start: u32::try_from(start).unwrap_or(u32::MAX),
         text_end: u32::try_from(end).unwrap_or(u32::MAX),
-        baseline: ascent,
+        baseline: ascent + LayoutUnit::from_raw((line_height - ascent - descent).raw() / 2),
         ascent,
         descent,
         line_height,
         width,
+        ink_bounds: TextBounds {
+            x: LayoutUnit::ZERO,
+            y: LayoutUnit::from_raw((line_height - ascent - descent).raw() / 2),
+            width,
+            height: ascent + descent,
+        },
         hard_break,
     }
 }
@@ -806,6 +843,12 @@ mod tests {
                     descent: LayoutUnit::from_px(5),
                     line_height,
                     width: LayoutUnit::from_px(16),
+                    ink_bounds: TextBounds {
+                        x: LayoutUnit::ZERO,
+                        y: LayoutUnit::ZERO,
+                        width: LayoutUnit::from_px(16),
+                        height: line_height,
+                    },
                     hard_break: false,
                 }],
                 vec![

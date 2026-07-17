@@ -4,17 +4,19 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     core::{
-        CancellationToken, ContentHash, Diagnostic, DiagnosticCode, LayoutError, LayoutUnit,
-        NodeId, PageletError, ResourceLimitError, ResourceLimitKind, ResourceLimits, Severity,
-        SourceRange, TextAffinity, TextAnchor,
+        CancellationToken, ContentHash, Diagnostic, DiagnosticCode, EngineVersions, LayoutError,
+        LayoutUnit, NodeId, PageletError, ResourceLimitError, ResourceLimitKind, ResourceLimits,
+        Severity, SourceRange, TextAffinity, TextAnchor,
     },
     document::{
         BlockText, ChapterIr, ComputedStyle as DocumentComputedStyle, DocumentNode, ImageNode,
         LinkKind, LinkTarget, StyleTable,
     },
     text::{
-        HeightBehavior, HostMeasuredTextBackend, LineMetrics, MeasureBatch, MeasureRequest,
-        MeasuredBatch, MeasuredText, StrutStyle, TextBackend, TextCluster, TextDirection,
+        FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
+        HostMeasuredTextBackend, LineMetrics, MeasureBatch, MeasureRequest, MeasuredBatch,
+        MeasuredText, StrutStyle, TextBackend, TextBounds, TextCluster, TextDirection,
+        TextStyleRun,
     },
 };
 
@@ -134,12 +136,26 @@ pub struct LayoutContext<'a> {
 }
 
 /// Layout-ready style subset.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ComputedLayoutStyle {
     /// Font size.
     pub font_size: LayoutUnit,
     /// Line height.
     pub line_height: LayoutUnit,
+    /// Ordered host-visible font fallback chain.
+    pub font_candidates: FontFallbackChain,
+    /// CSS-compatible numeric font weight.
+    pub font_weight: u16,
+    /// Requested font slant.
+    pub font_style: FontStyle,
+    /// CSS-compatible font stretch percentage.
+    pub font_stretch: u16,
+    /// Additional advance between text clusters.
+    pub letter_spacing: LayoutUnit,
+    /// BCP-47 paragraph locale.
+    pub locale: Arc<str>,
+    /// Paragraph base direction.
+    pub direction: TextDirection,
     /// Physical top margin in the horizontal writing fallback.
     pub margin_top: LayoutUnit,
     /// Physical right margin in the horizontal writing fallback.
@@ -202,6 +218,13 @@ impl ComputedLayoutStyle {
                 Self {
                     font_size: LayoutUnit::from_px(font),
                     line_height: LayoutUnit::from_px(font + 8),
+                    font_candidates: FontFallbackChain::default(),
+                    font_weight: 700,
+                    font_style: FontStyle::Normal,
+                    font_stretch: 100,
+                    letter_spacing: LayoutUnit::ZERO,
+                    locale: Arc::from("und"),
+                    direction: TextDirection::Auto,
                     margin_top: LayoutUnit::from_px(14),
                     margin_right: LayoutUnit::ZERO,
                     margin_bottom: LayoutUnit::from_px(8),
@@ -285,6 +308,49 @@ impl ComputedLayoutStyle {
                 _ => {}
             }
         }
+        self.font_weight = document_style
+            .properties
+            .get("font-weight")
+            .map_or(self.font_weight, |value| parse_font_weight(value));
+        self.font_style = document_style
+            .properties
+            .get("font-style")
+            .map_or(self.font_style, |value| parse_font_style(value));
+        self.font_stretch = document_style
+            .properties
+            .get("font-stretch")
+            .map_or(self.font_stretch, |value| parse_font_stretch(value));
+        self.letter_spacing = document_style
+            .properties
+            .get("letter-spacing")
+            .and_then(|value| {
+                if value.trim().eq_ignore_ascii_case("normal") {
+                    Some(LayoutUnit::ZERO)
+                } else {
+                    resolve_used_length(value, self.font_size, containing_width, true)
+                }
+            })
+            .unwrap_or(self.letter_spacing);
+        self.locale = document_style
+            .properties
+            .get("-pagelet-locale")
+            .cloned()
+            .unwrap_or_else(|| self.locale.clone());
+        self.direction =
+            document_style
+                .properties
+                .get("direction")
+                .map_or(self.direction, |value| match value.trim() {
+                    "ltr" => TextDirection::Ltr,
+                    "rtl" => TextDirection::Rtl,
+                    _ => TextDirection::Auto,
+                });
+        self.font_candidates = font_fallback_chain(
+            document_style.properties.get("font-family"),
+            self.font_weight,
+            self.font_style,
+            self.font_stretch,
+        );
         let geometry =
             UsedBoxGeometry::from_document(document_style, self.font_size, containing_width);
         let has_margin = document_style.properties.contains_key("margin");
@@ -506,11 +572,95 @@ fn parse_number(value: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+fn parse_font_weight(value: &str) -> u16 {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => 400,
+        "bold" | "bolder" => 700,
+        "lighter" => 300,
+        value => value
+            .parse::<u16>()
+            .ok()
+            .map_or(400, |weight| weight.clamp(1, 1_000)),
+    }
+}
+
+fn parse_font_style(value: &str) -> FontStyle {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "italic" => FontStyle::Italic,
+        value if value.starts_with("oblique") => FontStyle::Oblique,
+        _ => FontStyle::Normal,
+    }
+}
+
+fn parse_font_stretch(value: &str) -> u16 {
+    let value = value.trim().to_ascii_lowercase();
+    let keyword = match value.as_str() {
+        "ultra-condensed" => Some(50),
+        "extra-condensed" => Some(62),
+        "condensed" => Some(75),
+        "semi-condensed" => Some(87),
+        "normal" => Some(100),
+        "semi-expanded" => Some(112),
+        "expanded" => Some(125),
+        "extra-expanded" => Some(150),
+        "ultra-expanded" => Some(200),
+        _ => None,
+    };
+    keyword.unwrap_or_else(|| {
+        value
+            .strip_suffix('%')
+            .and_then(|number| number.trim().parse::<u16>().ok())
+            .map_or(100, |stretch| stretch.clamp(1, 1_000))
+    })
+}
+
+fn font_fallback_chain(
+    value: Option<&Arc<str>>,
+    weight: u16,
+    style: FontStyle,
+    stretch: u16,
+) -> FontFallbackChain {
+    let mut families = value
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|family| {
+                    let family = family.trim().trim_matches(['\'', '"']);
+                    (!family.is_empty()).then(|| Arc::<str>::from(family))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if families.is_empty() {
+        families.push(Arc::from("serif"));
+    }
+    let mut descriptors = families.into_iter().map(|family| FontDescriptor {
+        font_id: None,
+        family,
+        weight,
+        style,
+        stretch,
+        fingerprint: FontSetFingerprint::default(),
+    });
+    let primary = descriptors.next().unwrap_or_default();
+    FontFallbackChain {
+        primary,
+        fallbacks: descriptors.collect(),
+    }
+}
+
 impl Default for ComputedLayoutStyle {
     fn default() -> Self {
         Self {
             font_size: LayoutUnit::from_px(16),
             line_height: LayoutUnit::from_px(22),
+            font_candidates: FontFallbackChain::default(),
+            font_weight: 400,
+            font_style: FontStyle::Normal,
+            font_stretch: 100,
+            letter_spacing: LayoutUnit::ZERO,
+            locale: Arc::from("und"),
+            direction: TextDirection::Auto,
             margin_top: LayoutUnit::from_px(4),
             margin_right: LayoutUnit::ZERO,
             margin_bottom: LayoutUnit::from_px(8),
@@ -795,7 +945,7 @@ pub struct TextAnchorRange {
 /// Kind of scene fragment.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum SceneFragmentKind {
-    /// Text line clipped from a paragraph.
+    /// Legacy v1 text line. New scenes use [`TextPaintFragment`].
     TextLine,
     /// List marker.
     Marker,
@@ -831,6 +981,128 @@ pub struct SceneFragment {
     /// Line index inside the text block, when applicable.
     pub line_index: Option<u32>,
     /// True if the fragment was clipped to avoid an empty page.
+    pub overflow: bool,
+}
+
+/// A point in page-local logical pixels.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct Point {
+    /// Horizontal coordinate.
+    pub x: LayoutUnit,
+    /// Vertical coordinate.
+    pub y: LayoutUnit,
+}
+
+/// One measured line retained for paragraph replay.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SceneParagraphLine {
+    /// Host-provided metrics, including the original baseline.
+    pub metrics: LineMetrics,
+    /// Paragraph-local layout occupancy.
+    pub layout_rect: Rect,
+    /// Paragraph-local glyph ink, which may exceed the advance width.
+    pub ink_bounds: Rect,
+}
+
+/// Complete measured paragraph retained as the authoritative paint input.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SceneParagraph {
+    /// Stable paragraph id shared by every page fragment of this paragraph.
+    pub paragraph_id: u32,
+    /// Fingerprint of every input that produced the measurement request.
+    pub request_fingerprint: u64,
+    /// Host-provided fingerprint of the measured result.
+    pub measurement_fingerprint: u64,
+    /// Complete paragraph text.
+    pub text: Arc<str>,
+    /// UTF-8 byte range measured inside `text`.
+    pub text_range: std::ops::Range<u32>,
+    /// Exact style runs sent to the shaping adapter.
+    pub style_runs: Vec<TextStyleRun>,
+    /// Block-level font size supplied to the adapter.
+    pub font_size: LayoutUnit,
+    /// Final wrapping width supplied to the adapter.
+    pub available_width: LayoutUnit,
+    /// Maximum wrapping width supplied to the adapter.
+    pub max_width: LayoutUnit,
+    /// Paragraph locale supplied to the adapter.
+    pub locale: Arc<str>,
+    /// Paragraph direction supplied to the adapter.
+    pub direction: TextDirection,
+    /// Text scale supplied to the adapter.
+    pub text_scale: LayoutUnit,
+    /// Block-level fallback chain supplied to the adapter.
+    pub font_candidates: FontFallbackChain,
+    /// Strut supplied to the adapter.
+    pub strut: StrutStyle,
+    /// Height behavior supplied to the adapter.
+    pub height_behavior: HeightBehavior,
+    /// Paragraph-local measured line geometry.
+    pub lines: Vec<SceneParagraphLine>,
+    /// Host-provided cluster map for hit testing and selections.
+    pub clusters: Vec<TextCluster>,
+}
+
+/// Cache/replay identity of one measured paragraph.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct SceneParagraphIdentity {
+    /// Stable paragraph id.
+    pub paragraph_id: u32,
+    /// Fingerprint of the complete measurement request.
+    pub request_fingerprint: u64,
+    /// Fingerprint of the host measurement result.
+    pub measurement_fingerprint: u64,
+}
+
+impl SceneParagraph {
+    /// Return the complete identity required to reuse this paragraph measurement.
+    #[must_use]
+    pub const fn replay_identity(&self) -> SceneParagraphIdentity {
+        SceneParagraphIdentity {
+            paragraph_id: self.paragraph_id,
+            request_fingerprint: self.request_fingerprint,
+            measurement_fingerprint: self.measurement_fingerprint,
+        }
+    }
+}
+
+/// Complete identity required to reuse text in a cached page scene.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SceneTextIdentity {
+    /// Text backend that measured the scene.
+    pub text_backend_id: crate::text::TextBackendId,
+    /// Font set used by the backend.
+    pub font_fingerprint: FontSetFingerprint,
+    /// Paragraph identities in scene-table order.
+    pub paragraphs: Vec<SceneParagraphIdentity>,
+}
+
+/// One page-visible clipped replay of a complete measured paragraph.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TextPaintFragment {
+    /// Stable fragment id within the page.
+    pub id: u32,
+    /// Source semantic node.
+    pub node_id: NodeId,
+    /// Paragraph referenced from [`PageScene::paragraphs`].
+    pub paragraph_id: u32,
+    /// UTF-8 bytes visible on this page.
+    pub visible_text_range: std::ops::Range<u32>,
+    /// Origin used to paint the complete paragraph.
+    pub paint_origin: Point,
+    /// Layout occupancy of the visible lines on this page.
+    pub layout_rect: Rect,
+    /// Page clip; never derived from a line advance width.
+    pub clip_rect: Rect,
+    /// First visible line inside the complete paragraph.
+    pub first_line: u32,
+    /// Number of visible lines.
+    pub line_count: u32,
+    /// Optional source XHTML range.
+    pub source_range: Option<SourceRange>,
+    /// Semantic range visible on this page.
+    pub anchor_range: TextAnchorRange,
+    /// True only when an oversized line overflowed the page.
     pub overflow: bool,
 }
 
@@ -915,6 +1187,14 @@ pub struct PageScene {
     pub start_anchor: Option<TextAnchor>,
     /// Last text anchor on this page.
     pub end_anchor: Option<TextAnchor>,
+    /// Text backend that produced every paragraph measurement on this page.
+    pub text_backend_id: crate::text::TextBackendId,
+    /// Font set used by the measurement adapter.
+    pub font_fingerprint: FontSetFingerprint,
+    /// Complete measured paragraphs referenced by text paint fragments.
+    pub paragraphs: Vec<SceneParagraph>,
+    /// Clipped paragraph replay fragments.
+    pub text_paints: Vec<TextPaintFragment>,
     /// Drawable fragments.
     pub fragments: Vec<SceneFragment>,
     /// Clickable link regions.
@@ -941,6 +1221,34 @@ impl PageScene {
         push_page_json(&mut out, self, 0, false);
         out.push('\n');
         out
+    }
+
+    /// Return the identity tuple that must match before cached text can be replayed.
+    #[must_use]
+    pub fn text_replay_identity(&self) -> SceneTextIdentity {
+        SceneTextIdentity {
+            text_backend_id: self.text_backend_id,
+            font_fingerprint: self.font_fingerprint,
+            paragraphs: self
+                .paragraphs
+                .iter()
+                .map(SceneParagraph::replay_identity)
+                .collect(),
+        }
+    }
+
+    /// Reject a cached scene when its backend, font, request, or measurement identity changed.
+    pub fn validate_text_replay_identity(
+        &self,
+        expected: &SceneTextIdentity,
+    ) -> Result<(), PageletError> {
+        if &self.text_replay_identity() == expected {
+            Ok(())
+        } else {
+            Err(layout_error(
+                "cached page scene text replay identity does not match",
+            ))
+        }
     }
 }
 
@@ -1013,8 +1321,8 @@ fn prepare_measure_batch_from_blocks(
                 u32::try_from(index).unwrap_or(u32::MAX),
                 block.node_id.get(),
                 text,
-                block.style,
-                measurement_available_width(constraints, block.style),
+                &block.style,
+                measurement_available_width(constraints, &block.style),
             ))
         })
         .collect();
@@ -1027,6 +1335,13 @@ impl PaginatedDocument {
     pub fn to_normalized_json(&self) -> String {
         let mut out = String::new();
         out.push_str("{\n");
+        push_u32(
+            &mut out,
+            1,
+            "scene_wire",
+            EngineVersions::CURRENT.scene_wire,
+            true,
+        );
         indent(&mut out, 1);
         out.push_str("\"complete\": ");
         out.push_str(if self.complete { "true" } else { "false" });
@@ -1178,6 +1493,91 @@ pub fn anchor_to_page(pages: &[PageScene], anchor: TextAnchor) -> Option<u32> {
 /// Hit-test a page coordinate.
 #[must_use]
 pub fn hit_test(page: &PageScene, x: LayoutUnit, y: LayoutUnit) -> Option<HitTestResult> {
+    for paint in &page.text_paints {
+        if !paint.clip_rect.contains(x, y) || !paint.layout_rect.contains(x, y) {
+            continue;
+        }
+        let paragraph = page
+            .paragraphs
+            .iter()
+            .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)?;
+        let local_x = x - paint.paint_origin.x;
+        let local_y = y - paint.paint_origin.y;
+        let first_line = usize::try_from(paint.first_line).ok()?;
+        let last_line = first_line
+            .saturating_add(usize::try_from(paint.line_count).ok()?)
+            .min(paragraph.lines.len());
+        let (line_index, line) = paragraph.lines[first_line..last_line]
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                local_y >= line.layout_rect.y
+                    && local_y <= line.layout_rect.y + line.layout_rect.height
+            })
+            .map(|(relative, line)| (first_line + relative, line))?;
+        let line_x = local_x - line.layout_rect.x;
+        let mut line_clusters = paragraph
+            .clusters
+            .iter()
+            .filter(|cluster| {
+                usize::try_from(cluster.line_index).ok() == Some(line_index)
+                    && cluster.text_end > paint.visible_text_range.start
+                    && cluster.text_start < paint.visible_text_range.end
+            })
+            .peekable();
+        if line_clusters.peek().is_some() {
+            let mut nearest = None;
+            for cluster in line_clusters {
+                let distance = if line_x < cluster.x_start {
+                    cluster.x_start - line_x
+                } else if line_x > cluster.x_end {
+                    line_x - cluster.x_end
+                } else {
+                    LayoutUnit::ZERO
+                };
+                if nearest.is_none_or(|(_, best): (&TextCluster, LayoutUnit)| distance < best) {
+                    nearest = Some((cluster, distance));
+                }
+            }
+            if let Some((cluster, _)) = nearest {
+                let midpoint = LayoutUnit::from_raw(
+                    cluster.x_start.raw().saturating_add(cluster.x_end.raw()) / 2,
+                );
+                let (offset, affinity) = if line_x <= midpoint {
+                    (cluster.text_start, TextAffinity::Downstream)
+                } else {
+                    (cluster.text_end, TextAffinity::Upstream)
+                };
+                return Some(HitTestResult {
+                    node_id: paint.node_id,
+                    utf8_byte_offset: offset
+                        .clamp(paint.visible_text_range.start, paint.visible_text_range.end),
+                    affinity,
+                    fragment_id: paint.id,
+                });
+            }
+        }
+
+        let width = line.metrics.width.raw().max(1);
+        let span = line
+            .metrics
+            .text_end
+            .saturating_sub(line.metrics.text_start)
+            .max(1);
+        let relative_x = line_x.raw().clamp(0, width);
+        let offset = line.metrics.text_start.saturating_add(
+            u32::try_from((i64::from(span) * relative_x) / width).unwrap_or(u32::MAX),
+        );
+        return Some(HitTestResult {
+            node_id: paint.node_id,
+            utf8_byte_offset: offset
+                .clamp(paint.visible_text_range.start, paint.visible_text_range.end),
+            affinity: TextAffinity::Downstream,
+            fragment_id: paint.id,
+        });
+    }
+
+    // Explicit pageletScene v1 fallback.
     for fragment in &page.fragments {
         if !matches!(fragment.kind, SceneFragmentKind::TextLine) || !fragment.rect.contains(x, y) {
             continue;
@@ -1211,8 +1611,12 @@ pub fn validate_layout_invariants(
     pages: &[PageScene],
 ) -> Result<(), PageletError> {
     let mut last_anchor: Option<TextAnchor> = None;
+    let mut paragraph_identities = BTreeMap::<u32, (u64, u64, Arc<str>)>::new();
     for page in pages {
-        if page.fragments.is_empty() && page.next_break_token.is_some() {
+        if page.fragments.is_empty()
+            && page.text_paints.is_empty()
+            && page.next_break_token.is_some()
+        {
             return Err(layout_error(
                 "pagination produced an empty non-terminal page",
             ));
@@ -1231,6 +1635,62 @@ pub fn validate_layout_invariants(
             last_anchor = Some(start);
         }
         let mut last_range_by_node = BTreeMap::<NodeId, u32>::new();
+        for paragraph in &page.paragraphs {
+            let identity = (
+                paragraph.request_fingerprint,
+                paragraph.measurement_fingerprint,
+                paragraph.text.clone(),
+            );
+            if let Some(previous) =
+                paragraph_identities.insert(paragraph.paragraph_id, identity.clone())
+            {
+                if previous != identity {
+                    return Err(layout_error(
+                        "paragraph replay identity changed between pages",
+                    ));
+                }
+            }
+        }
+        for paint in &page.text_paints {
+            if paint.layout_rect.width.raw() < 0
+                || paint.layout_rect.height.raw() < 0
+                || paint.clip_rect.width.raw() < 0
+                || paint.clip_rect.height.raw() < 0
+            {
+                return Err(layout_error("text paint extent is negative"));
+            }
+            if paint.visible_text_range.end < paint.visible_text_range.start {
+                return Err(layout_error("text paint range is reversed"));
+            }
+            let paragraph = page
+                .paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+                .ok_or_else(|| layout_error("text paint references a missing paragraph"))?;
+            if paint.visible_text_range.start < paragraph.text_range.start
+                || paint.visible_text_range.end > paragraph.text_range.end
+            {
+                return Err(layout_error("text paint range is outside its paragraph"));
+            }
+            let first_line = usize::try_from(paint.first_line).unwrap_or(usize::MAX);
+            let line_count = usize::try_from(paint.line_count).unwrap_or(usize::MAX);
+            if line_count == 0
+                || first_line
+                    .checked_add(line_count)
+                    .is_none_or(|end| end > paragraph.lines.len())
+            {
+                return Err(layout_error(
+                    "text paint line range is outside its paragraph",
+                ));
+            }
+            if let Some(previous) =
+                last_range_by_node.insert(paint.node_id, paint.visible_text_range.end)
+            {
+                if paint.visible_text_range.start < previous {
+                    return Err(layout_error("text paint ranges overlap"));
+                }
+            }
+        }
         for fragment in &page.fragments {
             if fragment.rect.width.raw() < 0 || fragment.rect.height.raw() < 0 {
                 return Err(layout_error("fragment extent is negative"));
@@ -1268,15 +1728,14 @@ impl Fragmentable for ParagraphLayout {
         &self,
         context: &LayoutContext<'_>,
     ) -> Result<IntrinsicLayout, PageletError> {
-        let measured = measure_text(
-            context.text_backend,
-            context.cancel,
+        let request = measure_request(
             0,
             self.node_id.get(),
             &self.text,
-            self.style,
-            context.options.constraints.content_width(),
-        )?;
+            &self.style,
+            measurement_available_width(context.options.constraints, &self.style),
+        );
+        let measured = measure_text(context.text_backend, context.cancel, &request, &self.style)?;
         Ok(IntrinsicLayout {
             inline_size: measured.width,
             block_size: measured.height,
@@ -1290,15 +1749,14 @@ impl Fragmentable for ParagraphLayout {
         token: Option<&BreakToken>,
         available_block: LayoutUnit,
     ) -> Result<FragmentResult, PageletError> {
-        let measured = measure_text(
-            context.text_backend,
-            context.cancel,
+        let request = measure_request(
             0,
             self.node_id.get(),
             &self.text,
-            self.style,
-            context.options.constraints.content_width(),
-        )?;
+            &self.style,
+            measurement_available_width(context.options.constraints, &self.style),
+        );
+        let measured = measure_text(context.text_backend, context.cancel, &request, &self.style)?;
         let start_offset = token.map_or(0, |token| token.text_offset);
         let start_line = measured
             .lines
@@ -1362,7 +1820,12 @@ fn paginate_page_from_blocks(
         return Ok(None);
     }
 
-    let mut page = PageBuilder::new(start.page_index, options.constraints);
+    let mut page = PageBuilder::new(
+        start.page_index,
+        options.constraints,
+        text_backend.backend_id(),
+        text_backend.font_fingerprint(),
+    );
     let mut diagnostics = Vec::new();
     let mut index = usize::try_from(start.child_index).unwrap_or(usize::MAX);
     let mut text_offset = start.text_offset;
@@ -1378,19 +1841,20 @@ fn paginate_page_from_blocks(
         if cancel.is_cancelled() {
             return Err(PageletError::Cancelled);
         }
-        if page.fragments.len()
+        if page.fragments.len().saturating_add(page.text_paints.len())
             >= usize::try_from(options.limits.max_layout_fragments).unwrap_or(usize::MAX)
         {
             return Err(PageletError::ResourceLimitExceeded(
                 ResourceLimitError::new(
                     ResourceLimitKind::LayoutFragments,
                     u64::from(options.limits.max_layout_fragments),
-                    u64::try_from(page.fragments.len()).unwrap_or(u64::MAX),
+                    u64::try_from(page.fragments.len().saturating_add(page.text_paints.len()))
+                        .unwrap_or(u64::MAX),
                 ),
             ));
         }
         let block = &blocks[index];
-        if block.style.break_before && !page.fragments.is_empty() {
+        if block.style.break_before && !page.is_empty() {
             next_token = Some(BreakToken::for_position(
                 token_context,
                 BreakTokenPosition::new(
@@ -1406,7 +1870,7 @@ fn paginate_page_from_blocks(
 
         match &block.content {
             LayoutBlockContent::ForcedBreak => {
-                if page.fragments.is_empty() {
+                if page.is_empty() {
                     index += 1;
                     text_offset = 0;
                     continue;
@@ -1416,18 +1880,18 @@ fn paginate_page_from_blocks(
                 break;
             }
             LayoutBlockContent::Text { text, marker } => {
-                let available_width = measurement_available_width(options.constraints, block.style);
-                let measured = measure_text(
-                    text_backend,
-                    cancel,
+                let available_width =
+                    measurement_available_width(options.constraints, &block.style);
+                let request = measure_request(
                     u32::try_from(index).unwrap_or(u32::MAX),
                     block.node_id.get(),
                     text,
-                    block.style,
+                    &block.style,
                     available_width,
-                )?;
+                );
+                let measured = measure_text(text_backend, cancel, &request, &block.style)?;
                 if block.style.keep_with_next
-                    && !page.fragments.is_empty()
+                    && !page.is_empty()
                     && should_keep_with_next(blocks, index, &measured, page.y, content_bottom)
                 {
                     next_token = Some(BreakToken::for_position(
@@ -1446,8 +1910,8 @@ fn paginate_page_from_blocks(
                     token_context,
                     block,
                     block_index: index,
-                    text,
                     marker: marker.as_deref(),
+                    request: &request,
                     measured: &measured,
                     text_offset,
                     content_bottom,
@@ -1559,10 +2023,10 @@ fn paginate_page_from_blocks(
         next_token = None;
     }
 
-    page.links = link_regions(chapter, &page.fragments);
-    page.anchors = anchor_regions(chapter, &page.fragments);
-    page.selections = selection_maps(&page.fragments);
-    page.semantics = semantic_nodes(&page.fragments);
+    page.links = link_regions(chapter, &page.text_paints, &page.fragments);
+    page.anchors = anchor_regions(chapter, &page.text_paints, &page.fragments);
+    page.selections = selection_maps(&page.text_paints, &page.paragraphs, &page.fragments);
+    page.semantics = semantic_nodes(&page.text_paints, &page.paragraphs, &page.fragments);
     page.diagnostics = diagnostics;
     page.next_break_token = next_token;
     page.fingerprint = fingerprint_page(chapter, options, text_backend, &page);
@@ -1577,6 +2041,10 @@ struct PageBuilder {
     constraints: LayoutConstraints,
     y: LayoutUnit,
     pending_margin_bottom: LayoutUnit,
+    text_backend_id: crate::text::TextBackendId,
+    font_fingerprint: FontSetFingerprint,
+    paragraphs: Vec<SceneParagraph>,
+    text_paints: Vec<TextPaintFragment>,
     next_fragment_id: u32,
     fragments: Vec<SceneFragment>,
     links: Vec<LinkRegion>,
@@ -1592,15 +2060,20 @@ struct TextBlockPush<'a> {
     token_context: TokenContext<'a>,
     block: &'a LayoutBlock,
     block_index: usize,
-    text: &'a str,
     marker: Option<&'a str>,
+    request: &'a MeasureRequest,
     measured: &'a MeasuredText,
     text_offset: u32,
     content_bottom: LayoutUnit,
 }
 
 impl PageBuilder {
-    fn new(page_index: u32, constraints: LayoutConstraints) -> Self {
+    fn new(
+        page_index: u32,
+        constraints: LayoutConstraints,
+        text_backend_id: crate::text::TextBackendId,
+        font_fingerprint: FontSetFingerprint,
+    ) -> Self {
         Self {
             page_index,
             size: PageSize {
@@ -1610,6 +2083,10 @@ impl PageBuilder {
             constraints,
             y: constraints.margin_top,
             pending_margin_bottom: LayoutUnit::ZERO,
+            text_backend_id,
+            font_fingerprint,
+            paragraphs: Vec::new(),
+            text_paints: Vec::new(),
             next_fragment_id: 0,
             fragments: Vec::new(),
             links: Vec::new(),
@@ -1630,8 +2107,8 @@ impl PageBuilder {
             token_context,
             block,
             block_index,
-            text,
             marker,
+            request,
             measured,
             text_offset,
             content_bottom,
@@ -1648,8 +2125,8 @@ impl PageBuilder {
         }
 
         let is_continuation = text_offset > 0;
-        let top_spacing = self.block_start_spacing(block.style, is_continuation);
-        if self.y + top_spacing >= content_bottom && !self.fragments.is_empty() {
+        let top_spacing = self.block_start_spacing(&block.style, is_continuation);
+        if self.y + top_spacing >= content_bottom && !self.is_empty() {
             return Ok(BlockPushOutcome::NoFit);
         }
         let mut y = self.y + top_spacing;
@@ -1668,7 +2145,7 @@ impl PageBuilder {
             }
             if fit_count == 0
                 && y + line.line_height + required_bottom > content_bottom
-                && !self.fragments.is_empty()
+                && !self.is_empty()
             {
                 return Ok(BlockPushOutcome::NoFit);
             }
@@ -1683,7 +2160,7 @@ impl PageBuilder {
             fit_count = 1;
         }
         if fit_count < total_remaining {
-            if fit_count == 1 && !self.fragments.is_empty() {
+            if fit_count == 1 && !self.is_empty() {
                 return Ok(BlockPushOutcome::NoFit);
             }
             if total_remaining - fit_count == 1 && fit_count > 1 {
@@ -1693,87 +2170,89 @@ impl PageBuilder {
 
         self.y += top_spacing;
         self.pending_margin_bottom = LayoutUnit::ZERO;
-        let x = block_x(options.constraints, block.style);
-        let mut line_y = self.y;
-        let first_line_indent = block.style.text_indent;
-        for relative_index in 0..fit_count {
-            let line_index = start_line + relative_index;
-            let line = measured.lines[line_index];
-            let is_first_line = line_index == 0;
-            let line_x = x + if is_first_line {
-                first_line_indent
-            } else {
-                LayoutUnit::ZERO
-            };
-            if is_first_line {
-                if let Some(marker) = marker {
-                    let fragment_id = self.alloc_fragment_id();
-                    self.push_fragment(SceneFragment {
-                        id: fragment_id,
-                        kind: SceneFragmentKind::Marker,
-                        node_id: block.node_id,
-                        rect: Rect {
-                            x: (line_x - LayoutUnit::from_px(16))
-                                .max(options.constraints.margin_start),
-                            y: line_y,
-                            width: LayoutUnit::from_px(12),
-                            height: line.line_height,
-                        },
-                        text: Some(Arc::from(marker)),
-                        source_range: block.source_range,
-                        anchor_range: None,
-                        line_index: Some(u32::try_from(line_index).unwrap_or(u32::MAX)),
-                        overflow: false,
-                    });
-                }
+        let paragraph = scene_paragraph(request, measured, &block.style, options.constraints);
+        let block_origin_x = block_x(options.constraints, &block.style);
+        let first_local_line = paragraph.lines[start_line].layout_rect;
+        let paint_origin = Point {
+            x: block_origin_x,
+            y: self.y - first_local_line.y,
+        };
+        if start_line == 0 {
+            if let Some(marker) = marker {
+                let fragment_id = self.alloc_fragment_id();
+                self.push_fragment(SceneFragment {
+                    id: fragment_id,
+                    kind: SceneFragmentKind::Marker,
+                    node_id: block.node_id,
+                    rect: Rect {
+                        x: (paint_origin.x + first_local_line.x - LayoutUnit::from_px(16))
+                            .max(options.constraints.margin_start),
+                        y: self.y,
+                        width: LayoutUnit::from_px(12),
+                        height: first_local_line.height,
+                    },
+                    text: Some(Arc::from(marker)),
+                    source_range: block.source_range,
+                    anchor_range: None,
+                    line_index: Some(0),
+                    overflow: false,
+                });
             }
-            let text_start = line.text_start.max(text_offset);
-            let text_end = line.text_end;
-            let text_slice = slice_text(text, text_start, text_end);
-            let line_available_width = if is_first_line {
-                first_line_available_width(options.constraints, block.style)
-            } else {
-                block_available_width(options.constraints, block.style)
-            };
-            let rect = Rect {
-                x: aligned_x(
-                    line_x,
-                    line_available_width,
-                    line.width,
-                    block.style.alignment,
-                ),
-                y: line_y,
-                width: line.width,
-                height: line.line_height,
-            };
-            let range = TextAnchorRange {
-                start: TextAnchor::new(
-                    chapter.document_id,
-                    block.node_id,
-                    text_start,
-                    TextAffinity::Downstream,
-                ),
-                end: TextAnchor::new(
-                    chapter.document_id,
-                    block.node_id,
-                    text_end,
-                    TextAffinity::Upstream,
-                ),
-            };
-            let fragment_id = self.alloc_fragment_id();
-            self.push_fragment(SceneFragment {
-                id: fragment_id,
-                kind: SceneFragmentKind::TextLine,
-                node_id: block.node_id,
-                rect,
-                text: Some(Arc::from(text_slice)),
-                source_range: block.source_range,
-                anchor_range: Some(range),
-                line_index: Some(u32::try_from(line_index).unwrap_or(u32::MAX)),
-                overflow: line_y + line.line_height > content_bottom,
-            });
-            line_y += line.line_height;
         }
+        let last_line_index = start_line + fit_count - 1;
+        let text_start = measured.lines[start_line].text_start.max(text_offset);
+        let text_end = measured.lines[last_line_index].text_end;
+        let visible_height = paragraph.lines[last_line_index].layout_rect.y
+            + paragraph.lines[last_line_index].layout_rect.height
+            - first_local_line.y;
+        let layout_rect = Rect {
+            x: block_origin_x,
+            y: self.y,
+            width: block_available_width(options.constraints, &block.style),
+            height: visible_height,
+        };
+        let anchor_range = TextAnchorRange {
+            start: TextAnchor::new(
+                chapter.document_id,
+                block.node_id,
+                text_start,
+                TextAffinity::Downstream,
+            ),
+            end: TextAnchor::new(
+                chapter.document_id,
+                block.node_id,
+                text_end,
+                TextAffinity::Upstream,
+            ),
+        };
+        let paint_id = self.alloc_fragment_id();
+        self.text_paints.push(TextPaintFragment {
+            id: paint_id,
+            node_id: block.node_id,
+            paragraph_id: request.paragraph_id,
+            visible_text_range: text_start..text_end,
+            paint_origin,
+            layout_rect,
+            clip_rect: Rect {
+                x: options.constraints.margin_start,
+                y: options.constraints.margin_top,
+                width: options.constraints.content_width(),
+                height: options.constraints.content_height(),
+            },
+            first_line: u32::try_from(start_line).unwrap_or(u32::MAX),
+            line_count: u32::try_from(fit_count).unwrap_or(u32::MAX),
+            source_range: block.source_range,
+            anchor_range,
+            overflow: self.y + visible_height > content_bottom,
+        });
+        if !self
+            .paragraphs
+            .iter()
+            .any(|existing| existing.paragraph_id == paragraph.paragraph_id)
+        {
+            self.paragraphs.push(paragraph);
+        }
+        let line_y = self.y + visible_height;
 
         if start_line + fit_count >= measured.lines.len() {
             self.y = line_y + block.style.padding_bottom;
@@ -1805,9 +2284,9 @@ impl PageBuilder {
         height: LayoutUnit,
         content_bottom: LayoutUnit,
     ) -> bool {
-        let top_spacing = self.block_start_spacing(block.style, false);
+        let top_spacing = self.block_start_spacing(&block.style, false);
         if self.y + top_spacing + height + block.style.padding_bottom > content_bottom
-            && !self.fragments.is_empty()
+            && !self.is_empty()
         {
             return false;
         }
@@ -1819,9 +2298,9 @@ impl PageBuilder {
             kind,
             node_id: block.node_id,
             rect: Rect {
-                x: block_x(self.constraints, block.style),
+                x: block_x(self.constraints, &block.style),
                 y: self.y,
-                width: block_available_width(self.constraints, block.style),
+                width: block_available_width(self.constraints, &block.style),
                 height,
             },
             text,
@@ -1841,8 +2320,8 @@ impl PageBuilder {
         image: &LayoutImage,
         content_bottom: LayoutUnit,
     ) -> (bool, Option<Diagnostic>) {
-        let top_spacing = self.block_start_spacing(block.style, false);
-        let available_width = block_available_width(self.constraints, block.style);
+        let top_spacing = self.block_start_spacing(&block.style, false);
+        let available_width = block_available_width(self.constraints, &block.style);
         let mut width = image.intrinsic_width.unwrap_or(LayoutUnit::from_px(180));
         let mut height = image.intrinsic_height.unwrap_or(LayoutUnit::from_px(140));
         if width > available_width {
@@ -1851,7 +2330,7 @@ impl PageBuilder {
             height = LayoutUnit::from_raw((height.raw() * ratio_raw) / LayoutUnit::SCALE);
         }
         if self.y + top_spacing + height + block.style.padding_bottom > content_bottom
-            && !self.fragments.is_empty()
+            && !self.is_empty()
         {
             return (false, None);
         }
@@ -1873,7 +2352,7 @@ impl PageBuilder {
             kind: SceneFragmentKind::Image,
             node_id: block.node_id,
             rect: Rect {
-                x: block_x(self.constraints, block.style),
+                x: block_x(self.constraints, &block.style),
                 y: self.y,
                 width,
                 height,
@@ -1889,7 +2368,11 @@ impl PageBuilder {
         (true, diagnostic)
     }
 
-    fn block_start_spacing(&self, style: ComputedLayoutStyle, is_continuation: bool) -> LayoutUnit {
+    fn block_start_spacing(
+        &self,
+        style: &ComputedLayoutStyle,
+        is_continuation: bool,
+    ) -> LayoutUnit {
         if is_continuation {
             LayoutUnit::ZERO
         } else {
@@ -1907,22 +2390,40 @@ impl PageBuilder {
         self.fragments.push(fragment);
     }
 
+    fn is_empty(&self) -> bool {
+        self.fragments.is_empty() && self.text_paints.is_empty()
+    }
+
     fn finish(self) -> PageScene {
         let start_anchor = self
-            .fragments
+            .text_paints
             .iter()
-            .filter_map(|fragment| fragment.anchor_range.map(|range| range.start))
+            .map(|fragment| fragment.anchor_range.start)
+            .chain(
+                self.fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.anchor_range.map(|range| range.start)),
+            )
             .min_by_key(|anchor| (anchor.node_id, anchor.utf8_byte_offset));
         let end_anchor = self
-            .fragments
+            .text_paints
             .iter()
-            .filter_map(|fragment| fragment.anchor_range.map(|range| range.end))
+            .map(|fragment| fragment.anchor_range.end)
+            .chain(
+                self.fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.anchor_range.map(|range| range.end)),
+            )
             .max_by_key(|anchor| (anchor.node_id, anchor.utf8_byte_offset));
         PageScene {
             page_index: self.page_index,
             size: self.size,
             start_anchor,
             end_anchor,
+            text_backend_id: self.text_backend_id,
+            font_fingerprint: self.font_fingerprint,
+            paragraphs: self.paragraphs,
+            text_paints: self.text_paints,
             fragments: self.fragments,
             links: self.links,
             anchors: self.anchors,
@@ -2410,22 +2911,16 @@ fn layout_image(
 fn measure_text(
     text_backend: &dyn TextBackend,
     cancel: &CancellationToken,
-    request_id: u32,
-    paragraph_id: u32,
-    text: &str,
-    style: ComputedLayoutStyle,
-    width: LayoutUnit,
+    request: &MeasureRequest,
+    style: &ComputedLayoutStyle,
 ) -> Result<MeasuredText, PageletError> {
-    let request = measure_request(request_id, paragraph_id, text, style, width);
-    let batch = text_backend.measure_batch(&MeasureBatch::new(vec![request]), cancel)?;
+    let batch = text_backend.measure_batch(&MeasureBatch::new(vec![request.clone()]), cancel)?;
     let mut measured = batch
-        .get(request_id)
+        .get(request.id)
         .cloned()
         .ok_or_else(|| layout_error("text backend did not return requested measurement"))?;
     if measured.lines.is_empty() {
-        measured = synthesize_lines(text, request_id, style, width);
-    } else {
-        apply_resolved_line_height(&mut measured, style.line_height);
+        measured = synthesize_lines(request, style);
     }
     Ok(measured)
 }
@@ -2434,19 +2929,29 @@ fn measure_request(
     request_id: u32,
     paragraph_id: u32,
     text: &str,
-    style: ComputedLayoutStyle,
+    style: &ComputedLayoutStyle,
     width: LayoutUnit,
 ) -> MeasureRequest {
     let mut request = MeasureRequest::new(request_id, text, style.font_size, width);
+    let text_end = u32::try_from(text.len()).unwrap_or(u32::MAX);
     request.paragraph_id = paragraph_id;
-    request.direction = TextDirection::Auto;
+    request.style_runs = vec![TextStyleRun {
+        start: 0,
+        end: text_end,
+        font_size: style.font_size,
+        letter_spacing: style.letter_spacing,
+        fonts: style.font_candidates.clone(),
+    }];
+    request.locale = style.locale.clone();
+    request.direction = style.direction;
+    request.font_candidates = style.font_candidates.clone();
     request.height_behavior = HeightBehavior::IncludeStrut;
     request.strut = line_height_strut(style);
-    request.request_fingerprint = request_fingerprint(text, style, width);
+    request.request_fingerprint = measure_request_fingerprint(&request);
     request
 }
 
-fn line_height_strut(style: ComputedLayoutStyle) -> StrutStyle {
+fn line_height_strut(style: &ComputedLayoutStyle) -> StrutStyle {
     let font_size = style.font_size.max(LayoutUnit::from_px(1));
     let ascent = LayoutUnit::from_raw((font_size.raw() * 4) / 5);
     let descent = font_size - ascent;
@@ -2458,27 +2963,74 @@ fn line_height_strut(style: ComputedLayoutStyle) -> StrutStyle {
     }
 }
 
-fn apply_resolved_line_height(measured: &mut MeasuredText, line_height: LayoutUnit) {
-    let line_height = line_height.max(LayoutUnit::from_px(1));
-    for line in &mut measured.lines {
-        let glyph_height = line.ascent + line.descent;
-        let half_leading = LayoutUnit::from_raw((line_height - glyph_height).raw() / 2);
-        line.baseline = line.ascent + half_leading;
-        line.line_height = line_height;
+fn scene_paragraph(
+    request: &MeasureRequest,
+    measured: &MeasuredText,
+    style: &ComputedLayoutStyle,
+    constraints: LayoutConstraints,
+) -> SceneParagraph {
+    let mut line_y = LayoutUnit::ZERO;
+    let lines = measured
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, metrics)| {
+            let is_first_line = index == 0;
+            let base_x = if is_first_line {
+                style.text_indent
+            } else {
+                LayoutUnit::ZERO
+            };
+            let available_width = if is_first_line {
+                first_line_available_width(constraints, style)
+            } else {
+                block_available_width(constraints, style)
+            };
+            let line_x = aligned_x(base_x, available_width, metrics.width, style.alignment);
+            let layout_rect = Rect {
+                x: line_x,
+                y: line_y,
+                width: metrics.width,
+                height: metrics.line_height,
+            };
+            let ink_bounds = Rect {
+                x: line_x + metrics.ink_bounds.x,
+                y: line_y + metrics.ink_bounds.y,
+                width: metrics.ink_bounds.width,
+                height: metrics.ink_bounds.height,
+            };
+            line_y += metrics.line_height;
+            SceneParagraphLine {
+                metrics: *metrics,
+                layout_rect,
+                ink_bounds,
+            }
+        })
+        .collect();
+    SceneParagraph {
+        paragraph_id: request.paragraph_id,
+        request_fingerprint: request.request_fingerprint,
+        measurement_fingerprint: measured.measurement_fingerprint,
+        text: request.text.clone(),
+        text_range: request.text_range.clone(),
+        style_runs: request.style_runs.clone(),
+        font_size: request.font_size,
+        available_width: request.available_width,
+        max_width: request.max_width,
+        locale: request.locale.clone(),
+        direction: request.direction,
+        text_scale: request.text_scale,
+        font_candidates: request.font_candidates.clone(),
+        strut: request.strut,
+        height_behavior: request.height_behavior,
+        lines,
+        clusters: measured.clusters.clone(),
     }
-    measured.height = LayoutUnit::from_raw(
-        line_height
-            .raw()
-            .saturating_mul(i64::try_from(measured.lines.len()).unwrap_or(i64::MAX)),
-    );
 }
 
-fn synthesize_lines(
-    text: &str,
-    request_id: u32,
-    style: ComputedLayoutStyle,
-    width: LayoutUnit,
-) -> MeasuredText {
+fn synthesize_lines(request: &MeasureRequest, style: &ComputedLayoutStyle) -> MeasuredText {
+    let text = &request.text;
+    let width = request.available_width;
     let line_height = style.line_height.max(LayoutUnit::from_px(1));
     let advance = LayoutUnit::from_raw((style.font_size.raw() / 2).max(1));
     let max_clusters = (width.raw().max(advance.raw()) / advance.raw()).max(1);
@@ -2531,14 +3083,14 @@ fn synthesize_lines(
             .saturating_mul(i64::try_from(lines.len()).unwrap_or(i64::MAX)),
     );
     MeasuredText::new(
-        request_id,
-        request_fingerprint(text, style, width),
+        request.id,
+        request.request_fingerprint,
         width,
         height,
         u32::try_from(text.len()).unwrap_or(u32::MAX),
         lines,
         clusters,
-        request_id as u64,
+        request.id as u64,
     )
 }
 
@@ -2557,6 +3109,12 @@ fn line_metrics(
         descent: LayoutUnit::from_raw(line_height.raw() / 5),
         line_height,
         width,
+        ink_bounds: TextBounds {
+            x: LayoutUnit::ZERO,
+            y: LayoutUnit::ZERO,
+            width,
+            height: line_height,
+        },
         hard_break,
     }
 }
@@ -2592,7 +3150,10 @@ fn should_keep_with_next(
     y + heading_height + next_height > content_bottom
 }
 
-fn block_available_width(constraints: LayoutConstraints, style: ComputedLayoutStyle) -> LayoutUnit {
+fn block_available_width(
+    constraints: LayoutConstraints,
+    style: &ComputedLayoutStyle,
+) -> LayoutUnit {
     let width = constraints.content_width()
         - style.block_indent_left
         - style.margin_left
@@ -2609,7 +3170,7 @@ fn block_available_width(constraints: LayoutConstraints, style: ComputedLayoutSt
 
 fn measurement_available_width(
     constraints: LayoutConstraints,
-    style: ComputedLayoutStyle,
+    style: &ComputedLayoutStyle,
 ) -> LayoutUnit {
     let width = block_available_width(constraints, style) - style.text_indent.max(LayoutUnit::ZERO);
     if width.raw() <= 0 {
@@ -2621,12 +3182,12 @@ fn measurement_available_width(
 
 fn first_line_available_width(
     constraints: LayoutConstraints,
-    style: ComputedLayoutStyle,
+    style: &ComputedLayoutStyle,
 ) -> LayoutUnit {
     measurement_available_width(constraints, style)
 }
 
-fn block_x(constraints: LayoutConstraints, style: ComputedLayoutStyle) -> LayoutUnit {
+fn block_x(constraints: LayoutConstraints, style: &ComputedLayoutStyle) -> LayoutUnit {
     constraints.margin_start + style.block_indent_left + style.margin_left + style.padding_left
 }
 
@@ -2647,9 +3208,19 @@ fn aligned_x(
     }
 }
 
-fn link_regions(chapter: &ChapterIr, fragments: &[SceneFragment]) -> Vec<LinkRegion> {
+fn link_regions(
+    chapter: &ChapterIr,
+    text_paints: &[TextPaintFragment],
+    fragments: &[SceneFragment],
+) -> Vec<LinkRegion> {
     let mut regions = Vec::new();
     for link in &chapter.links {
+        for paint in text_paints
+            .iter()
+            .filter(|paint| paint.node_id == link.source_node)
+        {
+            regions.push(link_region(link, paint.layout_rect));
+        }
         for fragment in fragments
             .iter()
             .filter(|fragment| fragment.node_id == link.source_node)
@@ -2671,9 +3242,24 @@ fn link_region(link: &LinkTarget, rect: Rect) -> LinkRegion {
     }
 }
 
-fn anchor_regions(chapter: &ChapterIr, fragments: &[SceneFragment]) -> Vec<AnchorRegion> {
+fn anchor_regions(
+    chapter: &ChapterIr,
+    text_paints: &[TextPaintFragment],
+    fragments: &[SceneFragment],
+) -> Vec<AnchorRegion> {
     let mut regions = Vec::new();
     for anchor in chapter.anchors.anchors.values() {
+        if let Some(paint) = text_paints
+            .iter()
+            .find(|paint| paint.node_id == anchor.node_id)
+        {
+            regions.push(AnchorRegion {
+                rect: paint.layout_rect,
+                key: anchor.key.clone(),
+                node_id: anchor.node_id,
+            });
+            continue;
+        }
         if let Some(fragment) = fragments
             .iter()
             .find(|fragment| fragment.node_id == anchor.node_id)
@@ -2688,40 +3274,97 @@ fn anchor_regions(chapter: &ChapterIr, fragments: &[SceneFragment]) -> Vec<Ancho
     regions
 }
 
-fn selection_maps(fragments: &[SceneFragment]) -> Vec<SelectionMap> {
-    fragments
-        .iter()
-        .filter_map(|fragment| {
-            let range = fragment.anchor_range?;
-            Some(SelectionMap {
-                node_id: fragment.node_id,
-                start: range.start.utf8_byte_offset,
-                end: range.end.utf8_byte_offset,
-                rects: vec![fragment.rect],
-            })
+fn selection_maps(
+    text_paints: &[TextPaintFragment],
+    paragraphs: &[SceneParagraph],
+    fragments: &[SceneFragment],
+) -> Vec<SelectionMap> {
+    let mut maps = Vec::new();
+    for paint in text_paints {
+        let Some(paragraph) = paragraphs
+            .iter()
+            .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+        else {
+            continue;
+        };
+        let first = usize::try_from(paint.first_line).unwrap_or(usize::MAX);
+        let end = first
+            .saturating_add(usize::try_from(paint.line_count).unwrap_or(usize::MAX))
+            .min(paragraph.lines.len());
+        let rects = paragraph
+            .lines
+            .get(first..end)
+            .map_or_else(Vec::new, |lines| {
+                lines
+                    .iter()
+                    .map(|line| translate_rect(line.layout_rect, paint.paint_origin))
+                    .collect()
+            });
+        maps.push(SelectionMap {
+            node_id: paint.node_id,
+            start: paint.visible_text_range.start,
+            end: paint.visible_text_range.end,
+            rects,
+        });
+    }
+    maps.extend(fragments.iter().filter_map(|fragment| {
+        let range = fragment.anchor_range?;
+        Some(SelectionMap {
+            node_id: fragment.node_id,
+            start: range.start.utf8_byte_offset,
+            end: range.end.utf8_byte_offset,
+            rects: vec![fragment.rect],
         })
-        .collect()
+    }));
+    maps
 }
 
-fn semantic_nodes(fragments: &[SceneFragment]) -> Vec<SemanticNode> {
-    fragments
+fn semantic_nodes(
+    text_paints: &[TextPaintFragment],
+    paragraphs: &[SceneParagraph],
+    fragments: &[SceneFragment],
+) -> Vec<SemanticNode> {
+    let mut nodes = text_paints
         .iter()
-        .map(|fragment| SemanticNode {
-            node_id: fragment.node_id,
-            rect: fragment.rect,
-            role: Arc::from(match fragment.kind {
-                SceneFragmentKind::TextLine => "text",
-                SceneFragmentKind::Marker => "marker",
-                SceneFragmentKind::Image => "image",
-                SceneFragmentKind::Divider => "separator",
-                SceneFragmentKind::UnsupportedPlaceholder => "note",
-                SceneFragmentKind::BackgroundBorder | SceneFragmentKind::DebugOverlay => {
-                    "presentation"
-                }
-            }),
-            label: fragment.text.clone().unwrap_or_else(|| Arc::from("")),
+        .filter_map(|paint| {
+            let paragraph = paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)?;
+            Some(SemanticNode {
+                node_id: paint.node_id,
+                rect: paint.layout_rect,
+                role: Arc::from("text"),
+                label: Arc::from(slice_text(
+                    &paragraph.text,
+                    paint.visible_text_range.start,
+                    paint.visible_text_range.end,
+                )),
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    nodes.extend(fragments.iter().map(|fragment| SemanticNode {
+        node_id: fragment.node_id,
+        rect: fragment.rect,
+        role: Arc::from(match fragment.kind {
+            SceneFragmentKind::TextLine => "text",
+            SceneFragmentKind::Marker => "marker",
+            SceneFragmentKind::Image => "image",
+            SceneFragmentKind::Divider => "separator",
+            SceneFragmentKind::UnsupportedPlaceholder => "note",
+            SceneFragmentKind::BackgroundBorder | SceneFragmentKind::DebugOverlay => "presentation",
+        }),
+        label: fragment.text.clone().unwrap_or_else(|| Arc::from("")),
+    }));
+    nodes
+}
+
+fn translate_rect(rect: Rect, origin: Point) -> Rect {
+    Rect {
+        x: rect.x + origin.x,
+        y: rect.y + origin.y,
+        width: rect.width,
+        height: rect.height,
+    }
 }
 
 fn fingerprint_page(
@@ -2756,6 +3399,31 @@ fn fingerprint_page(
             ));
         }
     }
+    for paragraph in &page.paragraphs {
+        input.push_str(&format!(
+            "|paragraph:{}:{}:{}",
+            paragraph.paragraph_id,
+            paragraph.request_fingerprint,
+            paragraph.measurement_fingerprint
+        ));
+    }
+    for paint in &page.text_paints {
+        input.push_str(&format!(
+            "|paint:{}:{}:{}-{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            paint.id,
+            paint.paragraph_id,
+            paint.visible_text_range.start,
+            paint.visible_text_range.end,
+            paint.paint_origin.x.raw(),
+            paint.paint_origin.y.raw(),
+            paint.clip_rect.x.raw(),
+            paint.clip_rect.y.raw(),
+            paint.clip_rect.width.raw(),
+            paint.clip_rect.height.raw(),
+            paint.first_line,
+            paint.line_count,
+        ));
+    }
     PageFingerprint(ContentHash::from_bytes(input.as_bytes()))
 }
 
@@ -2775,17 +3443,94 @@ fn config_fingerprint(constraints: LayoutConstraints) -> u64 {
     hash
 }
 
-fn request_fingerprint(text: &str, style: ComputedLayoutStyle, width: LayoutUnit) -> u64 {
+fn measure_request_fingerprint(request: &MeasureRequest) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for value in [width.raw(), style.font_size.raw(), style.line_height.raw()] {
-        hash ^= value as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let direction = match request.direction {
+        TextDirection::Auto => 0,
+        TextDirection::Ltr => 1,
+        TextDirection::Rtl => 2,
+    };
+    let height_behavior = match request.height_behavior {
+        HeightBehavior::Natural => 0,
+        HeightBehavior::IncludeStrut => 1,
+        HeightBehavior::Tight => 2,
+    };
+    for value in [
+        i64::from(request.paragraph_id),
+        i64::from(request.text_range.start),
+        i64::from(request.text_range.end),
+        request.font_size.raw(),
+        request.max_width.raw(),
+        request.available_width.raw(),
+        request.text_scale.raw(),
+        request.strut.ascent.raw(),
+        request.strut.descent.raw(),
+        request.strut.leading.raw(),
+        direction,
+        height_behavior,
+    ] {
+        fingerprint_u64(&mut hash, value as u64);
     }
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    fingerprint_bytes(&mut hash, request.text.as_bytes());
+    fingerprint_bytes(&mut hash, request.locale.as_bytes());
+    fingerprint_font_chain(&mut hash, &request.font_candidates);
+    fingerprint_u64(
+        &mut hash,
+        u64::try_from(request.style_runs.len()).unwrap_or(u64::MAX),
+    );
+    for run in &request.style_runs {
+        fingerprint_u64(&mut hash, u64::from(run.start));
+        fingerprint_u64(&mut hash, u64::from(run.end));
+        fingerprint_u64(&mut hash, run.font_size.raw() as u64);
+        fingerprint_u64(&mut hash, run.letter_spacing.raw() as u64);
+        fingerprint_font_chain(&mut hash, &run.fonts);
     }
     hash
+}
+
+fn fingerprint_font_chain(hash: &mut u64, chain: &FontFallbackChain) {
+    fingerprint_font_descriptor(hash, &chain.primary);
+    fingerprint_u64(
+        hash,
+        u64::try_from(chain.fallbacks.len()).unwrap_or(u64::MAX),
+    );
+    for descriptor in &chain.fallbacks {
+        fingerprint_font_descriptor(hash, descriptor);
+    }
+}
+
+fn fingerprint_font_descriptor(hash: &mut u64, descriptor: &FontDescriptor) {
+    fingerprint_u64(
+        hash,
+        descriptor.font_id.map_or(0, |id| u64::from(id.get()) + 1),
+    );
+    fingerprint_bytes(hash, descriptor.family.as_bytes());
+    fingerprint_u64(hash, u64::from(descriptor.weight));
+    fingerprint_u64(
+        hash,
+        match descriptor.style {
+            FontStyle::Normal => 0,
+            FontStyle::Italic => 1,
+            FontStyle::Oblique => 2,
+        },
+    );
+    fingerprint_u64(hash, u64::from(descriptor.stretch));
+    fingerprint_u64(hash, descriptor.fingerprint.0);
+}
+
+fn fingerprint_bytes(hash: &mut u64, bytes: &[u8]) {
+    fingerprint_u64(hash, u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn fingerprint_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 fn slice_text(text: &str, start: u32, end: u32) -> &str {
@@ -2821,6 +3566,13 @@ fn layout_error(message: impl Into<Arc<str>>) -> PageletError {
 fn push_page_json(out: &mut String, page: &PageScene, level: usize, trailing: bool) {
     indent(out, level);
     out.push_str("{\n");
+    push_u32(
+        out,
+        level + 1,
+        "scene_wire",
+        EngineVersions::CURRENT.scene_wire,
+        true,
+    );
     push_u32(out, level + 1, "page_index", page.page_index, true);
     push_string(
         out,
@@ -2829,11 +3581,39 @@ fn push_page_json(out: &mut String, page: &PageScene, level: usize, trailing: bo
         &page.fingerprint.to_hex(),
         true,
     );
+    push_string(
+        out,
+        level + 1,
+        "text_backend_id",
+        &format!("{:016x}", page.text_backend_id.0),
+        true,
+    );
+    push_string(
+        out,
+        level + 1,
+        "font_fingerprint",
+        &format!("{:016x}", page.font_fingerprint.0),
+        true,
+    );
     indent(out, level + 1);
     out.push_str("\"size\": {");
     push_inline_i64(out, "width", page.size.width.raw(), true);
     push_inline_i64(out, "height", page.size.height.raw(), false);
     out.push_str("},\n");
+    indent(out, level + 1);
+    out.push_str("\"paragraphs\": [\n");
+    for (index, paragraph) in page.paragraphs.iter().enumerate() {
+        push_paragraph_json(out, paragraph, level + 2, index + 1 < page.paragraphs.len());
+    }
+    indent(out, level + 1);
+    out.push_str("],\n");
+    indent(out, level + 1);
+    out.push_str("\"text_paints\": [\n");
+    for (index, paint) in page.text_paints.iter().enumerate() {
+        push_text_paint_json(out, paint, level + 2, index + 1 < page.text_paints.len());
+    }
+    indent(out, level + 1);
+    out.push_str("],\n");
     indent(out, level + 1);
     out.push_str("\"fragments\": [\n");
     for (index, fragment) in page.fragments.iter().enumerate() {
@@ -2872,6 +3652,184 @@ fn push_page_json(out: &mut String, page: &PageScene, level: usize, trailing: bo
     indent(out, level + 1);
     out.push_str("]\n");
     indent(out, level);
+    out.push('}');
+    if trailing {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn push_paragraph_json(out: &mut String, paragraph: &SceneParagraph, level: usize, trailing: bool) {
+    indent(out, level);
+    out.push_str("{\n");
+    push_u32(out, level + 1, "paragraph_id", paragraph.paragraph_id, true);
+    push_string(
+        out,
+        level + 1,
+        "request_fingerprint",
+        &format!("{:016x}", paragraph.request_fingerprint),
+        true,
+    );
+    push_string(
+        out,
+        level + 1,
+        "measurement_fingerprint",
+        &format!("{:016x}", paragraph.measurement_fingerprint),
+        true,
+    );
+    push_string(out, level + 1, "text", &paragraph.text, true);
+    indent(out, level + 1);
+    out.push_str("\"text_range\": {");
+    push_inline_u32(out, "start", paragraph.text_range.start, true);
+    push_inline_u32(out, "end", paragraph.text_range.end, false);
+    out.push_str("},\n");
+    indent(out, level + 1);
+    out.push_str("\"style_runs\": [\n");
+    for (index, run) in paragraph.style_runs.iter().enumerate() {
+        indent(out, level + 2);
+        out.push('{');
+        push_inline_u32(out, "start", run.start, true);
+        push_inline_u32(out, "end", run.end, true);
+        push_inline_i64(out, "font_size", run.font_size.raw(), true);
+        push_inline_i64(out, "letter_spacing", run.letter_spacing.raw(), true);
+        push_inline_font_chain(out, "fonts", &run.fonts);
+        out.push('}');
+        if index + 1 < paragraph.style_runs.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, level + 1);
+    out.push_str("],\n");
+    push_i64(out, level + 1, "font_size", paragraph.font_size.raw(), true);
+    push_i64(
+        out,
+        level + 1,
+        "available_width",
+        paragraph.available_width.raw(),
+        true,
+    );
+    push_i64(out, level + 1, "max_width", paragraph.max_width.raw(), true);
+    push_string(out, level + 1, "locale", &paragraph.locale, true);
+    push_string(
+        out,
+        level + 1,
+        "direction",
+        text_direction_name(paragraph.direction),
+        true,
+    );
+    push_i64(
+        out,
+        level + 1,
+        "text_scale",
+        paragraph.text_scale.raw(),
+        true,
+    );
+    indent(out, level + 1);
+    push_inline_font_chain(out, "font_candidates", &paragraph.font_candidates);
+    out.push_str(",\n");
+    indent(out, level + 1);
+    out.push_str("\"strut\": {");
+    push_inline_i64(out, "ascent", paragraph.strut.ascent.raw(), true);
+    push_inline_i64(out, "descent", paragraph.strut.descent.raw(), true);
+    push_inline_i64(out, "leading", paragraph.strut.leading.raw(), false);
+    out.push_str("},\n");
+    push_string(
+        out,
+        level + 1,
+        "height_behavior",
+        match paragraph.height_behavior {
+            HeightBehavior::Natural => "natural",
+            HeightBehavior::IncludeStrut => "include-strut",
+            HeightBehavior::Tight => "tight",
+        },
+        true,
+    );
+    indent(out, level + 1);
+    out.push_str("\"lines\": [\n");
+    for (index, line) in paragraph.lines.iter().enumerate() {
+        indent(out, level + 2);
+        out.push('{');
+        push_inline_u32(out, "text_start", line.metrics.text_start, true);
+        push_inline_u32(out, "text_end", line.metrics.text_end, true);
+        push_inline_i64(out, "baseline", line.metrics.baseline.raw(), true);
+        push_inline_i64(out, "ascent", line.metrics.ascent.raw(), true);
+        push_inline_i64(out, "descent", line.metrics.descent.raw(), true);
+        push_inline_i64(out, "line_height", line.metrics.line_height.raw(), true);
+        push_inline_i64(out, "width", line.metrics.width.raw(), true);
+        push_inline_text_bounds(out, "host_ink_bounds", line.metrics.ink_bounds, true);
+        push_inline_rect_with_trailing(out, "layout_rect", line.layout_rect, true);
+        push_inline_rect_with_trailing(out, "ink_bounds", line.ink_bounds, true);
+        out.push_str("\"hard_break\": ");
+        out.push_str(if line.metrics.hard_break {
+            "true"
+        } else {
+            "false"
+        });
+        out.push('}');
+        if index + 1 < paragraph.lines.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, level + 1);
+    out.push_str("],\n");
+    indent(out, level + 1);
+    out.push_str("\"clusters\": [\n");
+    for (index, cluster) in paragraph.clusters.iter().enumerate() {
+        indent(out, level + 2);
+        out.push('{');
+        push_inline_u32(out, "text_start", cluster.text_start, true);
+        push_inline_u32(out, "text_end", cluster.text_end, true);
+        push_inline_u32(out, "line_index", cluster.line_index, true);
+        push_inline_i64(out, "x_start", cluster.x_start.raw(), true);
+        push_inline_i64(out, "x_end", cluster.x_end.raw(), false);
+        out.push('}');
+        if index + 1 < paragraph.clusters.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    indent(out, level + 1);
+    out.push_str("]\n");
+    indent(out, level);
+    out.push('}');
+    if trailing {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
+fn push_text_paint_json(out: &mut String, paint: &TextPaintFragment, level: usize, trailing: bool) {
+    indent(out, level);
+    out.push('{');
+    push_inline_u32(out, "id", paint.id, true);
+    push_inline_u32(out, "node_id", paint.node_id.get(), true);
+    push_inline_u32(out, "paragraph_id", paint.paragraph_id, true);
+    out.push_str("\"visible_text_range\": {");
+    push_inline_u32(out, "start", paint.visible_text_range.start, true);
+    push_inline_u32(out, "end", paint.visible_text_range.end, false);
+    out.push_str("}, ");
+    out.push_str("\"paint_origin\": {");
+    push_inline_i64(out, "x", paint.paint_origin.x.raw(), true);
+    push_inline_i64(out, "y", paint.paint_origin.y.raw(), false);
+    out.push_str("}, ");
+    push_inline_rect_with_trailing(out, "layout_rect", paint.layout_rect, true);
+    push_inline_rect_with_trailing(out, "clip_rect", paint.clip_rect, true);
+    push_inline_u32(out, "first_line", paint.first_line, true);
+    push_inline_u32(out, "line_count", paint.line_count, true);
+    if let Some(source_range) = paint.source_range {
+        out.push_str("\"source_range\": {");
+        push_inline_u32(out, "start", source_range.start, true);
+        push_inline_u32(out, "end", source_range.end, false);
+        out.push_str("}, ");
+    }
+    out.push_str("\"anchor_range\": {");
+    push_inline_text_anchor(out, "start", paint.anchor_range.start, true);
+    push_inline_text_anchor(out, "end", paint.anchor_range.end, false);
+    out.push_str("}, ");
+    out.push_str("\"overflow\": ");
+    out.push_str(if paint.overflow { "true" } else { "false" });
     out.push('}');
     if trailing {
         out.push(',');
@@ -2940,6 +3898,18 @@ fn push_u32(out: &mut String, level: usize, name: &str, value: u32, trailing: bo
     out.push('\n');
 }
 
+fn push_i64(out: &mut String, level: usize, name: &str, value: i64, trailing: bool) {
+    indent(out, level);
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": ");
+    out.push_str(&value.to_string());
+    if trailing {
+        out.push(',');
+    }
+    out.push('\n');
+}
+
 fn push_inline_string(out: &mut String, name: &str, value: &str, trailing: bool) {
     out.push('"');
     out.push_str(name);
@@ -2980,6 +3950,104 @@ fn push_inline_rect(out: &mut String, name: &str, rect: Rect) {
     push_inline_i64(out, "width", rect.width.raw(), true);
     push_inline_i64(out, "height", rect.height.raw(), false);
     out.push('}');
+}
+
+fn push_inline_rect_with_trailing(out: &mut String, name: &str, rect: Rect, trailing: bool) {
+    push_inline_rect(out, name, rect);
+    if trailing {
+        out.push_str(", ");
+    }
+}
+
+fn push_inline_text_bounds(out: &mut String, name: &str, bounds: TextBounds, trailing: bool) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": {");
+    push_inline_i64(out, "x", bounds.x.raw(), true);
+    push_inline_i64(out, "y", bounds.y.raw(), true);
+    push_inline_i64(out, "width", bounds.width.raw(), true);
+    push_inline_i64(out, "height", bounds.height.raw(), false);
+    out.push('}');
+    if trailing {
+        out.push_str(", ");
+    }
+}
+
+fn push_inline_text_anchor(out: &mut String, name: &str, anchor: TextAnchor, trailing: bool) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": {");
+    push_inline_u32(out, "document_id", anchor.document_id.get(), true);
+    push_inline_u32(out, "node_id", anchor.node_id.get(), true);
+    push_inline_u32(out, "utf8_byte_offset", anchor.utf8_byte_offset, true);
+    push_inline_string(
+        out,
+        "affinity",
+        match anchor.affinity {
+            TextAffinity::Upstream => "upstream",
+            TextAffinity::Downstream => "downstream",
+        },
+        false,
+    );
+    out.push('}');
+    if trailing {
+        out.push_str(", ");
+    }
+}
+
+fn push_inline_font_chain(out: &mut String, name: &str, chain: &FontFallbackChain) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\": {");
+    out.push_str("\"primary\": ");
+    push_inline_font_descriptor(out, &chain.primary);
+    out.push_str(", \"fallbacks\": [");
+    for (index, descriptor) in chain.fallbacks.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        push_inline_font_descriptor(out, descriptor);
+    }
+    out.push_str("]}");
+}
+
+fn push_inline_font_descriptor(out: &mut String, descriptor: &FontDescriptor) {
+    out.push('{');
+    out.push_str("\"font_id\": ");
+    if let Some(font_id) = descriptor.font_id {
+        out.push_str(&font_id.get().to_string());
+    } else {
+        out.push_str("null");
+    }
+    out.push_str(", ");
+    push_inline_string(out, "family", &descriptor.family, true);
+    push_inline_u32(out, "weight", u32::from(descriptor.weight), true);
+    push_inline_string(
+        out,
+        "style",
+        match descriptor.style {
+            FontStyle::Normal => "normal",
+            FontStyle::Italic => "italic",
+            FontStyle::Oblique => "oblique",
+        },
+        true,
+    );
+    push_inline_u32(out, "stretch", u32::from(descriptor.stretch), true);
+    push_inline_string(
+        out,
+        "fingerprint",
+        &format!("{:016x}", descriptor.fingerprint.0),
+        false,
+    );
+    out.push('}');
+}
+
+const fn text_direction_name(direction: TextDirection) -> &'static str {
+    match direction {
+        TextDirection::Auto => "auto",
+        TextDirection::Ltr => "ltr",
+        TextDirection::Rtl => "rtl",
+    }
 }
 
 fn indent(out: &mut String, level: usize) {
@@ -3027,6 +4095,37 @@ pub fn page_debug_svg(page: &PageScene) -> String {
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.2} {height:.2}" width="{width:.2}" height="{height:.2}">"#
     ));
     out.push_str(r#"<rect x="0" y="0" width="100%" height="100%" fill="white"/>"#);
+    for paint in &page.text_paints {
+        out.push_str(&format!(
+            r##"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="#1d4ed8" stroke-width="1"/>"##,
+            paint.layout_rect.x.to_f64_px(),
+            paint.layout_rect.y.to_f64_px(),
+            paint.layout_rect.width.to_f64_px(),
+            paint.layout_rect.height.to_f64_px(),
+        ));
+        if let Some(paragraph) = page
+            .paragraphs
+            .iter()
+            .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+        {
+            let first = usize::try_from(paint.first_line).unwrap_or(usize::MAX);
+            let end = first
+                .saturating_add(usize::try_from(paint.line_count).unwrap_or(usize::MAX))
+                .min(paragraph.lines.len());
+            if let Some(lines) = paragraph.lines.get(first..end) {
+                for line in lines {
+                    let ink = translate_rect(line.ink_bounds, paint.paint_origin);
+                    out.push_str(&format!(
+                        r##"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="#dc2626" stroke-width="0.5"/>"##,
+                        ink.x.to_f64_px(),
+                        ink.y.to_f64_px(),
+                        ink.width.to_f64_px(),
+                        ink.height.to_f64_px(),
+                    ));
+                }
+            }
+        }
+    }
     for fragment in &page.fragments {
         let color = match fragment.kind {
             SceneFragmentKind::TextLine => "#1d4ed8",
@@ -3084,6 +4183,25 @@ mod tests {
         text::{DefaultTextBackend, FontSetFingerprint, MeasuredBatch, TextBackend, TextBackendId},
     };
 
+    fn visible_text_line_rects(page: &PageScene) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for paint in &page.text_paints {
+            let paragraph = page
+                .paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+                .expect("paint paragraph");
+            let first = usize::try_from(paint.first_line).expect("first line");
+            let end = first + usize::try_from(paint.line_count).expect("line count");
+            rects.extend(
+                paragraph.lines[first..end]
+                    .iter()
+                    .map(|line| translate_rect(line.layout_rect, paint.paint_origin)),
+            );
+        }
+        rects
+    }
+
     #[test]
     fn host_measured_layout_prepares_one_batch_and_resumes_with_host_identity() {
         let chapter = chapter_with_paragraph("host metrics must drive the page scene");
@@ -3119,6 +4237,186 @@ mod tests {
             assert_eq!(token.text_backend_id, TextBackendId(0x686f_7374));
             assert_eq!(token.font_fingerprint, FontSetFingerprint(0x666f_6e74));
         }
+    }
+
+    #[test]
+    fn css_font_request_is_replayed_with_host_baseline_and_ink_bounds() {
+        let mut chapter = chapter_with_paragraph("One Two");
+        let style = document::ComputedStyle::new()
+            .with_property("font-family", "'Times New Roman', Georgia, serif")
+            .with_property("font-size", "20px")
+            .with_property("font-weight", "700")
+            .with_property("font-style", "italic")
+            .with_property("font-stretch", "semi-condensed")
+            .with_property("letter-spacing", "2px")
+            .with_property("-pagelet-locale", "en-US")
+            .with_property("direction", "ltr");
+        let style_id = chapter.styles.intern(style).expect("font style");
+        let paragraph_node = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                matches!(node, DocumentNode::Paragraph(_)).then_some(node_id)
+            })
+            .expect("paragraph");
+        if let Some(DocumentNode::Paragraph(block)) = chapter.nodes.get_mut(paragraph_node) {
+            block.style = style_id;
+        }
+
+        let prepared = HostMeasuredLayout::prepare(chapter, LayoutOptions::default());
+        let request = prepared.measure_batch().requests[0].clone();
+        assert_eq!(
+            request.font_candidates.primary.family.as_ref(),
+            "Times New Roman"
+        );
+        assert_eq!(request.font_candidates.primary.weight, 700);
+        assert_eq!(request.font_candidates.primary.style, FontStyle::Italic);
+        assert_eq!(request.font_candidates.primary.stretch, 87);
+        assert_eq!(request.font_candidates.fallbacks.len(), 2);
+        assert_eq!(request.locale.as_ref(), "en-US");
+        assert_eq!(request.direction, TextDirection::Ltr);
+        assert_eq!(request.style_runs.len(), 1);
+        assert_eq!(request.style_runs[0].letter_spacing, LayoutUnit::from_px(2));
+
+        let mut measured = DefaultTextBackend::new()
+            .measure_batch(prepared.measure_batch(), &CancellationToken::new())
+            .expect("measure Times paragraph");
+        let host_baseline = LayoutUnit::from_raw(1_337);
+        let host_ink_width = measured.results[0].lines[0].width + LayoutUnit::from_px(6);
+        measured.results[0].lines[0].baseline = host_baseline;
+        measured.results[0].lines[0].ink_bounds.x = LayoutUnit::from_px(-2);
+        measured.results[0].lines[0].ink_bounds.width = host_ink_width;
+        measured.results[0].measurement_fingerprint = 0xfeed_face;
+        let pages = prepared
+            .resume(MeasuredBatch::new(
+                TextBackendId(0x6361_6e76_6173),
+                FontSetFingerprint(0x7469_6d65_7301),
+                measured.results,
+            ))
+            .expect("resume host paragraph");
+        let page = &pages.pages[0];
+        let paragraph = &page.paragraphs[0];
+        let paint = &page.text_paints[0];
+
+        assert_eq!(page.text_backend_id, TextBackendId(0x6361_6e76_6173));
+        assert_eq!(page.font_fingerprint, FontSetFingerprint(0x7469_6d65_7301));
+        assert_eq!(paragraph.request_fingerprint, request.request_fingerprint);
+        assert_eq!(paragraph.measurement_fingerprint, 0xfeed_face);
+        assert_eq!(paragraph.text, request.text);
+        assert_eq!(paragraph.style_runs, request.style_runs);
+        assert_eq!(paragraph.font_candidates, request.font_candidates);
+        assert_eq!(paragraph.locale, request.locale);
+        assert_eq!(paragraph.direction, request.direction);
+        assert_eq!(paragraph.strut, request.strut);
+        assert_eq!(paragraph.lines[0].metrics.baseline, host_baseline);
+        assert_eq!(paragraph.lines[0].metrics.ink_bounds.width, host_ink_width);
+        assert!(paragraph.lines[0].ink_bounds.width > paragraph.lines[0].layout_rect.width);
+        assert_eq!(
+            paint.clip_rect.width,
+            LayoutOptions::default().constraints.content_width()
+        );
+        assert_ne!(paint.clip_rect.width, paragraph.lines[0].layout_rect.width);
+    }
+
+    #[test]
+    fn paragraph_replay_keeps_one_identity_across_pages() {
+        let text = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let chapter = chapter_with_paragraph(text);
+        let constraints = LayoutConstraints::new(LayoutUnit::from_px(90), LayoutUnit::from_px(72))
+            .with_margin(LayoutUnit::from_px(8));
+        let pages = paginate_chapter_with_options(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutOptions {
+                constraints,
+                max_pages: 32,
+                ..LayoutOptions::default()
+            },
+        )
+        .expect("paginate replay paragraph");
+
+        assert!(pages.pages.len() > 1);
+        let first = &pages.pages[0];
+        let second = &pages.pages[1];
+        let paragraph_id = first.paragraphs[0].paragraph_id;
+        let request_fingerprint = first.paragraphs[0].request_fingerprint;
+        let measurement_fingerprint = first.paragraphs[0].measurement_fingerprint;
+        for page in &pages.pages {
+            assert_eq!(page.paragraphs.len(), 1);
+            assert_eq!(page.paragraphs[0].paragraph_id, paragraph_id);
+            assert_eq!(page.paragraphs[0].request_fingerprint, request_fingerprint);
+            assert_eq!(
+                page.paragraphs[0].measurement_fingerprint,
+                measurement_fingerprint
+            );
+            assert_eq!(page.paragraphs[0].text.as_ref(), text);
+            assert_eq!(page.paragraphs[0].text_range, 0..text.len() as u32);
+        }
+        assert_eq!(first.text_paints[0].first_line, 0);
+        assert!(second.text_paints[0].first_line > 0);
+        assert!(second.text_paints[0].paint_origin.y < second.text_paints[0].layout_rect.y);
+        assert_eq!(
+            second.text_paints[0].clip_rect,
+            Rect {
+                x: constraints.margin_start,
+                y: constraints.margin_top,
+                width: constraints.content_width(),
+                height: constraints.content_height(),
+            }
+        );
+        assert!(first
+            .fragments
+            .iter()
+            .all(|fragment| { fragment.kind != SceneFragmentKind::TextLine }));
+        assert!(second
+            .fragments
+            .iter()
+            .all(|fragment| { fragment.kind != SceneFragmentKind::TextLine }));
+    }
+
+    #[test]
+    fn cached_scene_rejects_every_text_replay_identity_mismatch() {
+        let chapter = chapter_with_paragraph("identity");
+        let pages = paginate_chapter(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("paginate identity");
+        let page = &pages.pages[0];
+        let identity = page.text_replay_identity();
+        page.validate_text_replay_identity(&identity)
+            .expect("matching identity");
+
+        let mut stale = identity.clone();
+        stale.text_backend_id.0 ^= 1;
+        assert!(page.validate_text_replay_identity(&stale).is_err());
+        let mut stale = identity.clone();
+        stale.font_fingerprint.0 ^= 1;
+        assert!(page.validate_text_replay_identity(&stale).is_err());
+        let mut stale = identity.clone();
+        stale.paragraphs[0].request_fingerprint ^= 1;
+        assert!(page.validate_text_replay_identity(&stale).is_err());
+        let mut stale = identity;
+        stale.paragraphs[0].measurement_fingerprint ^= 1;
+        assert!(page.validate_text_replay_identity(&stale).is_err());
+    }
+
+    #[test]
+    fn request_fingerprint_covers_font_bytes_scale_and_strut() {
+        let chapter = chapter_with_paragraph("fingerprint");
+        let mut request =
+            prepare_measure_batch(&chapter, LayoutOptions::default()).requests[0].clone();
+        let original = request.request_fingerprint;
+
+        request.font_candidates.primary.fingerprint.0 ^= 1;
+        assert_ne!(measure_request_fingerprint(&request), original);
+        request.font_candidates.primary.fingerprint.0 ^= 1;
+        request.text_scale += LayoutUnit::from_raw(1);
+        assert_ne!(measure_request_fingerprint(&request), original);
+        request.text_scale -= LayoutUnit::from_raw(1);
+        request.strut.leading += LayoutUnit::from_raw(1);
+        assert_ne!(measure_request_fingerprint(&request), original);
     }
 
     #[test]
@@ -3159,8 +4457,8 @@ mod tests {
         .expect("paginate");
 
         assert_eq!(pages.pages.len(), 2);
-        assert!(!pages.pages[0].fragments.is_empty());
-        assert!(!pages.pages[1].fragments.is_empty());
+        assert!(!pages.pages[0].text_paints.is_empty());
+        assert!(!pages.pages[1].text_paints.is_empty());
     }
 
     #[test]
@@ -3195,13 +4493,9 @@ mod tests {
             .iter()
             .find(|fragment| fragment.kind == SceneFragmentKind::Marker)
             .expect("marker");
-        let text = pages.pages[0]
-            .fragments
-            .iter()
-            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-            .expect("text");
+        let text = visible_text_line_rects(&pages.pages[0])[0];
 
-        assert!(marker.rect.x + marker.rect.width <= text.rect.x);
+        assert!(marker.rect.x + marker.rect.width <= text.x);
     }
 
     #[test]
@@ -3293,12 +4587,12 @@ mod tests {
         let plain_rects = plain_pages
             .pages
             .iter()
-            .flat_map(|page| page.fragments.iter().map(|fragment| fragment.rect))
+            .flat_map(visible_text_line_rects)
             .collect::<Vec<_>>();
         let styled_rects = styled_pages
             .pages
             .iter()
-            .flat_map(|page| page.fragments.iter().map(|fragment| fragment.rect))
+            .flat_map(visible_text_line_rects)
             .collect::<Vec<_>>();
 
         assert_ne!(styled_rects, plain_rects);
@@ -3394,17 +4688,13 @@ mod tests {
                 measured.results,
             ))
             .expect("resume host-measured geometry");
-        let first_line = pages.pages[0]
-            .fragments
-            .iter()
-            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-            .expect("first line");
+        let first_line = visible_text_line_rects(&pages.pages[0])[0];
 
         assert_eq!(
-            first_line.rect.x,
+            first_line.x,
             LayoutUnit::from_px(40) + margin_left + padding_inline + text_indent
         );
-        assert_eq!(first_line.rect.y, LayoutUnit::from_px(160));
+        assert_eq!(first_line.y, LayoutUnit::from_px(160));
     }
 
     #[test]
@@ -3446,14 +4736,10 @@ mod tests {
             LayoutConstraints::new(LayoutUnit::from_px(300), LayoutUnit::from_px(200)),
         )
         .expect("paginate contents entries");
-        let lines = pages.pages[0]
-            .fragments
-            .iter()
-            .filter(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-            .collect::<Vec<_>>();
+        let lines = visible_text_line_rects(&pages.pages[0]);
 
-        assert_eq!(lines[0].rect.y, LayoutUnit::from_px(32));
-        assert_eq!(lines[1].rect.y, LayoutUnit::from_px(78));
+        assert_eq!(lines[0].y, LayoutUnit::from_px(32));
+        assert_eq!(lines[1].y, LayoutUnit::from_px(78));
     }
 
     #[test]
@@ -3496,17 +4782,12 @@ mod tests {
         let first_lines = pages
             .pages
             .iter()
-            .map(|page| {
-                page.fragments
-                    .iter()
-                    .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-                    .expect("page text line")
-            })
+            .map(|page| visible_text_line_rects(page)[0])
             .collect::<Vec<_>>();
 
         assert!(first_lines.len() > 1);
-        assert_eq!(first_lines[0].rect.y, LayoutUnit::from_px(60));
-        assert_eq!(first_lines[1].rect.y, LayoutUnit::ZERO);
+        assert_eq!(first_lines[0].y, LayoutUnit::from_px(60));
+        assert_eq!(first_lines[1].y, LayoutUnit::ZERO);
     }
 
     #[test]
@@ -3533,13 +4814,9 @@ mod tests {
             LayoutConstraints::default(),
         )
         .expect("pagination");
-        let line = pages.pages[0]
-            .fragments
-            .iter()
-            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-            .expect("text line");
+        let line = visible_text_line_rects(&pages.pages[0])[0];
 
-        assert_eq!(line.rect.height, LayoutUnit::from_px(30));
+        assert_eq!(line.height, LayoutUnit::from_px(30));
     }
 
     struct StrutCheckingBackend;
@@ -3602,20 +4879,16 @@ mod tests {
             LayoutConstraints::default(),
         )
         .expect("paginate");
-        let fragment = pages.pages[0]
-            .fragments
-            .iter()
-            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
-            .expect("text");
+        let paint = &pages.pages[0].text_paints[0];
 
         let hit = hit_test(
             &pages.pages[0],
-            fragment.rect.x + LayoutUnit::from_px(4),
-            fragment.rect.y + LayoutUnit::from_px(4),
+            paint.layout_rect.x + LayoutUnit::from_px(4),
+            paint.layout_rect.y + LayoutUnit::from_px(4),
         )
         .expect("hit");
 
-        assert_eq!(hit.node_id, fragment.node_id);
+        assert_eq!(hit.node_id, paint.node_id);
     }
 
     #[test]
@@ -3631,6 +4904,8 @@ mod tests {
 
         assert!(json.contains(r#""pages""#));
         assert!(json.contains(r#""fragments""#));
+        assert!(json.contains(r#""paragraphs""#));
+        assert!(json.contains(r#""text_paints""#));
         assert!(json.contains(r#""fingerprint""#));
     }
 

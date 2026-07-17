@@ -7,16 +7,18 @@ use pagelet::{
     },
     document::LinkKind,
     layout::{
-        AnchorRegion, BreakToken, LinkRegion, PageFingerprint, PageScene, PageSize, Rect,
-        SceneFragment, SceneFragmentKind, SelectionMap, SemanticNode, TextAnchorRange,
+        AnchorRegion, BreakToken, LinkRegion, PageFingerprint, PageScene, PageSize, Point, Rect,
+        SceneFragment, SceneFragmentKind, SceneParagraph, SceneParagraphLine, SelectionMap,
+        SemanticNode, TextAnchorRange, TextPaintFragment,
     },
     text::{
         DefaultTextBackend, FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle,
-        HeightBehavior, MeasureRequest, StrutStyle, TextBackend, TextBackendId, TextDirection,
-        TextStyleRun,
+        HeightBehavior, LineMetrics, MeasureRequest, StrutStyle, TextBackend, TextBackendId,
+        TextBounds, TextCluster, TextDirection, TextStyleRun,
     },
     wire::{
         MeasureBatch, MeasuredBatch, PageBatch, SchemaVersion, WireError, CURRENT_SCHEMA_VERSION,
+        SCHEMA_VERSION_V1,
     },
 };
 
@@ -24,8 +26,8 @@ const HEADER_LEN: usize = 20;
 
 #[test]
 fn schema_version_is_independent_from_crate_semver() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(1));
-    assert_eq!(CURRENT_SCHEMA_VERSION.get(), 1);
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(2));
+    assert_eq!(CURRENT_SCHEMA_VERSION.get(), 2);
     assert_ne!(
         CURRENT_SCHEMA_VERSION.get().to_string(),
         env!("CARGO_PKG_VERSION")
@@ -75,7 +77,69 @@ fn page_batch_round_trip_preserves_every_page_scene_field_and_is_canonical() {
 }
 
 #[test]
-fn empty_page_batch_has_a_fixed_v1_encoding() {
+fn v1_measure_and_measured_batches_decode_with_explicit_defaults() {
+    let mut measure = rich_measure_batch();
+    measure.schema_version = SCHEMA_VERSION_V1;
+    measure.requests[0].style_runs[0].letter_spacing = LayoutUnit::from_px(3);
+    let encoded = measure.encode().expect("encode v1 measure batch");
+    let decoded = MeasureBatch::decode(&encoded).expect("decode v1 measure batch");
+    assert_eq!(decoded.schema_version, SCHEMA_VERSION_V1);
+    assert_eq!(
+        decoded.requests[0].style_runs[0].letter_spacing,
+        LayoutUnit::ZERO
+    );
+    assert_eq!(
+        decoded.encode().expect("re-encode v1 measure batch"),
+        encoded
+    );
+
+    let requested = rich_measure_batch().into_text_batch();
+    let measured = DefaultTextBackend::new()
+        .measure_batch(&requested, &pagelet::core::CancellationToken::new())
+        .expect("measure v1 fixture");
+    let batch = MeasuredBatch {
+        schema_version: SCHEMA_VERSION_V1,
+        backend_id: measured.backend_id,
+        font_fingerprint: measured.font_fingerprint,
+        results: measured.results,
+    };
+    let encoded = batch.encode().expect("encode v1 measured batch");
+    let decoded = MeasuredBatch::decode(&encoded).expect("decode v1 measured batch");
+    let line = decoded.results[0].lines[0];
+    assert_eq!(line.ink_bounds.x, LayoutUnit::ZERO);
+    assert_eq!(line.ink_bounds.y, LayoutUnit::ZERO);
+    assert_eq!(line.ink_bounds.width, line.width);
+    assert_eq!(line.ink_bounds.height, line.line_height);
+    assert_eq!(
+        decoded.encode().expect("re-encode v1 measured batch"),
+        encoded
+    );
+}
+
+#[test]
+fn v1_page_projection_is_explicit_and_canonical() {
+    let batch = PageBatch {
+        schema_version: SCHEMA_VERSION_V1,
+        pages: vec![rich_page_scene()],
+    };
+    let encoded = batch.encode().expect("encode v1 page projection");
+    let decoded = PageBatch::decode(&encoded).expect("decode v1 page projection");
+    let page = &decoded.pages[0];
+
+    assert_eq!(decoded.schema_version, SCHEMA_VERSION_V1);
+    assert_eq!(page.text_backend_id, TextBackendId(0));
+    assert_eq!(page.font_fingerprint, FontSetFingerprint(0));
+    assert!(page.paragraphs.is_empty());
+    assert!(page.text_paints.is_empty());
+    assert!(page
+        .fragments
+        .iter()
+        .any(|fragment| fragment.kind == SceneFragmentKind::TextLine));
+    assert_eq!(decoded.encode().expect("re-encode v1 page batch"), encoded);
+}
+
+#[test]
+fn empty_page_batch_has_a_fixed_v2_encoding() {
     let encoded = PageBatch::new(Vec::new())
         .encode()
         .expect("encode empty page batch");
@@ -84,11 +148,29 @@ fn empty_page_batch_has_a_fixed_v1_encoding() {
         encoded,
         [
             0x50, 0x47, 0x4c, 0x54, 0x53, 0x43, 0x4e, 0x00, // magic
-            0x01, 0x00, // schema v1
+            0x02, 0x00, // schema v2
             0x01, 0x00, // PageBatch
             0x04, 0x00, 0x00, 0x00, // payload length
             0x1c, 0xdf, 0x44, 0x21, // CRC-32 of four zero bytes
             0x00, 0x00, 0x00, 0x00, // zero pages
+        ]
+    );
+}
+
+#[test]
+fn empty_page_batch_preserves_the_frozen_v1_encoding() {
+    let encoded = PageBatch {
+        schema_version: SCHEMA_VERSION_V1,
+        pages: Vec::new(),
+    }
+    .encode()
+    .expect("encode empty v1 page batch");
+
+    assert_eq!(
+        encoded,
+        [
+            0x50, 0x47, 0x4c, 0x54, 0x53, 0x43, 0x4e, 0x00, 0x01, 0x00, 0x01, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x1c, 0xdf, 0x44, 0x21, 0x00, 0x00, 0x00, 0x00,
         ]
     );
 }
@@ -129,12 +211,12 @@ fn decoder_rejects_unknown_schema_version_and_payload_kind() {
     let mut pages = PageBatch::new(Vec::new())
         .encode()
         .expect("encode empty page batch");
-    pages[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    pages[8..10].copy_from_slice(&3_u16.to_le_bytes());
     assert_eq!(
         PageBatch::decode(&pages),
         Err(WireError::UnsupportedVersion {
-            expected: 1,
-            actual: 2,
+            expected: 2,
+            actual: 3,
         })
     );
 
@@ -369,6 +451,87 @@ fn rich_page_scene() -> PageScene {
                 .then_some(SourceRange::new(0, u32::MAX).expect("diagnostic source range")),
         })
         .collect();
+    let paragraph_text: Arc<str> = Arc::from("完整字段🙂");
+    let paragraph_end = u32::try_from(paragraph_text.len()).expect("paragraph text length");
+    let mut paragraph_run = TextStyleRun::new(
+        0,
+        paragraph_end,
+        LayoutUnit::from_px(17),
+        FontFallbackChain::default(),
+    );
+    paragraph_run.letter_spacing = LayoutUnit::from_raw(7);
+    let paragraph_anchor_range = TextAnchorRange {
+        start: TextAnchor::new(
+            DocumentId::new(3),
+            NodeId::new(7),
+            0,
+            TextAffinity::Downstream,
+        ),
+        end: TextAnchor::new(
+            DocumentId::new(3),
+            NodeId::new(7),
+            paragraph_end,
+            TextAffinity::Upstream,
+        ),
+    };
+    let paragraph = SceneParagraph {
+        paragraph_id: 77,
+        request_fingerprint: 0x0102_0304_0506_0708,
+        measurement_fingerprint: 0x1112_1314_1516_1718,
+        text: paragraph_text,
+        text_range: 0..paragraph_end,
+        style_runs: vec![paragraph_run],
+        font_size: LayoutUnit::from_px(17),
+        available_width: LayoutUnit::from_px(300),
+        max_width: LayoutUnit::from_px(300),
+        locale: Arc::from("zh-Hans"),
+        direction: TextDirection::Ltr,
+        text_scale: LayoutUnit::from_raw(64),
+        font_candidates: FontFallbackChain::default(),
+        strut: StrutStyle {
+            ascent: LayoutUnit::from_px(14),
+            descent: LayoutUnit::from_px(4),
+            leading: LayoutUnit::from_px(2),
+        },
+        height_behavior: HeightBehavior::IncludeStrut,
+        lines: vec![SceneParagraphLine {
+            metrics: LineMetrics {
+                text_start: 0,
+                text_end: paragraph_end,
+                baseline: LayoutUnit::from_raw(999),
+                ascent: LayoutUnit::from_px(14),
+                descent: LayoutUnit::from_px(4),
+                line_height: LayoutUnit::from_px(20),
+                width: LayoutUnit::from_px(300),
+                ink_bounds: TextBounds {
+                    x: LayoutUnit::from_raw(-2),
+                    y: LayoutUnit::from_raw(-3),
+                    width: LayoutUnit::from_px(310),
+                    height: LayoutUnit::from_px(21),
+                },
+                hard_break: false,
+            },
+            layout_rect: Rect {
+                x: LayoutUnit::ZERO,
+                y: LayoutUnit::ZERO,
+                width: LayoutUnit::from_px(300),
+                height: LayoutUnit::from_px(20),
+            },
+            ink_bounds: Rect {
+                x: LayoutUnit::from_raw(-2),
+                y: LayoutUnit::from_raw(-3),
+                width: LayoutUnit::from_px(310),
+                height: LayoutUnit::from_px(21),
+            },
+        }],
+        clusters: vec![TextCluster {
+            text_start: 0,
+            text_end: paragraph_end,
+            line_index: 0,
+            x_start: LayoutUnit::ZERO,
+            x_end: LayoutUnit::from_px(300),
+        }],
+    };
 
     PageScene {
         page_index: u32::MAX,
@@ -378,6 +541,36 @@ fn rich_page_scene() -> PageScene {
         },
         start_anchor: Some(start_anchor),
         end_anchor: Some(end_anchor),
+        text_backend_id: TextBackendId(0x2021_2223_2425_2627),
+        font_fingerprint: FontSetFingerprint(0x3031_3233_3435_3637),
+        paragraphs: vec![paragraph],
+        text_paints: vec![TextPaintFragment {
+            id: 88,
+            node_id: NodeId::new(7),
+            paragraph_id: 77,
+            visible_text_range: 0..paragraph_end,
+            paint_origin: Point {
+                x: LayoutUnit::from_px(10),
+                y: LayoutUnit::from_px(20),
+            },
+            layout_rect: Rect {
+                x: LayoutUnit::from_px(10),
+                y: LayoutUnit::from_px(20),
+                width: LayoutUnit::from_px(300),
+                height: LayoutUnit::from_px(20),
+            },
+            clip_rect: Rect {
+                x: LayoutUnit::ZERO,
+                y: LayoutUnit::ZERO,
+                width: LayoutUnit::from_px(320),
+                height: LayoutUnit::from_px(480),
+            },
+            first_line: 0,
+            line_count: 1,
+            source_range: Some(SourceRange::new(10, 30).expect("paint source range")),
+            anchor_range: paragraph_anchor_range,
+            overflow: false,
+        }],
         fragments,
         links,
         anchors: vec![AnchorRegion {
@@ -420,7 +613,10 @@ fn rich_page_scene() -> PageScene {
 
 fn assert_envelope(bytes: &[u8], payload_kind: u16) {
     assert_eq!(&bytes[..8], b"PGLTSCN\0");
-    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 1);
+    assert_eq!(
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        CURRENT_SCHEMA_VERSION.get()
+    );
     assert_eq!(
         u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
         payload_kind

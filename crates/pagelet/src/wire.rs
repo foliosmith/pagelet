@@ -3,7 +3,7 @@
 //! Wire schema versions are intentionally independent from the pagelet crate's
 //! semantic version. All multi-byte integers use little-endian byte order.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use crate::{
     core::{
@@ -12,14 +12,15 @@ use crate::{
     },
     document::LinkKind,
     layout::{
-        AnchorRegion, BreakToken, LinkRegion, PageFingerprint, PageScene, PageSize, Rect,
-        SceneFragment, SceneFragmentKind, SelectionMap, SemanticNode, TextAnchorRange,
+        AnchorRegion, BreakToken, LinkRegion, PageFingerprint, PageScene, PageSize, Point, Rect,
+        SceneFragment, SceneFragmentKind, SceneParagraph, SceneParagraphLine, SelectionMap,
+        SemanticNode, TextAnchorRange, TextPaintFragment,
     },
     text::{
         FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
         LineMetrics, MeasureBatch as TextMeasureBatch, MeasureRequest,
-        MeasuredBatch as TextMeasuredBatch, MeasuredText, StrutStyle, TextBackendId, TextCluster,
-        TextDirection, TextStyleRun,
+        MeasuredBatch as TextMeasuredBatch, MeasuredText, StrutStyle, TextBackendId, TextBounds,
+        TextCluster, TextDirection, TextStyleRun,
     },
 };
 
@@ -33,7 +34,10 @@ const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// This value is advanced only when the binary schema changes and is not
 /// derived from `CARGO_PKG_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+
+/// Frozen legacy `pageletScene` schema version.
+pub const SCHEMA_VERSION_V1: SchemaVersion = SchemaVersion::new(1);
 
 /// Version of the cross-language binary schema.
 #[repr(transparent)]
@@ -75,11 +79,15 @@ impl PageBatch {
 
     /// Encode the batch as a canonical little-endian `pageletScene` payload.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        require_current_version(self.schema_version)?;
+        require_supported_version(self.schema_version)?;
         let mut writer = Writer::default();
         writer.write_collection_len("pages", self.pages.len())?;
         for page in &self.pages {
-            write_page_scene(&mut writer, page)?;
+            match self.schema_version {
+                SCHEMA_VERSION_V1 => write_page_scene_v1(&mut writer, page)?,
+                CURRENT_SCHEMA_VERSION => write_page_scene_v2(&mut writer, page)?,
+                _ => unreachable!("schema version was validated"),
+            }
         }
         encode_envelope(PayloadKind::Page, self.schema_version, writer.finish())
     }
@@ -91,7 +99,11 @@ impl PageBatch {
         let page_count = reader.read_collection_len("pages")?;
         let mut pages = Vec::new();
         for _ in 0..page_count {
-            pages.push(read_page_scene(&mut reader)?);
+            pages.push(match schema_version {
+                SCHEMA_VERSION_V1 => read_page_scene_v1(&mut reader)?,
+                CURRENT_SCHEMA_VERSION => read_page_scene_v2(&mut reader)?,
+                _ => unreachable!("schema version was validated"),
+            });
         }
         reader.finish()?;
         Ok(Self {
@@ -122,11 +134,15 @@ impl MeasureBatch {
 
     /// Encode the batch as a canonical little-endian payload.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        require_current_version(self.schema_version)?;
+        require_supported_version(self.schema_version)?;
         let mut writer = Writer::default();
         writer.write_collection_len("measure requests", self.requests.len())?;
         for request in &self.requests {
-            write_measure_request(&mut writer, request)?;
+            match self.schema_version {
+                SCHEMA_VERSION_V1 => write_measure_request_v1(&mut writer, request)?,
+                CURRENT_SCHEMA_VERSION => write_measure_request_v2(&mut writer, request)?,
+                _ => unreachable!("schema version was validated"),
+            }
         }
         encode_envelope(PayloadKind::Measure, self.schema_version, writer.finish())
     }
@@ -138,7 +154,11 @@ impl MeasureBatch {
         let request_count = reader.read_collection_len("measure requests")?;
         let mut requests = Vec::new();
         for _ in 0..request_count {
-            requests.push(read_measure_request(&mut reader)?);
+            requests.push(match schema_version {
+                SCHEMA_VERSION_V1 => read_measure_request_v1(&mut reader)?,
+                CURRENT_SCHEMA_VERSION => read_measure_request_v2(&mut reader)?,
+                _ => unreachable!("schema version was validated"),
+            });
         }
         reader.finish()?;
         Ok(Self {
@@ -191,13 +211,17 @@ impl MeasuredBatch {
 
     /// Encode the batch as a canonical little-endian payload.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        require_current_version(self.schema_version)?;
+        require_supported_version(self.schema_version)?;
         let mut writer = Writer::default();
         writer.write_u64(self.backend_id.0);
         writer.write_u64(self.font_fingerprint.0);
         writer.write_collection_len("measured results", self.results.len())?;
         for result in &self.results {
-            write_measured_text(&mut writer, result)?;
+            match self.schema_version {
+                SCHEMA_VERSION_V1 => write_measured_text_v1(&mut writer, result)?,
+                CURRENT_SCHEMA_VERSION => write_measured_text_v2(&mut writer, result)?,
+                _ => unreachable!("schema version was validated"),
+            }
         }
         encode_envelope(PayloadKind::Measured, self.schema_version, writer.finish())
     }
@@ -211,7 +235,11 @@ impl MeasuredBatch {
         let result_count = reader.read_collection_len("measured results")?;
         let mut results = Vec::new();
         for _ in 0..result_count {
-            results.push(read_measured_text(&mut reader)?);
+            results.push(match schema_version {
+                SCHEMA_VERSION_V1 => read_measured_text_v1(&mut reader)?,
+                CURRENT_SCHEMA_VERSION => read_measured_text_v2(&mut reader)?,
+                _ => unreachable!("schema version was validated"),
+            });
         }
         reader.finish()?;
         Ok(Self {
@@ -373,8 +401,8 @@ impl PayloadKind {
     }
 }
 
-fn require_current_version(version: SchemaVersion) -> Result<(), WireError> {
-    if version == CURRENT_SCHEMA_VERSION {
+fn require_supported_version(version: SchemaVersion) -> Result<(), WireError> {
+    if matches!(version, SCHEMA_VERSION_V1 | CURRENT_SCHEMA_VERSION) {
         Ok(())
     } else {
         Err(WireError::UnsupportedVersion {
@@ -389,7 +417,7 @@ fn encode_envelope(
     schema_version: SchemaVersion,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, WireError> {
-    require_current_version(schema_version)?;
+    require_supported_version(schema_version)?;
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(WireError::PayloadTooLarge {
             limit: MAX_PAYLOAD_BYTES,
@@ -425,7 +453,7 @@ fn decode_envelope(
         return Err(WireError::InvalidMagic);
     }
     let schema_version = SchemaVersion::new(u16::from_le_bytes([bytes[8], bytes[9]]));
-    require_current_version(schema_version)?;
+    require_supported_version(schema_version)?;
     let actual_kind = u16::from_le_bytes([bytes[10], bytes[11]]);
     if actual_kind != expected_kind.get() {
         return Err(WireError::UnexpectedPayloadKind {
@@ -642,7 +670,25 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn write_measure_request(writer: &mut Writer, request: &MeasureRequest) -> Result<(), WireError> {
+fn write_measure_request_v1(
+    writer: &mut Writer,
+    request: &MeasureRequest,
+) -> Result<(), WireError> {
+    write_measure_request(writer, request, SCHEMA_VERSION_V1)
+}
+
+fn write_measure_request_v2(
+    writer: &mut Writer,
+    request: &MeasureRequest,
+) -> Result<(), WireError> {
+    write_measure_request(writer, request, CURRENT_SCHEMA_VERSION)
+}
+
+fn write_measure_request(
+    writer: &mut Writer,
+    request: &MeasureRequest,
+    version: SchemaVersion,
+) -> Result<(), WireError> {
     validate_request_ranges(request)?;
     writer.write_u32(request.id);
     writer.write_u32(request.paragraph_id);
@@ -651,7 +697,11 @@ fn write_measure_request(writer: &mut Writer, request: &MeasureRequest) -> Resul
     writer.write_u32(request.text_range.end);
     writer.write_collection_len("text style runs", request.style_runs.len())?;
     for style_run in &request.style_runs {
-        write_text_style_run(writer, style_run)?;
+        match version {
+            SCHEMA_VERSION_V1 => write_text_style_run_v1(writer, style_run)?,
+            CURRENT_SCHEMA_VERSION => write_text_style_run_v2(writer, style_run)?,
+            _ => unreachable!("schema version was validated"),
+        }
     }
     writer.write_layout_unit(request.font_size);
     writer.write_layout_unit(request.max_width);
@@ -668,7 +718,18 @@ fn write_measure_request(writer: &mut Writer, request: &MeasureRequest) -> Resul
     Ok(())
 }
 
-fn read_measure_request(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireError> {
+fn read_measure_request_v1(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireError> {
+    read_measure_request(reader, SCHEMA_VERSION_V1)
+}
+
+fn read_measure_request_v2(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireError> {
+    read_measure_request(reader, CURRENT_SCHEMA_VERSION)
+}
+
+fn read_measure_request(
+    reader: &mut Reader<'_>,
+    version: SchemaVersion,
+) -> Result<MeasureRequest, WireError> {
     let id = reader.read_u32("measure request id")?;
     let paragraph_id = reader.read_u32("paragraph id")?;
     let text = reader.read_string("measure text")?;
@@ -678,7 +739,11 @@ fn read_measure_request(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireE
     let style_run_count = reader.read_collection_len("text style runs")?;
     let mut style_runs = Vec::new();
     for _ in 0..style_run_count {
-        let style_run = read_text_style_run(reader)?;
+        let style_run = match version {
+            SCHEMA_VERSION_V1 => read_text_style_run_v1(reader)?,
+            CURRENT_SCHEMA_VERSION => read_text_style_run_v2(reader)?,
+            _ => unreachable!("schema version was validated"),
+        };
         validate_utf8_range("text style run", &text, style_run.start, style_run.end)?;
         if style_run.start < text_start || style_run.end > text_end {
             return Err(WireError::InvalidRange {
@@ -710,7 +775,19 @@ fn read_measure_request(reader: &mut Reader<'_>) -> Result<MeasureRequest, WireE
     })
 }
 
-fn write_measured_text(writer: &mut Writer, measured: &MeasuredText) -> Result<(), WireError> {
+fn write_measured_text_v1(writer: &mut Writer, measured: &MeasuredText) -> Result<(), WireError> {
+    write_measured_text(writer, measured, SCHEMA_VERSION_V1)
+}
+
+fn write_measured_text_v2(writer: &mut Writer, measured: &MeasuredText) -> Result<(), WireError> {
+    write_measured_text(writer, measured, CURRENT_SCHEMA_VERSION)
+}
+
+fn write_measured_text(
+    writer: &mut Writer,
+    measured: &MeasuredText,
+    version: SchemaVersion,
+) -> Result<(), WireError> {
     if measured.line_count != u32::try_from(measured.lines.len()).unwrap_or(u32::MAX) {
         return Err(WireError::LengthMismatch {
             declared: usize::try_from(measured.line_count).unwrap_or(usize::MAX),
@@ -732,6 +809,12 @@ fn write_measured_text(writer: &mut Writer, measured: &MeasuredText) -> Result<(
         writer.write_layout_unit(line.descent);
         writer.write_layout_unit(line.line_height);
         writer.write_layout_unit(line.width);
+        if version == CURRENT_SCHEMA_VERSION {
+            writer.write_layout_unit(line.ink_bounds.x);
+            writer.write_layout_unit(line.ink_bounds.y);
+            writer.write_layout_unit(line.ink_bounds.width);
+            writer.write_layout_unit(line.ink_bounds.height);
+        }
         writer.write_bool(line.hard_break);
     }
     writer.write_collection_len("measured clusters", measured.clusters.len())?;
@@ -746,7 +829,18 @@ fn write_measured_text(writer: &mut Writer, measured: &MeasuredText) -> Result<(
     Ok(())
 }
 
-fn read_measured_text(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError> {
+fn read_measured_text_v1(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError> {
+    read_measured_text(reader, SCHEMA_VERSION_V1)
+}
+
+fn read_measured_text_v2(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError> {
+    read_measured_text(reader, CURRENT_SCHEMA_VERSION)
+}
+
+fn read_measured_text(
+    reader: &mut Reader<'_>,
+    version: SchemaVersion,
+) -> Result<MeasuredText, WireError> {
     let request_id = reader.read_u32("measured request id")?;
     let request_fingerprint = reader.read_u64("measured request fingerprint")?;
     let width = reader.read_layout_unit("measured width")?;
@@ -762,14 +856,37 @@ fn read_measured_text(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError
     }
     let mut lines = Vec::new();
     for _ in 0..encoded_line_count {
+        let text_start = reader.read_u32("measured line start")?;
+        let text_end = reader.read_u32("measured line end")?;
+        let baseline = reader.read_layout_unit("measured line baseline")?;
+        let ascent = reader.read_layout_unit("measured line ascent")?;
+        let descent = reader.read_layout_unit("measured line descent")?;
+        let line_height = reader.read_layout_unit("measured line height")?;
+        let line_width = reader.read_layout_unit("measured line width")?;
+        let ink_bounds = if version == CURRENT_SCHEMA_VERSION {
+            TextBounds {
+                x: reader.read_layout_unit("measured line ink x")?,
+                y: reader.read_layout_unit("measured line ink y")?,
+                width: reader.read_layout_unit("measured line ink width")?,
+                height: reader.read_layout_unit("measured line ink height")?,
+            }
+        } else {
+            TextBounds {
+                x: LayoutUnit::ZERO,
+                y: LayoutUnit::ZERO,
+                width: line_width,
+                height: line_height,
+            }
+        };
         lines.push(LineMetrics {
-            text_start: reader.read_u32("measured line start")?,
-            text_end: reader.read_u32("measured line end")?,
-            baseline: reader.read_layout_unit("measured line baseline")?,
-            ascent: reader.read_layout_unit("measured line ascent")?,
-            descent: reader.read_layout_unit("measured line descent")?,
-            line_height: reader.read_layout_unit("measured line height")?,
-            width: reader.read_layout_unit("measured line width")?,
+            text_start,
+            text_end,
+            baseline,
+            ascent,
+            descent,
+            line_height,
+            width: line_width,
+            ink_bounds,
             hard_break: reader.read_bool("measured line hard break")?,
         });
     }
@@ -797,7 +914,19 @@ fn read_measured_text(reader: &mut Reader<'_>) -> Result<MeasuredText, WireError
     })
 }
 
-fn write_text_style_run(writer: &mut Writer, style_run: &TextStyleRun) -> Result<(), WireError> {
+fn write_text_style_run_v1(writer: &mut Writer, style_run: &TextStyleRun) -> Result<(), WireError> {
+    write_text_style_run(writer, style_run, false)
+}
+
+fn write_text_style_run_v2(writer: &mut Writer, style_run: &TextStyleRun) -> Result<(), WireError> {
+    write_text_style_run(writer, style_run, true)
+}
+
+fn write_text_style_run(
+    writer: &mut Writer,
+    style_run: &TextStyleRun,
+    include_letter_spacing: bool,
+) -> Result<(), WireError> {
     if style_run.start > style_run.end {
         return Err(WireError::InvalidRange {
             field: "text style run",
@@ -806,10 +935,24 @@ fn write_text_style_run(writer: &mut Writer, style_run: &TextStyleRun) -> Result
     writer.write_u32(style_run.start);
     writer.write_u32(style_run.end);
     writer.write_layout_unit(style_run.font_size);
+    if include_letter_spacing {
+        writer.write_layout_unit(style_run.letter_spacing);
+    }
     write_font_fallback_chain(writer, &style_run.fonts)
 }
 
-fn read_text_style_run(reader: &mut Reader<'_>) -> Result<TextStyleRun, WireError> {
+fn read_text_style_run_v1(reader: &mut Reader<'_>) -> Result<TextStyleRun, WireError> {
+    read_text_style_run(reader, false)
+}
+
+fn read_text_style_run_v2(reader: &mut Reader<'_>) -> Result<TextStyleRun, WireError> {
+    read_text_style_run(reader, true)
+}
+
+fn read_text_style_run(
+    reader: &mut Reader<'_>,
+    include_letter_spacing: bool,
+) -> Result<TextStyleRun, WireError> {
     let start = reader.read_u32("text style run start")?;
     let end = reader.read_u32("text style run end")?;
     if start > end {
@@ -821,6 +964,11 @@ fn read_text_style_run(reader: &mut Reader<'_>) -> Result<TextStyleRun, WireErro
         start,
         end,
         font_size: reader.read_layout_unit("text style font size")?,
+        letter_spacing: if include_letter_spacing {
+            reader.read_layout_unit("text style letter spacing")?
+        } else {
+            LayoutUnit::ZERO
+        },
         fonts: read_font_fallback_chain(reader)?,
     })
 }
@@ -918,7 +1066,540 @@ fn validate_utf8_range(
     }
 }
 
-fn write_page_scene(writer: &mut Writer, page: &PageScene) -> Result<(), WireError> {
+fn write_page_scene_v2(writer: &mut Writer, page: &PageScene) -> Result<(), WireError> {
+    validate_page_text_tables(page)?;
+    writer.write_u32(page.page_index);
+    write_page_size(writer, page.size);
+    write_option(writer, page.start_anchor, |writer, anchor| {
+        write_text_anchor(writer, anchor);
+        Ok(())
+    })?;
+    write_option(writer, page.end_anchor, |writer, anchor| {
+        write_text_anchor(writer, anchor);
+        Ok(())
+    })?;
+    writer.write_u64(page.text_backend_id.0);
+    writer.write_u64(page.font_fingerprint.0);
+    writer.write_collection_len("scene paragraphs", page.paragraphs.len())?;
+    for paragraph in &page.paragraphs {
+        write_scene_paragraph(writer, paragraph)?;
+    }
+    writer.write_collection_len("text paint fragments", page.text_paints.len())?;
+    for paint in &page.text_paints {
+        write_text_paint_fragment(writer, paint)?;
+    }
+    writer.write_collection_len("scene fragments", page.fragments.len())?;
+    for fragment in &page.fragments {
+        write_scene_fragment(writer, fragment)?;
+    }
+    writer.write_collection_len("link regions", page.links.len())?;
+    for link in &page.links {
+        write_link_region(writer, link)?;
+    }
+    writer.write_collection_len("anchor regions", page.anchors.len())?;
+    for anchor in &page.anchors {
+        write_anchor_region(writer, anchor)?;
+    }
+    writer.write_collection_len("selection maps", page.selections.len())?;
+    for selection in &page.selections {
+        write_selection_map(writer, selection)?;
+    }
+    writer.write_collection_len("semantic nodes", page.semantics.len())?;
+    for semantic in &page.semantics {
+        write_semantic_node(writer, semantic)?;
+    }
+    writer.write_hash(page.fingerprint.0);
+    write_option(writer, page.next_break_token.as_ref(), |writer, token| {
+        write_break_token(writer, token);
+        Ok(())
+    })?;
+    writer.write_collection_len("diagnostics", page.diagnostics.len())?;
+    for diagnostic in &page.diagnostics {
+        write_diagnostic(writer, diagnostic)?;
+    }
+    Ok(())
+}
+
+fn read_page_scene_v2(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
+    let page_index = reader.read_u32("page index")?;
+    let size = read_page_size(reader)?;
+    let start_anchor = read_option(reader, "start anchor", read_text_anchor)?;
+    let end_anchor = read_option(reader, "end anchor", read_text_anchor)?;
+    let text_backend_id = TextBackendId(reader.read_u64("scene text backend id")?);
+    let font_fingerprint = FontSetFingerprint(reader.read_u64("scene font fingerprint")?);
+    let paragraph_count = reader.read_collection_len("scene paragraphs")?;
+    let mut paragraphs = Vec::new();
+    for _ in 0..paragraph_count {
+        paragraphs.push(read_scene_paragraph(reader)?);
+    }
+    let paint_count = reader.read_collection_len("text paint fragments")?;
+    let mut text_paints = Vec::new();
+    for _ in 0..paint_count {
+        text_paints.push(read_text_paint_fragment(reader)?);
+    }
+    let fragment_count = reader.read_collection_len("scene fragments")?;
+    let mut fragments = Vec::new();
+    for _ in 0..fragment_count {
+        fragments.push(read_scene_fragment(reader)?);
+    }
+    let link_count = reader.read_collection_len("link regions")?;
+    let mut links = Vec::new();
+    for _ in 0..link_count {
+        links.push(read_link_region(reader)?);
+    }
+    let anchor_count = reader.read_collection_len("anchor regions")?;
+    let mut anchors = Vec::new();
+    for _ in 0..anchor_count {
+        anchors.push(read_anchor_region(reader)?);
+    }
+    let selection_count = reader.read_collection_len("selection maps")?;
+    let mut selections = Vec::new();
+    for _ in 0..selection_count {
+        selections.push(read_selection_map(reader)?);
+    }
+    let semantic_count = reader.read_collection_len("semantic nodes")?;
+    let mut semantics = Vec::new();
+    for _ in 0..semantic_count {
+        semantics.push(read_semantic_node(reader)?);
+    }
+    let fingerprint = PageFingerprint(reader.read_hash("page fingerprint")?);
+    let next_break_token = read_option(reader, "next break token", read_break_token)?;
+    let diagnostic_count = reader.read_collection_len("diagnostics")?;
+    let mut diagnostics = Vec::new();
+    for _ in 0..diagnostic_count {
+        diagnostics.push(read_diagnostic(reader)?);
+    }
+    let page = PageScene {
+        page_index,
+        size,
+        start_anchor,
+        end_anchor,
+        text_backend_id,
+        font_fingerprint,
+        paragraphs,
+        text_paints,
+        fragments,
+        links,
+        anchors,
+        selections,
+        semantics,
+        fingerprint,
+        next_break_token,
+        diagnostics,
+    };
+    validate_page_text_tables(&page)?;
+    Ok(page)
+}
+
+fn write_scene_paragraph(writer: &mut Writer, paragraph: &SceneParagraph) -> Result<(), WireError> {
+    writer.write_u32(paragraph.paragraph_id);
+    writer.write_u64(paragraph.request_fingerprint);
+    writer.write_u64(paragraph.measurement_fingerprint);
+    writer.write_string("scene paragraph text", &paragraph.text)?;
+    writer.write_u32(paragraph.text_range.start);
+    writer.write_u32(paragraph.text_range.end);
+    writer.write_collection_len("scene paragraph style runs", paragraph.style_runs.len())?;
+    for run in &paragraph.style_runs {
+        write_text_style_run_v2(writer, run)?;
+    }
+    writer.write_layout_unit(paragraph.font_size);
+    writer.write_layout_unit(paragraph.available_width);
+    writer.write_layout_unit(paragraph.max_width);
+    writer.write_string("scene paragraph locale", &paragraph.locale)?;
+    writer.write_u8(text_direction_to_wire(paragraph.direction));
+    writer.write_layout_unit(paragraph.text_scale);
+    write_font_fallback_chain(writer, &paragraph.font_candidates)?;
+    writer.write_layout_unit(paragraph.strut.ascent);
+    writer.write_layout_unit(paragraph.strut.descent);
+    writer.write_layout_unit(paragraph.strut.leading);
+    writer.write_u8(height_behavior_to_wire(paragraph.height_behavior));
+    writer.write_collection_len("scene paragraph lines", paragraph.lines.len())?;
+    for line in &paragraph.lines {
+        write_line_metrics_v2(writer, line.metrics);
+        write_rect(writer, line.layout_rect);
+        write_rect(writer, line.ink_bounds);
+    }
+    writer.write_collection_len("scene paragraph clusters", paragraph.clusters.len())?;
+    for cluster in &paragraph.clusters {
+        write_text_cluster(writer, *cluster);
+    }
+    Ok(())
+}
+
+fn read_scene_paragraph(reader: &mut Reader<'_>) -> Result<SceneParagraph, WireError> {
+    let paragraph_id = reader.read_u32("scene paragraph id")?;
+    let request_fingerprint = reader.read_u64("scene paragraph request fingerprint")?;
+    let measurement_fingerprint = reader.read_u64("scene paragraph measurement fingerprint")?;
+    let text = reader.read_string("scene paragraph text")?;
+    let text_start = reader.read_u32("scene paragraph text start")?;
+    let text_end = reader.read_u32("scene paragraph text end")?;
+    validate_utf8_range("scene paragraph text range", &text, text_start, text_end)?;
+    let style_count = reader.read_collection_len("scene paragraph style runs")?;
+    let mut style_runs = Vec::new();
+    for _ in 0..style_count {
+        style_runs.push(read_text_style_run_v2(reader)?);
+    }
+    let font_size = reader.read_layout_unit("scene paragraph font size")?;
+    let available_width = reader.read_layout_unit("scene paragraph available width")?;
+    let max_width = reader.read_layout_unit("scene paragraph maximum width")?;
+    let locale = reader.read_string("scene paragraph locale")?;
+    let direction = text_direction_from_wire(reader.read_u8("scene paragraph direction")?)?;
+    let text_scale = reader.read_layout_unit("scene paragraph text scale")?;
+    let font_candidates = read_font_fallback_chain(reader)?;
+    let strut = StrutStyle {
+        ascent: reader.read_layout_unit("scene paragraph strut ascent")?,
+        descent: reader.read_layout_unit("scene paragraph strut descent")?,
+        leading: reader.read_layout_unit("scene paragraph strut leading")?,
+    };
+    let height_behavior =
+        height_behavior_from_wire(reader.read_u8("scene paragraph height behavior")?)?;
+    let line_count = reader.read_collection_len("scene paragraph lines")?;
+    let mut lines = Vec::new();
+    for _ in 0..line_count {
+        lines.push(SceneParagraphLine {
+            metrics: read_line_metrics_v2(reader)?,
+            layout_rect: read_rect(reader)?,
+            ink_bounds: read_rect(reader)?,
+        });
+    }
+    let cluster_count = reader.read_collection_len("scene paragraph clusters")?;
+    let mut clusters = Vec::new();
+    for _ in 0..cluster_count {
+        clusters.push(read_text_cluster(reader)?);
+    }
+    Ok(SceneParagraph {
+        paragraph_id,
+        request_fingerprint,
+        measurement_fingerprint,
+        text,
+        text_range: text_start..text_end,
+        style_runs,
+        font_size,
+        available_width,
+        max_width,
+        locale,
+        direction,
+        text_scale,
+        font_candidates,
+        strut,
+        height_behavior,
+        lines,
+        clusters,
+    })
+}
+
+fn write_text_paint_fragment(
+    writer: &mut Writer,
+    paint: &TextPaintFragment,
+) -> Result<(), WireError> {
+    writer.write_u32(paint.id);
+    writer.write_u32(paint.node_id.get());
+    writer.write_u32(paint.paragraph_id);
+    writer.write_u32(paint.visible_text_range.start);
+    writer.write_u32(paint.visible_text_range.end);
+    write_point(writer, paint.paint_origin);
+    write_rect(writer, paint.layout_rect);
+    write_rect(writer, paint.clip_rect);
+    writer.write_u32(paint.first_line);
+    writer.write_u32(paint.line_count);
+    write_option(writer, paint.source_range, |writer, source_range| {
+        write_source_range(writer, source_range)
+    })?;
+    write_text_anchor_range(writer, paint.anchor_range);
+    writer.write_bool(paint.overflow);
+    Ok(())
+}
+
+fn read_text_paint_fragment(reader: &mut Reader<'_>) -> Result<TextPaintFragment, WireError> {
+    let id = reader.read_u32("text paint id")?;
+    let node_id = NodeId::new(reader.read_u32("text paint node id")?);
+    let paragraph_id = reader.read_u32("text paint paragraph id")?;
+    let text_start = reader.read_u32("text paint visible start")?;
+    let text_end = reader.read_u32("text paint visible end")?;
+    if text_start > text_end {
+        return Err(WireError::InvalidRange {
+            field: "text paint visible range",
+        });
+    }
+    Ok(TextPaintFragment {
+        id,
+        node_id,
+        paragraph_id,
+        visible_text_range: text_start..text_end,
+        paint_origin: read_point(reader)?,
+        layout_rect: read_rect(reader)?,
+        clip_rect: read_rect(reader)?,
+        first_line: reader.read_u32("text paint first line")?,
+        line_count: reader.read_u32("text paint line count")?,
+        source_range: read_option(reader, "text paint source range", read_source_range)?,
+        anchor_range: read_text_anchor_range(reader)?,
+        overflow: reader.read_bool("text paint overflow")?,
+    })
+}
+
+fn write_line_metrics_v2(writer: &mut Writer, line: LineMetrics) {
+    writer.write_u32(line.text_start);
+    writer.write_u32(line.text_end);
+    writer.write_layout_unit(line.baseline);
+    writer.write_layout_unit(line.ascent);
+    writer.write_layout_unit(line.descent);
+    writer.write_layout_unit(line.line_height);
+    writer.write_layout_unit(line.width);
+    write_text_bounds(writer, line.ink_bounds);
+    writer.write_bool(line.hard_break);
+}
+
+fn read_line_metrics_v2(reader: &mut Reader<'_>) -> Result<LineMetrics, WireError> {
+    Ok(LineMetrics {
+        text_start: reader.read_u32("scene line text start")?,
+        text_end: reader.read_u32("scene line text end")?,
+        baseline: reader.read_layout_unit("scene line baseline")?,
+        ascent: reader.read_layout_unit("scene line ascent")?,
+        descent: reader.read_layout_unit("scene line descent")?,
+        line_height: reader.read_layout_unit("scene line height")?,
+        width: reader.read_layout_unit("scene line width")?,
+        ink_bounds: read_text_bounds(reader)?,
+        hard_break: reader.read_bool("scene line hard break")?,
+    })
+}
+
+fn write_text_cluster(writer: &mut Writer, cluster: TextCluster) {
+    writer.write_u32(cluster.text_start);
+    writer.write_u32(cluster.text_end);
+    writer.write_u32(cluster.line_index);
+    writer.write_layout_unit(cluster.x_start);
+    writer.write_layout_unit(cluster.x_end);
+}
+
+fn read_text_cluster(reader: &mut Reader<'_>) -> Result<TextCluster, WireError> {
+    Ok(TextCluster {
+        text_start: reader.read_u32("scene cluster text start")?,
+        text_end: reader.read_u32("scene cluster text end")?,
+        line_index: reader.read_u32("scene cluster line index")?,
+        x_start: reader.read_layout_unit("scene cluster x start")?,
+        x_end: reader.read_layout_unit("scene cluster x end")?,
+    })
+}
+
+fn write_text_bounds(writer: &mut Writer, bounds: TextBounds) {
+    writer.write_layout_unit(bounds.x);
+    writer.write_layout_unit(bounds.y);
+    writer.write_layout_unit(bounds.width);
+    writer.write_layout_unit(bounds.height);
+}
+
+fn read_text_bounds(reader: &mut Reader<'_>) -> Result<TextBounds, WireError> {
+    Ok(TextBounds {
+        x: reader.read_layout_unit("text bounds x")?,
+        y: reader.read_layout_unit("text bounds y")?,
+        width: reader.read_layout_unit("text bounds width")?,
+        height: reader.read_layout_unit("text bounds height")?,
+    })
+}
+
+fn write_point(writer: &mut Writer, point: Point) {
+    writer.write_layout_unit(point.x);
+    writer.write_layout_unit(point.y);
+}
+
+fn read_point(reader: &mut Reader<'_>) -> Result<Point, WireError> {
+    Ok(Point {
+        x: reader.read_layout_unit("point x")?,
+        y: reader.read_layout_unit("point y")?,
+    })
+}
+
+fn validate_page_text_tables(page: &PageScene) -> Result<(), WireError> {
+    let mut paragraph_ids = BTreeSet::new();
+    for paragraph in &page.paragraphs {
+        if !paragraph_ids.insert(paragraph.paragraph_id) {
+            return Err(WireError::InvalidRange {
+                field: "scene paragraph id",
+            });
+        }
+        validate_utf8_range(
+            "scene paragraph text range",
+            &paragraph.text,
+            paragraph.text_range.start,
+            paragraph.text_range.end,
+        )?;
+        for run in &paragraph.style_runs {
+            validate_utf8_range(
+                "scene paragraph style run",
+                &paragraph.text,
+                run.start,
+                run.end,
+            )?;
+            if run.start < paragraph.text_range.start || run.end > paragraph.text_range.end {
+                return Err(WireError::InvalidRange {
+                    field: "scene paragraph style run",
+                });
+            }
+        }
+        for line in &paragraph.lines {
+            validate_utf8_range(
+                "scene paragraph line",
+                &paragraph.text,
+                line.metrics.text_start,
+                line.metrics.text_end,
+            )?;
+            if line.metrics.text_start < paragraph.text_range.start
+                || line.metrics.text_end > paragraph.text_range.end
+                || line.metrics.width.raw() < 0
+                || line.metrics.baseline.raw() < 0
+                || line.metrics.ascent.raw() < 0
+                || line.metrics.descent.raw() < 0
+                || line.metrics.line_height.raw() < 0
+                || line.metrics.ink_bounds.width.raw() < 0
+                || line.metrics.ink_bounds.height.raw() < 0
+                || line.layout_rect.width.raw() < 0
+                || line.layout_rect.height.raw() < 0
+                || line.ink_bounds.width.raw() < 0
+                || line.ink_bounds.height.raw() < 0
+            {
+                return Err(WireError::InvalidRange {
+                    field: "scene paragraph line",
+                });
+            }
+        }
+        for cluster in &paragraph.clusters {
+            validate_utf8_range(
+                "scene paragraph cluster",
+                &paragraph.text,
+                cluster.text_start,
+                cluster.text_end,
+            )?;
+            if cluster.text_start < paragraph.text_range.start
+                || cluster.text_end > paragraph.text_range.end
+                || cluster.x_end < cluster.x_start
+            {
+                return Err(WireError::InvalidRange {
+                    field: "scene paragraph cluster",
+                });
+            }
+            if usize::try_from(cluster.line_index).unwrap_or(usize::MAX) >= paragraph.lines.len() {
+                return Err(WireError::InvalidRange {
+                    field: "scene paragraph cluster line",
+                });
+            }
+        }
+    }
+    for paint in &page.text_paints {
+        let paragraph = page
+            .paragraphs
+            .iter()
+            .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+            .ok_or(WireError::InvalidRange {
+                field: "text paint paragraph",
+            })?;
+        validate_utf8_range(
+            "text paint visible range",
+            &paragraph.text,
+            paint.visible_text_range.start,
+            paint.visible_text_range.end,
+        )?;
+        if paint.visible_text_range.start < paragraph.text_range.start
+            || paint.visible_text_range.end > paragraph.text_range.end
+            || paint.layout_rect.width.raw() < 0
+            || paint.layout_rect.height.raw() < 0
+            || paint.clip_rect.width.raw() < 0
+            || paint.clip_rect.height.raw() < 0
+        {
+            return Err(WireError::InvalidRange {
+                field: "text paint visible range",
+            });
+        }
+        let first = usize::try_from(paint.first_line).unwrap_or(usize::MAX);
+        let count = usize::try_from(paint.line_count).unwrap_or(usize::MAX);
+        if count == 0
+            || first
+                .checked_add(count)
+                .is_none_or(|end| end > paragraph.lines.len())
+        {
+            return Err(WireError::InvalidRange {
+                field: "text paint line range",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn legacy_text_fragments(page: &PageScene) -> Vec<SceneFragment> {
+    let mut next_id = page
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .chain(page.text_paints.iter().map(|paint| paint.id))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut fragments = Vec::new();
+    for paint in &page.text_paints {
+        let Some(paragraph) = page
+            .paragraphs
+            .iter()
+            .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+        else {
+            continue;
+        };
+        let first = usize::try_from(paint.first_line).unwrap_or(usize::MAX);
+        let end = first
+            .saturating_add(usize::try_from(paint.line_count).unwrap_or(usize::MAX))
+            .min(paragraph.lines.len());
+        let Some(lines) = paragraph.lines.get(first..end) else {
+            continue;
+        };
+        for (relative, line) in lines.iter().enumerate() {
+            let text_start = line.metrics.text_start.max(paint.visible_text_range.start);
+            let text_end = line.metrics.text_end.min(paint.visible_text_range.end);
+            let text = slice_utf8(&paragraph.text, text_start, text_end).map(Arc::from);
+            let document_id = paint.anchor_range.start.document_id;
+            fragments.push(SceneFragment {
+                id: next_id,
+                kind: SceneFragmentKind::TextLine,
+                node_id: paint.node_id,
+                rect: Rect {
+                    x: paint.paint_origin.x + line.layout_rect.x,
+                    y: paint.paint_origin.y + line.layout_rect.y,
+                    width: line.layout_rect.width,
+                    height: line.layout_rect.height,
+                },
+                text,
+                source_range: paint.source_range,
+                anchor_range: Some(TextAnchorRange {
+                    start: TextAnchor::new(
+                        document_id,
+                        paint.node_id,
+                        text_start,
+                        TextAffinity::Downstream,
+                    ),
+                    end: TextAnchor::new(
+                        document_id,
+                        paint.node_id,
+                        text_end,
+                        TextAffinity::Upstream,
+                    ),
+                }),
+                line_index: Some(
+                    paint
+                        .first_line
+                        .saturating_add(u32::try_from(relative).unwrap_or(u32::MAX)),
+                ),
+                overflow: paint.overflow,
+            });
+            next_id = next_id.saturating_add(1);
+        }
+    }
+    fragments
+}
+
+fn slice_utf8(text: &str, start: u32, end: u32) -> Option<&str> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    text.get(start..end)
+}
+
+fn write_page_scene_v1(writer: &mut Writer, page: &PageScene) -> Result<(), WireError> {
     writer.write_u32(page.page_index);
     write_page_size(writer, page.size);
     write_option(writer, page.start_anchor, |writer, anchor| {
@@ -930,8 +1611,12 @@ fn write_page_scene(writer: &mut Writer, page: &PageScene) -> Result<(), WireErr
         Ok(())
     })?;
 
-    writer.write_collection_len("scene fragments", page.fragments.len())?;
-    for fragment in &page.fragments {
+    let projected_text = legacy_text_fragments(page);
+    writer.write_collection_len(
+        "scene fragments",
+        projected_text.len().saturating_add(page.fragments.len()),
+    )?;
+    for fragment in projected_text.iter().chain(&page.fragments) {
         write_scene_fragment(writer, fragment)?;
     }
 
@@ -968,7 +1653,7 @@ fn write_page_scene(writer: &mut Writer, page: &PageScene) -> Result<(), WireErr
     Ok(())
 }
 
-fn read_page_scene(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
+fn read_page_scene_v1(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
     let page_index = reader.read_u32("page index")?;
     let size = read_page_size(reader)?;
     let start_anchor = read_option(reader, "start anchor", read_text_anchor)?;
@@ -1018,6 +1703,10 @@ fn read_page_scene(reader: &mut Reader<'_>) -> Result<PageScene, WireError> {
         size,
         start_anchor,
         end_anchor,
+        text_backend_id: TextBackendId(0),
+        font_fingerprint: FontSetFingerprint(0),
+        paragraphs: Vec::new(),
+        text_paints: Vec::new(),
         fragments,
         links,
         anchors,

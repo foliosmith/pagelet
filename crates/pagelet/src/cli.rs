@@ -10,7 +10,7 @@ use crate::{
         OpenOptions,
     },
     layout::{self, HostMeasuredLayout, LayoutConstraints, LayoutOptions},
-    text::DefaultTextBackend,
+    text::{DefaultTextBackend, TextBackend},
     wire::{MeasureBatch as WireMeasureBatch, MeasuredBatch as WireMeasuredBatch},
 };
 
@@ -143,6 +143,10 @@ pub fn paginate_bytes_debug_svg_with_options(
                 },
                 start_anchor: None,
                 end_anchor: None,
+                text_backend_id: backend.backend_id(),
+                font_fingerprint: backend.font_fingerprint(),
+                paragraphs: Vec::new(),
+                text_paints: Vec::new(),
                 fragments: Vec::new(),
                 links: Vec::new(),
                 anchors: Vec::new(),

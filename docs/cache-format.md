@@ -9,6 +9,10 @@ Cache keys include the pagelet version, cache schema version, publication
 fingerprint, resource fingerprints, layout configuration, resource limits, text
 backend ID, and font set fingerprint.
 
+Cached v2 page scenes additionally bind every paragraph ID to its complete
+request and measurement fingerprints. A mismatch in backend, font set,
+request, or measurement identity rejects text replay and triggers remeasurement.
+
 ## Schema
 
 Cache records use compact, versioned data. Records must be validated before use

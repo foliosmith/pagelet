@@ -2,7 +2,7 @@ use pagelet::{
     core::{CancellationToken, LayoutUnit, PageletError},
     text::{
         FontSetFingerprint, LineMetrics, MeasureBatch, MeasuredBatch, MeasuredText, TextBackend,
-        TextBackendId, TextCluster,
+        TextBackendId, TextBounds, TextCluster,
     },
 };
 
@@ -228,6 +228,12 @@ fn push_line(
         descent: LayoutUnit::from_raw(line_height.raw() / 5),
         line_height,
         width,
+        ink_bounds: TextBounds {
+            x: LayoutUnit::ZERO,
+            y: LayoutUnit::ZERO,
+            width,
+            height: line_height,
+        },
         hard_break,
     });
 }

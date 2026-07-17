@@ -1920,6 +1920,7 @@ fn is_supported_css_property(property: &str) -> bool {
             | "font-size"
             | "font-weight"
             | "font-style"
+            | "font-stretch"
             | "line-height"
             | "letter-spacing"
             | "text-align"
@@ -1959,6 +1960,7 @@ fn is_inherited_css_property(property: &str) -> bool {
             | "font-size"
             | "font-weight"
             | "font-style"
+            | "font-stretch"
             | "line-height"
             | "letter-spacing"
             | "text-align"
@@ -2860,6 +2862,27 @@ impl ChapterBuilder<'_> {
             &document::ComputedStyle::new(),
         );
         let mut style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &inherited);
+        if let Some(locale) = element
+            .attr("xml:lang")
+            .or_else(|| element.attr("lang"))
+            .filter(|locale| !locale.trim().is_empty())
+            .map(Arc::<str>::from)
+            .or_else(|| inherited.properties.get("-pagelet-locale").cloned())
+        {
+            style
+                .properties
+                .insert(Arc::from("-pagelet-locale"), locale);
+        }
+        if !authored.properties.contains_key("direction") {
+            if let Some(direction) = element
+                .attr("dir")
+                .filter(|direction| matches!(*direction, "ltr" | "rtl" | "auto"))
+            {
+                style
+                    .properties
+                    .insert(Arc::from("direction"), Arc::from(direction));
+            }
+        }
         let root_font_size = if element.local_name() == "html" {
             LayoutUnit::from_px(16)
         } else {
@@ -3194,7 +3217,7 @@ fn resolve_font_relative_geometry(
     font_size: LayoutUnit,
     root_font_size: LayoutUnit,
 ) {
-    const GEOMETRY_PROPERTIES: [&str; 9] = [
+    const GEOMETRY_PROPERTIES: [&str; 10] = [
         "margin-top",
         "margin-right",
         "margin-bottom",
@@ -3204,6 +3227,7 @@ fn resolve_font_relative_geometry(
         "padding-bottom",
         "padding-left",
         "text-indent",
+        "letter-spacing",
     ];
     for property in GEOMETRY_PROPERTIES {
         let Some(value) = style.properties.get(property).cloned() else {
@@ -4173,6 +4197,30 @@ fn limit_error(kind: ResourceLimitKind, limit: u64, observed: u64) -> PageletErr
 mod tests {
     use super::*;
 
+    fn visible_text_line_rects(page: &crate::layout::PageScene) -> Vec<crate::layout::Rect> {
+        let mut rects = Vec::new();
+        for paint in &page.text_paints {
+            let paragraph = page
+                .paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+                .expect("paint paragraph");
+            let first = usize::try_from(paint.first_line).expect("first line");
+            let end = first + usize::try_from(paint.line_count).expect("line count");
+            rects.extend(
+                paragraph.lines[first..end]
+                    .iter()
+                    .map(|line| crate::layout::Rect {
+                        x: paint.paint_origin.x + line.layout_rect.x,
+                        y: paint.paint_origin.y + line.layout_rect.y,
+                        width: line.layout_rect.width,
+                        height: line.layout_rect.height,
+                    }),
+            );
+        }
+        rects
+    }
+
     fn minimal_fixture_bytes() -> Vec<u8> {
         crate::testkit::GeneratedEpubFixture::preset(crate::testkit::FixtureKind::MinimalEpub3)
             .bytes()
@@ -4489,12 +4537,8 @@ mod tests {
         let line_heights = pages
             .pages
             .iter()
-            .flat_map(|page| {
-                page.fragments.iter().filter_map(|fragment| {
-                    (fragment.kind == crate::layout::SceneFragmentKind::TextLine)
-                        .then_some(fragment.rect.height)
-                })
-            })
+            .flat_map(visible_text_line_rects)
+            .map(|rect| rect.height)
             .collect::<Vec<_>>();
 
         assert_eq!(line_heights.first(), Some(&LayoutUnit::from_px(75)));
@@ -4588,20 +4632,16 @@ mod tests {
             options,
         )
         .expect("paginate geometry fixture");
-        let first_line = pages.pages[0]
-            .fragments
-            .iter()
-            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::TextLine)
-            .expect("first text line");
+        let first_line = visible_text_line_rects(&pages.pages[0])[0];
         assert_eq!(
-            first_line.rect.x,
+            first_line.x,
             options.constraints.margin_start
                 + section_padding
                 + paragraph_margin_left
                 + LayoutUnit::from_px(60)
         );
         assert_eq!(
-            first_line.rect.y,
+            first_line.y,
             options.constraints.margin_top + LayoutUnit::from_px(75)
         );
     }

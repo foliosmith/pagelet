@@ -25,7 +25,8 @@ Every wire payload carries a schema version. Incompatible cache, wire, or handle
 changes require a documented version bump and migration or invalidation policy.
 
 The active binary contract is documented in
-[`schemas/pageletScene/v1.md`](../schemas/pageletScene/v1.md). It uses a fixed
+[`schemas/pageletScene/v2.md`](../schemas/pageletScene/v2.md). The frozen v1
+contract remains available for explicit capability fallback. Both use a fixed
 little-endian envelope with an exact payload length and CRC-32 checksum.
 
 ## Host-Measured Text Round Trip
@@ -37,8 +38,14 @@ Host adapters paginate in two phases:
 2. the host measures that batch with its rendering stack and submits one
    `MeasuredBatch` carrying backend, font-set, request, line, and cluster
    identities;
-3. pagelet validates the complete response and resumes layout to `PageScene`.
+3. pagelet validates the complete response and resumes layout to a v2
+   `PageScene` containing complete measured paragraphs plus clipped paint
+   references.
 
 Adapters must not cross FFI once per line or glyph. Missing, duplicate, unknown,
 stale, invalid UTF-8, or geometrically invalid results are protocol errors and
 must not reach layout or caches.
+
+Renderers replay the complete paragraph using the same backend/font identity,
+request parameters, line baselines, and measurement fingerprint. They clip only
+to the page fragment clip rectangle; line advance width is not a glyph clip.
