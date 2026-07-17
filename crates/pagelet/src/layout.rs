@@ -140,18 +140,28 @@ pub struct ComputedLayoutStyle {
     pub font_size: LayoutUnit,
     /// Line height.
     pub line_height: LayoutUnit,
-    /// Space before block.
-    pub margin_before: LayoutUnit,
-    /// Space after block.
-    pub margin_after: LayoutUnit,
-    /// Start padding.
-    pub padding_start: LayoutUnit,
-    /// End padding.
-    pub padding_end: LayoutUnit,
+    /// Physical top margin in the horizontal writing fallback.
+    pub margin_top: LayoutUnit,
+    /// Physical right margin in the horizontal writing fallback.
+    pub margin_right: LayoutUnit,
+    /// Physical bottom margin in the horizontal writing fallback.
+    pub margin_bottom: LayoutUnit,
+    /// Physical left margin in the horizontal writing fallback.
+    pub margin_left: LayoutUnit,
+    /// Physical top padding in the horizontal writing fallback.
+    pub padding_top: LayoutUnit,
+    /// Physical right padding in the horizontal writing fallback.
+    pub padding_right: LayoutUnit,
+    /// Physical bottom padding in the horizontal writing fallback.
+    pub padding_bottom: LayoutUnit,
+    /// Physical left padding in the horizontal writing fallback.
+    pub padding_left: LayoutUnit,
     /// First-line indent.
     pub text_indent: LayoutUnit,
-    /// Container/list/blockquote indent.
-    pub block_indent: LayoutUnit,
+    /// Semantic/container physical left inset.
+    pub block_indent_left: LayoutUnit,
+    /// Container physical right inset.
+    pub block_indent_right: LayoutUnit,
     /// Text alignment.
     pub alignment: TextAlignment,
     /// Whether this block should stay with the next block.
@@ -170,11 +180,16 @@ impl ComputedLayoutStyle {
         style_id: crate::core::StyleId,
         kind: BlockKind,
         depth: u32,
+        containing_width: LayoutUnit,
+        ancestor_left: LayoutUnit,
+        ancestor_right: LayoutUnit,
     ) -> Self {
         let mut style = Self::for_kind(kind, depth);
         if let Some(document_style) = styles.get(style_id) {
-            style.apply_document_style(document_style);
+            style.apply_document_style(document_style, containing_width);
         }
+        style.block_indent_left += ancestor_left;
+        style.block_indent_right += ancestor_right;
         style
     }
 
@@ -187,12 +202,17 @@ impl ComputedLayoutStyle {
                 Self {
                     font_size: LayoutUnit::from_px(font),
                     line_height: LayoutUnit::from_px(font + 8),
-                    margin_before: LayoutUnit::from_px(14),
-                    margin_after: LayoutUnit::from_px(8),
-                    padding_start: LayoutUnit::ZERO,
-                    padding_end: LayoutUnit::ZERO,
+                    margin_top: LayoutUnit::from_px(14),
+                    margin_right: LayoutUnit::ZERO,
+                    margin_bottom: LayoutUnit::from_px(8),
+                    margin_left: LayoutUnit::ZERO,
+                    padding_top: LayoutUnit::ZERO,
+                    padding_right: LayoutUnit::ZERO,
+                    padding_bottom: LayoutUnit::ZERO,
+                    padding_left: LayoutUnit::ZERO,
                     text_indent: LayoutUnit::ZERO,
-                    block_indent: depth_indent,
+                    block_indent_left: depth_indent,
+                    block_indent_right: LayoutUnit::ZERO,
                     alignment: TextAlignment::Start,
                     keep_with_next: true,
                     break_before: false,
@@ -201,35 +221,39 @@ impl ComputedLayoutStyle {
                 }
             }
             BlockKind::ListItem => Self {
-                block_indent: depth_indent + LayoutUnit::from_px(18),
-                margin_before: LayoutUnit::from_px(2),
-                margin_after: LayoutUnit::from_px(4),
+                block_indent_left: depth_indent + LayoutUnit::from_px(18),
+                margin_top: LayoutUnit::from_px(2),
+                margin_bottom: LayoutUnit::from_px(4),
                 ..Self::default()
             },
             BlockKind::BlockQuote => Self {
-                block_indent: depth_indent + LayoutUnit::from_px(18),
-                padding_start: LayoutUnit::from_px(10),
-                margin_before: LayoutUnit::from_px(8),
-                margin_after: LayoutUnit::from_px(8),
+                block_indent_left: depth_indent + LayoutUnit::from_px(18),
+                padding_left: LayoutUnit::from_px(10),
+                margin_top: LayoutUnit::from_px(8),
+                margin_bottom: LayoutUnit::from_px(8),
                 ..Self::default()
             },
             BlockKind::Image | BlockKind::Unsupported | BlockKind::Divider => Self {
-                margin_before: LayoutUnit::from_px(8),
-                margin_after: LayoutUnit::from_px(8),
-                block_indent: depth_indent,
+                margin_top: LayoutUnit::from_px(8),
+                margin_bottom: LayoutUnit::from_px(8),
+                block_indent_left: depth_indent,
                 ..Self::default()
             },
             BlockKind::Paragraph | BlockKind::Container => Self {
-                block_indent: depth_indent,
+                block_indent_left: depth_indent,
                 ..Self::default()
             },
             BlockKind::ForcedBreak => Self::default(),
         }
     }
 
-    fn apply_document_style(&mut self, document_style: &DocumentComputedStyle) {
-        // PageScene owns fragment geometry. Author CSS may affect typography and
-        // pagination policy, but not margins, padding, dimensions, or text indent.
+    fn apply_document_style(
+        &mut self,
+        document_style: &DocumentComputedStyle,
+        containing_width: LayoutUnit,
+    ) {
+        // Resolve typography first because `em` geometry is relative to the
+        // element's computed font size.
         for (name, value) in &document_style.properties {
             match &**name {
                 "font-size" => set_unit(&mut self.font_size, value),
@@ -261,7 +285,225 @@ impl ComputedLayoutStyle {
                 _ => {}
             }
         }
+        let geometry =
+            UsedBoxGeometry::from_document(document_style, self.font_size, containing_width);
+        let has_margin = document_style.properties.contains_key("margin");
+        let has_padding = document_style.properties.contains_key("padding");
+        if has_margin || document_style.properties.contains_key("margin-top") {
+            self.margin_top = geometry.margin_top;
+        }
+        if has_margin || document_style.properties.contains_key("margin-right") {
+            self.margin_right = geometry.margin_right;
+        }
+        if has_margin || document_style.properties.contains_key("margin-bottom") {
+            self.margin_bottom = geometry.margin_bottom;
+        }
+        if has_margin || document_style.properties.contains_key("margin-left") {
+            self.margin_left = geometry.margin_left;
+        }
+        if has_padding || document_style.properties.contains_key("padding-top") {
+            self.padding_top = geometry.padding_top;
+        }
+        if has_padding || document_style.properties.contains_key("padding-right") {
+            self.padding_right = geometry.padding_right;
+        }
+        if has_padding || document_style.properties.contains_key("padding-bottom") {
+            self.padding_bottom = geometry.padding_bottom;
+        }
+        if has_padding || document_style.properties.contains_key("padding-left") {
+            self.padding_left = geometry.padding_left;
+        }
+        if document_style.properties.contains_key("text-indent") {
+            self.text_indent = geometry.text_indent;
+        }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+struct UsedBoxGeometry {
+    margin_top: LayoutUnit,
+    margin_right: LayoutUnit,
+    margin_bottom: LayoutUnit,
+    margin_left: LayoutUnit,
+    padding_top: LayoutUnit,
+    padding_right: LayoutUnit,
+    padding_bottom: LayoutUnit,
+    padding_left: LayoutUnit,
+    text_indent: LayoutUnit,
+}
+
+impl UsedBoxGeometry {
+    fn from_document(
+        style: &DocumentComputedStyle,
+        font_size: LayoutUnit,
+        containing_width: LayoutUnit,
+    ) -> Self {
+        let mut geometry = Self::default();
+        if let Some(value) = style.properties.get("margin") {
+            if let Some([top, right, bottom, left]) =
+                resolve_box_shorthand(value, font_size, containing_width, true)
+            {
+                geometry.margin_top = top;
+                geometry.margin_right = right;
+                geometry.margin_bottom = bottom;
+                geometry.margin_left = left;
+            }
+        }
+        if let Some(value) = style.properties.get("padding") {
+            if let Some([top, right, bottom, left]) =
+                resolve_box_shorthand(value, font_size, containing_width, false)
+            {
+                geometry.padding_top = top;
+                geometry.padding_right = right;
+                geometry.padding_bottom = bottom;
+                geometry.padding_left = left;
+            }
+        }
+        set_used_length(
+            &mut geometry.margin_top,
+            style.properties.get("margin-top"),
+            font_size,
+            containing_width,
+            true,
+        );
+        set_used_length(
+            &mut geometry.margin_right,
+            style.properties.get("margin-right"),
+            font_size,
+            containing_width,
+            true,
+        );
+        set_used_length(
+            &mut geometry.margin_bottom,
+            style.properties.get("margin-bottom"),
+            font_size,
+            containing_width,
+            true,
+        );
+        set_used_length(
+            &mut geometry.margin_left,
+            style.properties.get("margin-left"),
+            font_size,
+            containing_width,
+            true,
+        );
+        set_used_length(
+            &mut geometry.padding_top,
+            style.properties.get("padding-top"),
+            font_size,
+            containing_width,
+            false,
+        );
+        set_used_length(
+            &mut geometry.padding_right,
+            style.properties.get("padding-right"),
+            font_size,
+            containing_width,
+            false,
+        );
+        set_used_length(
+            &mut geometry.padding_bottom,
+            style.properties.get("padding-bottom"),
+            font_size,
+            containing_width,
+            false,
+        );
+        set_used_length(
+            &mut geometry.padding_left,
+            style.properties.get("padding-left"),
+            font_size,
+            containing_width,
+            false,
+        );
+        set_used_length(
+            &mut geometry.text_indent,
+            style.properties.get("text-indent"),
+            font_size,
+            containing_width,
+            true,
+        );
+        geometry
+    }
+
+    fn horizontal(self) -> LayoutUnit {
+        self.margin_left + self.padding_left + self.padding_right + self.margin_right
+    }
+}
+
+fn resolve_box_shorthand(
+    value: &str,
+    font_size: LayoutUnit,
+    containing_width: LayoutUnit,
+    allow_negative: bool,
+) -> Option<[LayoutUnit; 4]> {
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    let [top, right, bottom, left] = match values.as_slice() {
+        [all] => [*all, *all, *all, *all],
+        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
+        [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
+        [top, right, bottom, left] => [*top, *right, *bottom, *left],
+        _ => return None,
+    };
+    Some([
+        resolve_used_length(top, font_size, containing_width, allow_negative)?,
+        resolve_used_length(right, font_size, containing_width, allow_negative)?,
+        resolve_used_length(bottom, font_size, containing_width, allow_negative)?,
+        resolve_used_length(left, font_size, containing_width, allow_negative)?,
+    ])
+}
+
+fn set_used_length(
+    target: &mut LayoutUnit,
+    value: Option<&Arc<str>>,
+    font_size: LayoutUnit,
+    containing_width: LayoutUnit,
+    allow_negative: bool,
+) {
+    if let Some(value) = value
+        .and_then(|value| resolve_used_length(value, font_size, containing_width, allow_negative))
+    {
+        *target = value;
+    }
+}
+
+fn resolve_used_length(
+    value: &str,
+    font_size: LayoutUnit,
+    containing_width: LayoutUnit,
+    allow_negative: bool,
+) -> Option<LayoutUnit> {
+    const MAX_USED_LENGTH_PX: f64 = 1_000_000.0;
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "auto" | "initial" | "inherit" | "unset") {
+        return None;
+    }
+    let pixels = if let Some(number) = value.strip_suffix("rem") {
+        parse_number(number)? * 16.0
+    } else if let Some(number) = value.strip_suffix("em") {
+        parse_number(number)? * font_size.to_f64_px()
+    } else if let Some(number) = value.strip_suffix('%') {
+        parse_number(number)? * containing_width.to_f64_px() / 100.0
+    } else if let Some(number) = value.strip_suffix("px") {
+        parse_number(number)?
+    } else if value == "0" {
+        0.0
+    } else {
+        return None;
+    };
+    if !pixels.is_finite() || (!allow_negative && pixels < 0.0) {
+        return None;
+    }
+    Some(LayoutUnit::from_f64_px(
+        pixels.clamp(-MAX_USED_LENGTH_PX, MAX_USED_LENGTH_PX),
+    ))
+}
+
+fn parse_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 impl Default for ComputedLayoutStyle {
@@ -269,12 +511,17 @@ impl Default for ComputedLayoutStyle {
         Self {
             font_size: LayoutUnit::from_px(16),
             line_height: LayoutUnit::from_px(22),
-            margin_before: LayoutUnit::from_px(4),
-            margin_after: LayoutUnit::from_px(8),
-            padding_start: LayoutUnit::ZERO,
-            padding_end: LayoutUnit::ZERO,
+            margin_top: LayoutUnit::from_px(4),
+            margin_right: LayoutUnit::ZERO,
+            margin_bottom: LayoutUnit::from_px(8),
+            margin_left: LayoutUnit::ZERO,
+            padding_top: LayoutUnit::ZERO,
+            padding_right: LayoutUnit::ZERO,
+            padding_bottom: LayoutUnit::ZERO,
+            padding_left: LayoutUnit::ZERO,
             text_indent: LayoutUnit::ZERO,
-            block_indent: LayoutUnit::ZERO,
+            block_indent_left: LayoutUnit::ZERO,
+            block_indent_right: LayoutUnit::ZERO,
             alignment: TextAlignment::Start,
             keep_with_next: false,
             break_before: false,
@@ -713,6 +960,7 @@ pub struct PaginatedDocument {
 pub struct HostMeasuredLayout {
     chapter: ChapterIr,
     options: LayoutOptions,
+    blocks: Vec<LayoutBlock>,
     measure_batch: MeasureBatch,
 }
 
@@ -720,10 +968,12 @@ impl HostMeasuredLayout {
     /// Prepare a chapter for one batched host measurement round trip.
     #[must_use]
     pub fn prepare(chapter: ChapterIr, options: LayoutOptions) -> Self {
-        let measure_batch = prepare_measure_batch(&chapter, options);
+        let blocks = layout_blocks(&chapter, options.constraints);
+        let measure_batch = prepare_measure_batch_from_blocks(&blocks, options.constraints);
         Self {
             chapter,
             options,
+            blocks,
             measure_batch,
         }
     }
@@ -737,26 +987,34 @@ impl HostMeasuredLayout {
     /// Validate host metrics and resume layout to completion.
     pub fn resume(self, measured: MeasuredBatch) -> Result<PaginatedDocument, PageletError> {
         let backend = HostMeasuredTextBackend::new(&self.measure_batch, measured)?;
-        paginate_chapter_with_options(&self.chapter, &backend, self.options)
+        paginate_prepared_blocks(&self.chapter, &self.blocks, &backend, self.options)
     }
 }
 
 /// Build the single host measurement batch required to paginate a chapter.
 #[must_use]
 pub fn prepare_measure_batch(chapter: &ChapterIr, options: LayoutOptions) -> MeasureBatch {
-    let requests = layout_blocks(chapter)
-        .into_iter()
+    let blocks = layout_blocks(chapter, options.constraints);
+    prepare_measure_batch_from_blocks(&blocks, options.constraints)
+}
+
+fn prepare_measure_batch_from_blocks(
+    blocks: &[LayoutBlock],
+    constraints: LayoutConstraints,
+) -> MeasureBatch {
+    let requests = blocks
+        .iter()
         .enumerate()
         .filter_map(|(index, block)| {
-            let LayoutBlockContent::Text { text, .. } = block.content else {
+            let LayoutBlockContent::Text { text, .. } = &block.content else {
                 return None;
             };
             Some(measure_request(
                 u32::try_from(index).unwrap_or(u32::MAX),
                 block.node_id.get(),
-                &text,
+                text,
                 block.style,
-                block_available_width(options.constraints, block.style),
+                measurement_available_width(constraints, block.style),
             ))
         })
         .collect();
@@ -813,8 +1071,17 @@ pub fn paginate_chapter_with_options(
     text_backend: &dyn TextBackend,
     options: LayoutOptions,
 ) -> Result<PaginatedDocument, PageletError> {
+    let blocks = layout_blocks(chapter, options.constraints);
+    paginate_prepared_blocks(chapter, &blocks, text_backend, options)
+}
+
+fn paginate_prepared_blocks(
+    chapter: &ChapterIr,
+    blocks: &[LayoutBlock],
+    text_backend: &dyn TextBackend,
+    options: LayoutOptions,
+) -> Result<PaginatedDocument, PageletError> {
     let cancel = CancellationToken::new();
-    let blocks = layout_blocks(chapter);
     if blocks.is_empty() {
         return Ok(PaginatedDocument {
             pages: Vec::new(),
@@ -845,7 +1112,7 @@ pub fn paginate_chapter_with_options(
             ));
         }
         let Some(page) =
-            paginate_page_from_blocks(chapter, &blocks, text_backend, options, &cancel, start)?
+            paginate_page_from_blocks(chapter, blocks, text_backend, options, &cancel, start)?
         else {
             break;
         };
@@ -872,7 +1139,7 @@ pub fn paginate_next_page(
     options: LayoutOptions,
     token: Option<BreakToken>,
 ) -> Result<Option<PageScene>, PageletError> {
-    let blocks = layout_blocks(chapter);
+    let blocks = layout_blocks(chapter, options.constraints);
     if blocks.is_empty() {
         return Ok(None);
     }
@@ -1149,7 +1416,7 @@ fn paginate_page_from_blocks(
                 break;
             }
             LayoutBlockContent::Text { text, marker } => {
-                let available_width = block_available_width(options.constraints, block.style);
+                let available_width = measurement_available_width(options.constraints, block.style);
                 let measured = measure_text(
                     text_backend,
                     cancel,
@@ -1307,7 +1574,9 @@ fn paginate_page_from_blocks(
 struct PageBuilder {
     page_index: u32,
     size: PageSize,
+    constraints: LayoutConstraints,
     y: LayoutUnit,
+    pending_margin_bottom: LayoutUnit,
     next_fragment_id: u32,
     fragments: Vec<SceneFragment>,
     links: Vec<LinkRegion>,
@@ -1338,7 +1607,9 @@ impl PageBuilder {
                 width: constraints.viewport_width,
                 height: constraints.viewport_height,
             },
+            constraints,
             y: constraints.margin_top,
+            pending_margin_bottom: LayoutUnit::ZERO,
             next_fragment_id: 0,
             fragments: Vec::new(),
             links: Vec::new(),
@@ -1376,23 +1647,28 @@ impl PageBuilder {
             return Ok(BlockPushOutcome::Complete);
         }
 
-        let top_margin = if self.fragments.is_empty() {
-            LayoutUnit::ZERO
-        } else {
-            block.style.margin_before
-        };
-        if self.y + top_margin >= content_bottom && !self.fragments.is_empty() {
+        let is_continuation = text_offset > 0;
+        let top_spacing = self.block_start_spacing(block.style, is_continuation);
+        if self.y + top_spacing >= content_bottom && !self.fragments.is_empty() {
             return Ok(BlockPushOutcome::NoFit);
         }
-        let mut y = self.y + top_margin;
+        let mut y = self.y + top_spacing;
         let mut fit_count = 0_usize;
         let total_remaining = measured.lines.len() - start_line;
 
         for line in &measured.lines[start_line..] {
-            if fit_count > 0 && y + line.line_height > content_bottom {
+            let completes_block = fit_count + 1 == total_remaining;
+            let required_bottom = if completes_block {
+                block.style.padding_bottom
+            } else {
+                LayoutUnit::ZERO
+            };
+            if fit_count > 0 && y + line.line_height + required_bottom > content_bottom {
                 break;
             }
-            if fit_count == 0 && y + line.line_height > content_bottom && !self.fragments.is_empty()
+            if fit_count == 0
+                && y + line.line_height + required_bottom > content_bottom
+                && !self.fragments.is_empty()
             {
                 return Ok(BlockPushOutcome::NoFit);
             }
@@ -1415,7 +1691,8 @@ impl PageBuilder {
             }
         }
 
-        self.y += top_margin;
+        self.y += top_spacing;
+        self.pending_margin_bottom = LayoutUnit::ZERO;
         let x = block_x(options.constraints, block.style);
         let mut line_y = self.y;
         let first_line_indent = block.style.text_indent;
@@ -1453,10 +1730,15 @@ impl PageBuilder {
             let text_start = line.text_start.max(text_offset);
             let text_end = line.text_end;
             let text_slice = slice_text(text, text_start, text_end);
+            let line_available_width = if is_first_line {
+                first_line_available_width(options.constraints, block.style)
+            } else {
+                block_available_width(options.constraints, block.style)
+            };
             let rect = Rect {
                 x: aligned_x(
                     line_x,
-                    block_available_width(options.constraints, block.style),
+                    line_available_width,
                     line.width,
                     block.style.alignment,
                 ),
@@ -1493,11 +1775,12 @@ impl PageBuilder {
             line_y += line.line_height;
         }
 
-        self.y = line_y + block.style.margin_after;
-
         if start_line + fit_count >= measured.lines.len() {
+            self.y = line_y + block.style.padding_bottom;
+            self.pending_margin_bottom = block.style.margin_bottom;
             Ok(BlockPushOutcome::Complete)
         } else {
+            self.y = line_y;
             let next_offset = measured.lines[start_line + fit_count - 1].text_end;
             Ok(BlockPushOutcome::Split {
                 next: BreakToken::for_position(
@@ -1522,24 +1805,23 @@ impl PageBuilder {
         height: LayoutUnit,
         content_bottom: LayoutUnit,
     ) -> bool {
-        let top_margin = if self.fragments.is_empty() {
-            LayoutUnit::ZERO
-        } else {
-            block.style.margin_before
-        };
-        if self.y + top_margin + height > content_bottom && !self.fragments.is_empty() {
+        let top_spacing = self.block_start_spacing(block.style, false);
+        if self.y + top_spacing + height + block.style.padding_bottom > content_bottom
+            && !self.fragments.is_empty()
+        {
             return false;
         }
-        self.y += top_margin;
+        self.y += top_spacing;
+        self.pending_margin_bottom = LayoutUnit::ZERO;
         let fragment_id = self.alloc_fragment_id();
         self.push_fragment(SceneFragment {
             id: fragment_id,
             kind,
             node_id: block.node_id,
             rect: Rect {
-                x: block.style.block_indent,
+                x: block_x(self.constraints, block.style),
                 y: self.y,
-                width: LayoutUnit::from_px(160),
+                width: block_available_width(self.constraints, block.style),
                 height,
             },
             text,
@@ -1548,7 +1830,8 @@ impl PageBuilder {
             line_index: None,
             overflow: self.y + height > content_bottom,
         });
-        self.y += height + block.style.margin_after;
+        self.y += height + block.style.padding_bottom;
+        self.pending_margin_bottom = block.style.margin_bottom;
         true
     }
 
@@ -1558,24 +1841,23 @@ impl PageBuilder {
         image: &LayoutImage,
         content_bottom: LayoutUnit,
     ) -> (bool, Option<Diagnostic>) {
-        let top_margin = if self.fragments.is_empty() {
-            LayoutUnit::ZERO
-        } else {
-            block.style.margin_before
-        };
+        let top_spacing = self.block_start_spacing(block.style, false);
+        let available_width = block_available_width(self.constraints, block.style);
         let mut width = image.intrinsic_width.unwrap_or(LayoutUnit::from_px(180));
         let mut height = image.intrinsic_height.unwrap_or(LayoutUnit::from_px(140));
-        if width > LayoutUnit::from_px(280) {
-            let ratio_raw =
-                (LayoutUnit::from_px(280).raw() * LayoutUnit::SCALE) / width.raw().max(1);
-            width = LayoutUnit::from_px(280);
+        if width > available_width {
+            let ratio_raw = (available_width.raw() * LayoutUnit::SCALE) / width.raw().max(1);
+            width = available_width;
             height = LayoutUnit::from_raw((height.raw() * ratio_raw) / LayoutUnit::SCALE);
         }
-        if self.y + top_margin + height > content_bottom && !self.fragments.is_empty() {
+        if self.y + top_spacing + height + block.style.padding_bottom > content_bottom
+            && !self.fragments.is_empty()
+        {
             return (false, None);
         }
 
-        self.y += top_margin;
+        self.y += top_spacing;
+        self.pending_margin_bottom = LayoutUnit::ZERO;
         let mut diagnostic = None;
         if self.y + height > content_bottom {
             height = (content_bottom - self.y).max(LayoutUnit::from_px(1));
@@ -1591,7 +1873,7 @@ impl PageBuilder {
             kind: SceneFragmentKind::Image,
             node_id: block.node_id,
             rect: Rect {
-                x: block.style.block_indent,
+                x: block_x(self.constraints, block.style),
                 y: self.y,
                 width,
                 height,
@@ -1602,8 +1884,17 @@ impl PageBuilder {
             line_index: None,
             overflow: diagnostic.is_some(),
         });
-        self.y += height + block.style.margin_after;
+        self.y += height + block.style.padding_bottom;
+        self.pending_margin_bottom = block.style.margin_bottom;
         (true, diagnostic)
+    }
+
+    fn block_start_spacing(&self, style: ComputedLayoutStyle, is_continuation: bool) -> LayoutUnit {
+        if is_continuation {
+            LayoutUnit::ZERO
+        } else {
+            collapse_margins(self.pending_margin_bottom, style.margin_top) + style.padding_top
+        }
     }
 
     fn alloc_fragment_id(&mut self) -> u32 {
@@ -1692,9 +1983,52 @@ struct LayoutImage {
     intrinsic_height: Option<LayoutUnit>,
 }
 
-fn layout_blocks(chapter: &ChapterIr) -> Vec<LayoutBlock> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ContainingBlock {
+    inline_width: LayoutUnit,
+    inset_left: LayoutUnit,
+    inset_right: LayoutUnit,
+}
+
+struct LeafLayoutContext {
+    depth: u32,
+    marker: Option<Arc<str>>,
+    containing: ContainingBlock,
+}
+
+impl ContainingBlock {
+    fn root(constraints: LayoutConstraints) -> Self {
+        Self {
+            inline_width: constraints.content_width(),
+            inset_left: LayoutUnit::ZERO,
+            inset_right: LayoutUnit::ZERO,
+        }
+    }
+
+    fn nested(self, geometry: UsedBoxGeometry) -> Self {
+        let inline_width = self.inline_width - geometry.horizontal();
+        Self {
+            inline_width: if inline_width.raw() <= 0 {
+                LayoutUnit::from_px(1)
+            } else {
+                inline_width
+            },
+            inset_left: self.inset_left + geometry.margin_left + geometry.padding_left,
+            inset_right: self.inset_right + geometry.padding_right + geometry.margin_right,
+        }
+    }
+}
+
+fn layout_blocks(chapter: &ChapterIr, constraints: LayoutConstraints) -> Vec<LayoutBlock> {
     let mut blocks = Vec::new();
-    collect_blocks(chapter, chapter.root, 0, None, &mut blocks);
+    collect_blocks(
+        chapter,
+        chapter.root,
+        0,
+        None,
+        ContainingBlock::root(constraints),
+        &mut blocks,
+    );
     blocks
 }
 
@@ -1703,6 +2037,7 @@ fn collect_blocks(
     node_id: NodeId,
     depth: u32,
     marker: Option<Arc<str>>,
+    containing: ContainingBlock,
     blocks: &mut Vec<LayoutBlock>,
 ) {
     let Some(node) = chapter.nodes.get(node_id) else {
@@ -1714,8 +2049,11 @@ fn collect_blocks(
             node_id,
             BlockKind::Paragraph,
             *text,
-            depth,
-            marker,
+            LeafLayoutContext {
+                depth,
+                marker,
+                containing,
+            },
             blocks,
         ),
         DocumentNode::Heading(heading) => push_text_block(
@@ -1723,21 +2061,38 @@ fn collect_blocks(
             node_id,
             BlockKind::Heading(heading.level),
             heading.content,
-            depth,
-            marker,
+            LeafLayoutContext {
+                depth,
+                marker,
+                containing,
+            },
             blocks,
         ),
         DocumentNode::List(list) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, list.style, containing);
             for (index, child) in list.children.iter().enumerate() {
                 let marker = if list.ordered {
                     Arc::from(format!("{}.", index + 1))
                 } else {
                     Arc::from("•")
                 };
-                collect_blocks(chapter, *child, depth + 1, Some(marker), blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth + 1,
+                    Some(marker),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::ListItem(item) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, item.style, containing);
             if item.children.is_empty() {
                 blocks.push(layout_placeholder(
                     chapter,
@@ -1746,14 +2101,26 @@ fn collect_blocks(
                     item.style,
                     "empty-list-item",
                     depth,
+                    child_containing,
                 ));
             }
             let mut pending_marker = marker;
             for child in &item.children {
-                collect_blocks(chapter, *child, depth, pending_marker.take(), blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth,
+                    pending_marker.take(),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::BlockQuote(container) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, container.style, containing);
             if container.children.is_empty() {
                 blocks.push(layout_placeholder(
                     chapter,
@@ -1762,13 +2129,26 @@ fn collect_blocks(
                     container.style,
                     "blockquote",
                     depth + 1,
+                    child_containing,
                 ));
             }
+            let mut pending_marker = marker;
             for child in &container.children {
-                collect_blocks(chapter, *child, depth + 1, None, blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth + 1,
+                    pending_marker.take(),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::Figure(container) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, container.style, containing);
             if container.children.is_empty() {
                 blocks.push(layout_placeholder(
                     chapter,
@@ -1777,16 +2157,38 @@ fn collect_blocks(
                     container.style,
                     "container",
                     depth,
+                    child_containing,
                 ));
             }
+            let mut pending_marker = marker;
             for child in &container.children {
-                collect_blocks(chapter, *child, depth, None, blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth,
+                    pending_marker.take(),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::Container(container) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, container.style, containing);
+            let mut pending_marker = marker;
             for child in &container.children {
-                collect_blocks(chapter, *child, depth, None, blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth,
+                    pending_marker.take(),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::Table(container) => {
             blocks.push(layout_placeholder(
@@ -1796,30 +2198,51 @@ fn collect_blocks(
                 container.style,
                 "unsupported:table",
                 depth,
+                containing,
             ));
             for child in &container.children {
-                collect_blocks(chapter, *child, depth + 1, None, blocks);
+                collect_blocks(chapter, *child, depth + 1, None, containing, blocks);
             }
         }
-        DocumentNode::Image(image) => blocks.push(layout_image(chapter, node_id, image, depth)),
+        DocumentNode::Image(image) => {
+            blocks.push(layout_image(chapter, node_id, image, depth, containing));
+        }
         DocumentNode::Divider => blocks.push(LayoutBlock {
             node_id,
             kind: BlockKind::Divider,
             content: LayoutBlockContent::Divider,
-            style: ComputedLayoutStyle::for_kind(BlockKind::Divider, depth),
+            style: with_containing_insets(
+                ComputedLayoutStyle::for_kind(BlockKind::Divider, depth),
+                containing,
+            ),
             source_range: chapter.source_map.get(node_id),
         }),
         DocumentNode::ForcedBreak => blocks.push(LayoutBlock {
             node_id,
             kind: BlockKind::ForcedBreak,
             content: LayoutBlockContent::ForcedBreak,
-            style: ComputedLayoutStyle::for_kind(BlockKind::ForcedBreak, depth),
+            style: with_containing_insets(
+                ComputedLayoutStyle::for_kind(BlockKind::ForcedBreak, depth),
+                containing,
+            ),
             source_range: chapter.source_map.get(node_id),
         }),
         DocumentNode::Footnote(note) => {
+            let start = blocks.len();
+            let (geometry, child_containing) =
+                container_geometry(&chapter.styles, note.style, containing);
+            let mut pending_marker = marker;
             for child in &note.children {
-                collect_blocks(chapter, *child, depth + 1, None, blocks);
+                collect_blocks(
+                    chapter,
+                    *child,
+                    depth + 1,
+                    pending_marker.take(),
+                    child_containing,
+                    blocks,
+                );
             }
+            apply_container_vertical_geometry(blocks, start, geometry);
         }
         DocumentNode::Unsupported(unsupported) => {
             blocks.push(layout_placeholder(
@@ -1829,12 +2252,74 @@ fn collect_blocks(
                 unsupported.style,
                 &format!("unsupported:{}", unsupported.element),
                 depth,
+                containing,
             ));
             for child in &unsupported.children {
-                collect_blocks(chapter, *child, depth + 1, None, blocks);
+                collect_blocks(chapter, *child, depth + 1, None, containing, blocks);
             }
         }
     }
+}
+
+fn container_geometry(
+    styles: &StyleTable,
+    style_id: crate::core::StyleId,
+    containing: ContainingBlock,
+) -> (UsedBoxGeometry, ContainingBlock) {
+    let geometry = styles
+        .get(style_id)
+        .map_or_else(UsedBoxGeometry::default, |style| {
+            let font_size = style
+                .properties
+                .get("font-size")
+                .and_then(|value| parse_px(value))
+                .unwrap_or(LayoutUnit::from_px(16));
+            UsedBoxGeometry::from_document(style, font_size, containing.inline_width)
+        });
+    (geometry, containing.nested(geometry))
+}
+
+fn apply_container_vertical_geometry(
+    blocks: &mut [LayoutBlock],
+    start: usize,
+    geometry: UsedBoxGeometry,
+) {
+    let Some(first) = blocks.get_mut(start) else {
+        return;
+    };
+    if geometry.padding_top.raw() == 0 {
+        first.style.margin_top = collapse_margins(geometry.margin_top, first.style.margin_top);
+    } else {
+        first.style.padding_top += geometry.padding_top + first.style.margin_top;
+        first.style.margin_top = geometry.margin_top;
+    }
+    let Some(last) = blocks.last_mut() else {
+        return;
+    };
+    if geometry.padding_bottom.raw() == 0 {
+        last.style.margin_bottom =
+            collapse_margins(last.style.margin_bottom, geometry.margin_bottom);
+    } else {
+        last.style.padding_bottom += geometry.padding_bottom + last.style.margin_bottom;
+        last.style.margin_bottom = geometry.margin_bottom;
+    }
+}
+
+fn collapse_margins(first: LayoutUnit, second: LayoutUnit) -> LayoutUnit {
+    match (first.raw() >= 0, second.raw() >= 0) {
+        (true, true) => first.max(second),
+        (false, false) => first.min(second),
+        _ => first + second,
+    }
+}
+
+fn with_containing_insets(
+    mut style: ComputedLayoutStyle,
+    containing: ContainingBlock,
+) -> ComputedLayoutStyle {
+    style.block_indent_left += containing.inset_left;
+    style.block_indent_right += containing.inset_right;
+    style
 }
 
 fn push_text_block(
@@ -1842,8 +2327,7 @@ fn push_text_block(
     node_id: NodeId,
     kind: BlockKind,
     text: BlockText,
-    depth: u32,
-    marker: Option<Arc<str>>,
+    context: LeafLayoutContext,
     blocks: &mut Vec<LayoutBlock>,
 ) {
     let Some(value) = chapter.text_pool.get(text.text) else {
@@ -1854,9 +2338,17 @@ fn push_text_block(
         kind,
         content: LayoutBlockContent::Text {
             text: Arc::from(value),
-            marker,
+            marker: context.marker,
         },
-        style: ComputedLayoutStyle::from_document(&chapter.styles, text.style, kind, depth),
+        style: ComputedLayoutStyle::from_document(
+            &chapter.styles,
+            text.style,
+            kind,
+            context.depth,
+            context.containing.inline_width,
+            context.containing.inset_left,
+            context.containing.inset_right,
+        ),
         source_range: chapter.source_map.get(node_id),
     });
 }
@@ -1868,12 +2360,21 @@ fn layout_placeholder(
     style_id: crate::core::StyleId,
     label: &str,
     depth: u32,
+    containing: ContainingBlock,
 ) -> LayoutBlock {
     LayoutBlock {
         node_id,
         kind,
         content: LayoutBlockContent::Unsupported(Arc::from(label)),
-        style: ComputedLayoutStyle::from_document(&chapter.styles, style_id, kind, depth),
+        style: ComputedLayoutStyle::from_document(
+            &chapter.styles,
+            style_id,
+            kind,
+            depth,
+            containing.inline_width,
+            containing.inset_left,
+            containing.inset_right,
+        ),
         source_range: chapter.source_map.get(node_id),
     }
 }
@@ -1883,6 +2384,7 @@ fn layout_image(
     node_id: NodeId,
     image: &ImageNode,
     depth: u32,
+    containing: ContainingBlock,
 ) -> LayoutBlock {
     LayoutBlock {
         node_id,
@@ -1897,6 +2399,9 @@ fn layout_image(
             image.style,
             BlockKind::Image,
             depth,
+            containing.inline_width,
+            containing.inset_left,
+            containing.inset_right,
         ),
         source_range: chapter.source_map.get(node_id),
     }
@@ -2088,8 +2593,13 @@ fn should_keep_with_next(
 }
 
 fn block_available_width(constraints: LayoutConstraints, style: ComputedLayoutStyle) -> LayoutUnit {
-    let width =
-        constraints.content_width() - style.block_indent - style.padding_start - style.padding_end;
+    let width = constraints.content_width()
+        - style.block_indent_left
+        - style.margin_left
+        - style.padding_left
+        - style.padding_right
+        - style.margin_right
+        - style.block_indent_right;
     if width.raw() <= 0 {
         LayoutUnit::from_px(1)
     } else {
@@ -2097,8 +2607,27 @@ fn block_available_width(constraints: LayoutConstraints, style: ComputedLayoutSt
     }
 }
 
+fn measurement_available_width(
+    constraints: LayoutConstraints,
+    style: ComputedLayoutStyle,
+) -> LayoutUnit {
+    let width = block_available_width(constraints, style) - style.text_indent.max(LayoutUnit::ZERO);
+    if width.raw() <= 0 {
+        LayoutUnit::from_px(1)
+    } else {
+        width
+    }
+}
+
+fn first_line_available_width(
+    constraints: LayoutConstraints,
+    style: ComputedLayoutStyle,
+) -> LayoutUnit {
+    measurement_available_width(constraints, style)
+}
+
 fn block_x(constraints: LayoutConstraints, style: ComputedLayoutStyle) -> LayoutUnit {
-    constraints.margin_start + style.block_indent + style.padding_start
+    constraints.margin_start + style.block_indent_left + style.margin_left + style.padding_left
 }
 
 fn aligned_x(
@@ -2247,7 +2776,11 @@ fn config_fingerprint(constraints: LayoutConstraints) -> u64 {
 }
 
 fn request_fingerprint(text: &str, style: ComputedLayoutStyle, width: LayoutUnit) -> u64 {
-    let mut hash = config_fingerprint(LayoutConstraints::new(width, style.line_height));
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [width.raw(), style.font_size.raw(), style.line_height.raw()] {
+        hash ^= value as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -2722,7 +3255,7 @@ mod tests {
     }
 
     #[test]
-    fn page_scene_ignores_document_geometry_css() {
+    fn page_scene_applies_document_geometry_css() {
         let plain = chapter_with_paragraph("geometry must stay stable");
         let mut styled = chapter_with_paragraph("geometry must stay stable");
         let style = document::ComputedStyle::new()
@@ -2768,7 +3301,212 @@ mod tests {
             .flat_map(|page| page.fragments.iter().map(|fragment| fragment.rect))
             .collect::<Vec<_>>();
 
-        assert_eq!(styled_rects, plain_rects);
+        assert_ne!(styled_rects, plain_rects);
+        assert_eq!(styled_rects[0].x, LayoutUnit::from_px(174));
+        assert_eq!(styled_rects[0].y, LayoutUnit::from_px(144));
+        assert!(styled_rects[0].width <= LayoutUnit::from_px(92));
+
+        let batch = prepare_measure_batch(&styled, LayoutOptions::default());
+        assert_eq!(batch.requests[0].available_width, LayoutUnit::from_px(92));
+        assert_eq!(batch.requests[0].max_width, LayoutUnit::from_px(92));
+    }
+
+    #[test]
+    fn nested_container_geometry_drives_host_measurement_and_page_scene() {
+        let mut chapter = empty_chapter();
+        let paragraph_style = chapter
+            .styles
+            .intern(
+                document::ComputedStyle::new()
+                    .with_property("font-size", "20px")
+                    .with_property("text-indent", "2em"),
+            )
+            .expect("paragraph style");
+        let range = chapter
+            .text_pool
+            .push("nested contents entry uses host measurement")
+            .expect("text");
+        let paragraph = chapter
+            .nodes
+            .push(DocumentNode::Paragraph(BlockText {
+                text: TextRange {
+                    start: range.start,
+                    end: range.end,
+                },
+                style: paragraph_style,
+            }))
+            .expect("paragraph");
+        let inner = chapter
+            .nodes
+            .push(DocumentNode::Container(ContainerNode {
+                children: vec![paragraph],
+                style: StyleId::new(0),
+            }))
+            .expect("inner container");
+        let container_style = chapter
+            .styles
+            .intern(
+                document::ComputedStyle::new()
+                    .with_property("font-size", "20px")
+                    .with_property("margin", "4.8em 10% .32em 3.125%")
+                    .with_property("padding", "1em 2%"),
+            )
+            .expect("container style");
+        let outer = chapter
+            .nodes
+            .push(DocumentNode::Container(ContainerNode {
+                children: vec![inner],
+                style: container_style,
+            }))
+            .expect("outer container");
+        set_root_children(&mut chapter, vec![outer]);
+        chapter.rebuild_utf16_index();
+
+        let constraints =
+            LayoutConstraints::new(LayoutUnit::from_px(400), LayoutUnit::from_px(500))
+                .with_margin(LayoutUnit::from_px(40));
+        let options = LayoutOptions::new(constraints);
+        let prepared = HostMeasuredLayout::prepare(chapter, options);
+        let request = &prepared.measure_batch().requests[0];
+        let containing_width = LayoutUnit::from_px(320);
+        let margin_left = LayoutUnit::from_f64_px(10.0);
+        let margin_right = LayoutUnit::from_f64_px(32.0);
+        let padding_inline = LayoutUnit::from_f64_px(6.4);
+        let text_indent = LayoutUnit::from_px(40);
+        let expected_width = containing_width
+            - margin_left
+            - margin_right
+            - padding_inline
+            - padding_inline
+            - text_indent;
+
+        assert_eq!(request.available_width, expected_width);
+        assert_eq!(request.max_width, expected_width);
+
+        let fallback = DefaultTextBackend::new();
+        let measured = fallback
+            .measure_batch(prepared.measure_batch(), &CancellationToken::new())
+            .expect("measure nested geometry");
+        let pages = prepared
+            .resume(MeasuredBatch::new(
+                TextBackendId(0x686f_7374),
+                FontSetFingerprint(0x666f_6e74),
+                measured.results,
+            ))
+            .expect("resume host-measured geometry");
+        let first_line = pages.pages[0]
+            .fragments
+            .iter()
+            .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
+            .expect("first line");
+
+        assert_eq!(
+            first_line.rect.x,
+            LayoutUnit::from_px(40) + margin_left + padding_inline + text_indent
+        );
+        assert_eq!(first_line.rect.y, LayoutUnit::from_px(160));
+    }
+
+    #[test]
+    fn contents_container_margins_preserve_first_page_space_and_collapse_between_entries() {
+        let mut chapter = empty_chapter();
+        let first_text = push_paragraph(&mut chapter, "Contents");
+        let second_text = push_paragraph(&mut chapter, "Chapter one");
+        let first_style = chapter
+            .styles
+            .intern(
+                document::ComputedStyle::new()
+                    .with_property("margin-top", "32px")
+                    .with_property("margin-bottom", "10px"),
+            )
+            .expect("first entry style");
+        let second_style = chapter
+            .styles
+            .intern(document::ComputedStyle::new().with_property("margin-top", "24px"))
+            .expect("second entry style");
+        let first = chapter
+            .nodes
+            .push(DocumentNode::Container(ContainerNode {
+                children: vec![first_text],
+                style: first_style,
+            }))
+            .expect("first entry");
+        let second = chapter
+            .nodes
+            .push(DocumentNode::Container(ContainerNode {
+                children: vec![second_text],
+                style: second_style,
+            }))
+            .expect("second entry");
+        set_root_children(&mut chapter, vec![first, second]);
+
+        let pages = paginate_chapter(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::new(LayoutUnit::from_px(300), LayoutUnit::from_px(200)),
+        )
+        .expect("paginate contents entries");
+        let lines = pages.pages[0]
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.kind == SceneFragmentKind::TextLine)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0].rect.y, LayoutUnit::from_px(32));
+        assert_eq!(lines[1].rect.y, LayoutUnit::from_px(78));
+    }
+
+    #[test]
+    fn paragraph_continuation_suppresses_top_margin_and_padding() {
+        let mut chapter = chapter_with_paragraph(
+            "one two three four five six seven eight nine ten eleven twelve thirteen",
+        );
+        let style = chapter
+            .styles
+            .intern(
+                document::ComputedStyle::new()
+                    .with_property("margin-top", "40px")
+                    .with_property("padding-top", "20px"),
+            )
+            .expect("style");
+        let paragraph = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                matches!(node, DocumentNode::Paragraph(_)).then_some(node_id)
+            })
+            .expect("paragraph");
+        if let Some(DocumentNode::Paragraph(text)) = chapter.nodes.get_mut(paragraph) {
+            text.style = style;
+        }
+
+        let pages = paginate_chapter_with_options(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutOptions {
+                constraints: LayoutConstraints::new(
+                    LayoutUnit::from_px(90),
+                    LayoutUnit::from_px(100),
+                ),
+                max_pages: 16,
+                ..LayoutOptions::default()
+            },
+        )
+        .expect("paginate continuation");
+        let first_lines = pages
+            .pages
+            .iter()
+            .map(|page| {
+                page.fragments
+                    .iter()
+                    .find(|fragment| fragment.kind == SceneFragmentKind::TextLine)
+                    .expect("page text line")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(first_lines.len() > 1);
+        assert_eq!(first_lines[0].rect.y, LayoutUnit::from_px(60));
+        assert_eq!(first_lines[1].rect.y, LayoutUnit::ZERO);
     }
 
     #[test]

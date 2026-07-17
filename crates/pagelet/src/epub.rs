@@ -1857,16 +1857,58 @@ fn parse_css_declarations(input: &str) -> (Vec<CssDeclaration>, Vec<CssUnsupport
             continue;
         }
         if is_supported_css_property(&property) {
-            declarations.push(CssDeclaration {
-                property,
-                value,
-                important,
-            });
+            if matches!(property.as_str(), "margin" | "padding") {
+                if let Some(expanded) = expand_box_shorthand(&property, &value, important) {
+                    declarations.extend(expanded);
+                } else {
+                    declarations.push(CssDeclaration {
+                        property,
+                        value,
+                        important,
+                    });
+                }
+            } else {
+                declarations.push(CssDeclaration {
+                    property,
+                    value,
+                    important,
+                });
+            }
         } else {
             unsupported.push(CssUnsupportedDeclaration { property, value });
         }
     }
     (declarations, unsupported)
+}
+
+fn expand_box_shorthand(
+    property: &str,
+    value: &str,
+    important: bool,
+) -> Option<Vec<CssDeclaration>> {
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    let [top, right, bottom, left] = match values.as_slice() {
+        [all] => [*all, *all, *all, *all],
+        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
+        [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
+        [top, right, bottom, left] => [*top, *right, *bottom, *left],
+        _ => return None,
+    };
+    Some(
+        [
+            ("top", top),
+            ("right", right),
+            ("bottom", bottom),
+            ("left", left),
+        ]
+        .into_iter()
+        .map(|(side, value)| CssDeclaration {
+            property: format!("{property}-{side}"),
+            value: value.to_owned(),
+            important,
+        })
+        .collect(),
+    )
 }
 
 fn is_supported_css_property(property: &str) -> bool {
@@ -2833,6 +2875,7 @@ impl ChapterBuilder<'_> {
             parent_font,
             root_font_size,
         );
+        resolve_font_relative_geometry(&mut style, font_context.font_size, root_font_size);
         let style_id = self.chapter.styles.intern(style.clone())?;
         self.computed_styles.insert(tree_node_id, (style_id, style));
         self.font_contexts.insert(tree_node_id, font_context);
@@ -3146,6 +3189,61 @@ fn resolve_font_metrics(
     }
 }
 
+fn resolve_font_relative_geometry(
+    style: &mut document::ComputedStyle,
+    font_size: LayoutUnit,
+    root_font_size: LayoutUnit,
+) {
+    const GEOMETRY_PROPERTIES: [&str; 9] = [
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+        "text-indent",
+    ];
+    for property in GEOMETRY_PROPERTIES {
+        let Some(value) = style.properties.get(property).cloned() else {
+            continue;
+        };
+        let Some(resolved) = resolve_font_relative_geometry_length(
+            &value,
+            font_size,
+            root_font_size,
+            !property.starts_with("padding"),
+        ) else {
+            continue;
+        };
+        style
+            .properties
+            .insert(Arc::from(property), Arc::from(format_css_px(resolved)));
+    }
+}
+
+fn resolve_font_relative_geometry_length(
+    value: &str,
+    em_base: LayoutUnit,
+    rem_base: LayoutUnit,
+    allow_negative: bool,
+) -> Option<LayoutUnit> {
+    let value = value.trim().to_ascii_lowercase();
+    let parsed = if let Some(number) = value.strip_suffix("rem") {
+        parse_signed_css_number_value(number).map(|factor| scale_layout_unit(rem_base, factor))
+    } else if let Some(number) = value.strip_suffix("em") {
+        parse_signed_css_number_value(number).map(|factor| scale_layout_unit(em_base, factor))
+    } else if let Some(number) = value.strip_suffix("px") {
+        parse_signed_css_number_value(number).map(LayoutUnit::from_f64_px)
+    } else if value == "0" {
+        Some(LayoutUnit::ZERO)
+    } else {
+        None
+    }?;
+    (allow_negative || parsed.raw() >= 0).then_some(parsed)
+}
+
 fn resolve_font_size(
     value: &str,
     parent_font_size: LayoutUnit,
@@ -3223,6 +3321,14 @@ fn parse_css_number_value(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_signed_css_number_value(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 fn scale_layout_unit(value: LayoutUnit, factor: f64) -> LayoutUnit {
@@ -4270,7 +4376,13 @@ mod tests {
         let stylesheet = parse_css(
             r#"
             @import "theme.css";
-            p.lead { font-weight: normal; color: red; }
+            p.lead {
+              font-weight: normal;
+              color: red;
+              margin: 1em 2em 3em 4em;
+              margin-left: 5em;
+              padding: 6px 7px;
+            }
             #main .lead { font-weight: bold; }
             section p { text-indent: 2em; }
             "#,
@@ -4301,6 +4413,33 @@ mod tests {
         assert_eq!(style_value(&computed, "font-weight"), Some("bold"));
         assert_eq!(style_value(&computed, "font-style"), Some("italic"));
         assert_eq!(style_value(&computed, "text-indent"), Some("2em"));
+        assert_eq!(style_value(&computed, "margin"), None);
+        assert_eq!(style_value(&computed, "margin-top"), Some("1em"));
+        assert_eq!(style_value(&computed, "margin-right"), Some("2em"));
+        assert_eq!(style_value(&computed, "margin-bottom"), Some("3em"));
+        assert_eq!(style_value(&computed, "margin-left"), Some("5em"));
+        assert_eq!(style_value(&computed, "padding-top"), Some("6px"));
+        assert_eq!(style_value(&computed, "padding-right"), Some("7px"));
+        assert_eq!(style_value(&computed, "padding-bottom"), Some("6px"));
+        assert_eq!(style_value(&computed, "padding-left"), Some("7px"));
+    }
+
+    #[test]
+    fn css_box_shorthand_expands_one_to_four_values() {
+        for (value, expected) in [
+            ("1px", ["1px", "1px", "1px", "1px"]),
+            ("1px 2px", ["1px", "2px", "1px", "2px"]),
+            ("1px 2px 3px", ["1px", "2px", "3px", "2px"]),
+            ("1px 2px 3px 4px", ["1px", "2px", "3px", "4px"]),
+        ] {
+            let (declarations, unsupported) = parse_css_declarations(&format!("margin: {value}"));
+            assert!(unsupported.is_empty());
+            let values = declarations
+                .iter()
+                .map(|declaration| declaration.value.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected);
+        }
     }
 
     #[test]
@@ -4360,6 +4499,111 @@ mod tests {
 
         assert_eq!(line_heights.first(), Some(&LayoutUnit::from_px(75)));
         assert_eq!(line_heights.last(), Some(&LayoutUnit::from_px(60)));
+    }
+
+    #[test]
+    fn chapter_styles_resolve_font_relative_geometry_and_preserve_percentages() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Relative geometry",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml">
+              <head>
+                <title>Chapter 1</title>
+                <style>
+                  html { font-size: 20px; }
+                  section {
+                    font-size: 150%;
+                    text-indent: 2em;
+                    padding: .5em 2%;
+                  }
+                  section p {
+                    font-size: 2em;
+                    margin: 1em 10% 2rem 5%;
+                  }
+                </style>
+              </head>
+              <body>
+                <section><p>Geometry paragraph.</p></section>
+              </body>
+            </html>"#,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let paragraph = first_paragraph_style(&chapter).expect("paragraph style");
+
+        assert_eq!(style_value(paragraph, "font-size"), Some("60px"));
+        assert_eq!(style_value(paragraph, "text-indent"), Some("60px"));
+        assert_eq!(style_value(paragraph, "margin-top"), Some("60px"));
+        assert_eq!(style_value(paragraph, "margin-right"), Some("10%"));
+        assert_eq!(style_value(paragraph, "margin-bottom"), Some("40px"));
+        assert_eq!(style_value(paragraph, "margin-left"), Some("5%"));
+
+        let section = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(_, node)| match node {
+                document::DocumentNode::Container(container)
+                    if chapter
+                        .styles
+                        .get(container.style)
+                        .is_some_and(|style| style.properties.contains_key("padding-top")) =>
+                {
+                    chapter.styles.get(container.style)
+                }
+                _ => None,
+            })
+            .expect("section style");
+        assert_eq!(style_value(section, "padding-top"), Some("15px"));
+        assert_eq!(style_value(section, "padding-right"), Some("2%"));
+        assert_eq!(style_value(section, "padding-bottom"), Some("15px"));
+        assert_eq!(style_value(section, "padding-left"), Some("2%"));
+
+        let options = crate::layout::LayoutOptions::default();
+        let content_width = options.constraints.content_width();
+        let section_padding = LayoutUnit::from_f64_px(content_width.to_f64_px() * 2.0 / 100.0);
+        let paragraph_containing_width = content_width - section_padding - section_padding;
+        let paragraph_margin_right =
+            LayoutUnit::from_f64_px(paragraph_containing_width.to_f64_px() * 10.0 / 100.0);
+        let paragraph_margin_left =
+            LayoutUnit::from_f64_px(paragraph_containing_width.to_f64_px() * 5.0 / 100.0);
+        let expected_measurement_width = paragraph_containing_width
+            - paragraph_margin_right
+            - paragraph_margin_left
+            - LayoutUnit::from_px(60);
+        let batch = crate::layout::prepare_measure_batch(&chapter, options);
+
+        assert_eq!(
+            batch.requests[0].available_width,
+            expected_measurement_width
+        );
+
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            options,
+        )
+        .expect("paginate geometry fixture");
+        let first_line = pages.pages[0]
+            .fragments
+            .iter()
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::TextLine)
+            .expect("first text line");
+        assert_eq!(
+            first_line.rect.x,
+            options.constraints.margin_start
+                + section_padding
+                + paragraph_margin_left
+                + LayoutUnit::from_px(60)
+        );
+        assert_eq!(
+            first_line.rect.y,
+            options.constraints.margin_top + LayoutUnit::from_px(75)
+        );
     }
 
     #[test]
