@@ -508,8 +508,8 @@ impl ChapterIr {
             return;
         };
         match node {
-            DocumentNode::Paragraph(text) => self.push_block_text(*text, out),
-            DocumentNode::Heading(node) => self.push_block_text(node.content, out),
+            DocumentNode::Paragraph(text) => self.push_block_text(text, out),
+            DocumentNode::Heading(node) => self.push_block_text(&node.content, out),
             DocumentNode::List(node) => {
                 for child in &node.children {
                     self.push_visible_text(*child, out);
@@ -538,7 +538,7 @@ impl ChapterIr {
         }
     }
 
-    fn push_block_text(&self, text: BlockText, out: &mut String) {
+    fn push_block_text(&self, text: &BlockText, out: &mut String) {
         if let Some(value) = self.text_pool.get(text.text) {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
@@ -717,14 +717,31 @@ impl DocumentNode {
 }
 
 /// Text-bearing block node payload.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct BlockText {
+    /// UTF-8 text range in the chapter text pool.
     pub text: TextRange,
+    /// Block-level computed style.
     pub style: StyleId,
+    /// Paragraph-local inline style runs.
+    pub style_runs: Vec<InlineStyleRun>,
+}
+
+/// One computed inline style range inside a text-bearing block.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct InlineStyleRun {
+    /// Paragraph-local UTF-8 byte offset.
+    pub start: u32,
+    /// Exclusive paragraph-local UTF-8 byte offset.
+    pub end: u32,
+    /// Computed style for this run.
+    pub style: StyleId,
+    /// XHTML source range that produced this run.
+    pub source_range: Option<SourceRange>,
 }
 
 /// Heading payload.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct HeadingNode {
     pub level: u8,
     pub content: BlockText,
@@ -847,6 +864,8 @@ pub struct Anchor {
     pub document_href: Arc<str>,
     pub fragment: Arc<str>,
     pub node_id: NodeId,
+    /// Paragraph-local UTF-8 offset for inline anchors.
+    pub utf8_byte_offset: u32,
     pub source_range: Option<SourceRange>,
 }
 
@@ -854,6 +873,8 @@ pub struct Anchor {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LinkTarget {
     pub source_node: NodeId,
+    /// Paragraph-local UTF-8 range covered by the link.
+    pub text_range: Option<std::ops::Range<u32>>,
     pub source_range: Option<SourceRange>,
     pub href: Arc<str>,
     pub resolved_document: Option<Arc<str>>,
@@ -1318,9 +1339,10 @@ mod tests {
         let text = BlockText {
             text: TextRange { start: 0, end: 5 },
             style: StyleId::new(0),
+            style_runs: Vec::new(),
         };
         let nodes = vec![
-            DocumentNode::Paragraph(text),
+            DocumentNode::Paragraph(text.clone()),
             DocumentNode::Heading(HeadingNode {
                 level: 1,
                 content: text,
@@ -1350,6 +1372,7 @@ mod tests {
             .push(DocumentNode::Paragraph(BlockText {
                 text: range,
                 style: StyleId::new(0),
+                style_runs: Vec::new(),
             }))
             .expect("node");
 
@@ -1380,6 +1403,7 @@ mod tests {
             .push(DocumentNode::Paragraph(BlockText {
                 text,
                 style: StyleId::new(0),
+                style_runs: Vec::new(),
             }))
             .expect("paragraph");
         if let Some(DocumentNode::Container(node)) = chapter.nodes.nodes.get_mut(0) {

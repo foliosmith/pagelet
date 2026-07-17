@@ -1314,7 +1314,10 @@ fn prepare_measure_batch_from_blocks(
         .iter()
         .enumerate()
         .filter_map(|(index, block)| {
-            let LayoutBlockContent::Text { text, .. } = &block.content else {
+            let LayoutBlockContent::Text {
+                text, style_runs, ..
+            } = &block.content
+            else {
                 return None;
             };
             Some(measure_request(
@@ -1322,6 +1325,7 @@ fn prepare_measure_batch_from_blocks(
                 block.node_id.get(),
                 text,
                 &block.style,
+                style_runs,
                 measurement_available_width(constraints, &block.style),
             ))
         })
@@ -1733,6 +1737,7 @@ impl Fragmentable for ParagraphLayout {
             self.node_id.get(),
             &self.text,
             &self.style,
+            &[],
             measurement_available_width(context.options.constraints, &self.style),
         );
         let measured = measure_text(context.text_backend, context.cancel, &request, &self.style)?;
@@ -1754,6 +1759,7 @@ impl Fragmentable for ParagraphLayout {
             self.node_id.get(),
             &self.text,
             &self.style,
+            &[],
             measurement_available_width(context.options.constraints, &self.style),
         );
         let measured = measure_text(context.text_backend, context.cancel, &request, &self.style)?;
@@ -1879,7 +1885,11 @@ fn paginate_page_from_blocks(
                     next_block_token(token_context, blocks, index + 1, start.page_index + 1);
                 break;
             }
-            LayoutBlockContent::Text { text, marker } => {
+            LayoutBlockContent::Text {
+                text,
+                marker,
+                style_runs,
+            } => {
                 let available_width =
                     measurement_available_width(options.constraints, &block.style);
                 let request = measure_request(
@@ -1887,6 +1897,7 @@ fn paginate_page_from_blocks(
                     block.node_id.get(),
                     text,
                     &block.style,
+                    style_runs,
                     available_width,
                 );
                 let measured = measure_text(text_backend, cancel, &request, &block.style)?;
@@ -2023,8 +2034,18 @@ fn paginate_page_from_blocks(
         next_token = None;
     }
 
-    page.links = link_regions(chapter, &page.text_paints, &page.fragments);
-    page.anchors = anchor_regions(chapter, &page.text_paints, &page.fragments);
+    page.links = link_regions(
+        chapter,
+        &page.text_paints,
+        &page.paragraphs,
+        &page.fragments,
+    );
+    page.anchors = anchor_regions(
+        chapter,
+        &page.text_paints,
+        &page.paragraphs,
+        &page.fragments,
+    );
     page.selections = selection_maps(&page.text_paints, &page.paragraphs, &page.fragments);
     page.semantics = semantic_nodes(&page.text_paints, &page.paragraphs, &page.fragments);
     page.diagnostics = diagnostics;
@@ -2470,6 +2491,7 @@ enum LayoutBlockContent {
     Text {
         text: Arc<str>,
         marker: Option<Arc<str>>,
+        style_runs: Vec<TextStyleRun>,
     },
     Image(LayoutImage),
     Divider,
@@ -2549,7 +2571,7 @@ fn collect_blocks(
             chapter,
             node_id,
             BlockKind::Paragraph,
-            *text,
+            text,
             LeafLayoutContext {
                 depth,
                 marker,
@@ -2561,7 +2583,7 @@ fn collect_blocks(
             chapter,
             node_id,
             BlockKind::Heading(heading.level),
-            heading.content,
+            &heading.content,
             LeafLayoutContext {
                 depth,
                 marker,
@@ -2827,31 +2849,113 @@ fn push_text_block(
     chapter: &ChapterIr,
     node_id: NodeId,
     kind: BlockKind,
-    text: BlockText,
+    text: &BlockText,
     context: LeafLayoutContext,
     blocks: &mut Vec<LayoutBlock>,
 ) {
     let Some(value) = chapter.text_pool.get(text.text) else {
         return;
     };
+    let style = ComputedLayoutStyle::from_document(
+        &chapter.styles,
+        text.style,
+        kind,
+        context.depth,
+        context.containing.inline_width,
+        context.containing.inset_left,
+        context.containing.inset_right,
+    );
+    let style_runs = compile_inline_style_runs(
+        chapter,
+        text,
+        value,
+        kind,
+        context.depth,
+        context.containing,
+        &style,
+    );
     blocks.push(LayoutBlock {
         node_id,
         kind,
         content: LayoutBlockContent::Text {
             text: Arc::from(value),
             marker: context.marker,
+            style_runs,
         },
-        style: ComputedLayoutStyle::from_document(
-            &chapter.styles,
-            text.style,
-            kind,
-            context.depth,
-            context.containing.inline_width,
-            context.containing.inset_left,
-            context.containing.inset_right,
-        ),
+        style,
         source_range: chapter.source_map.get(node_id),
     });
+}
+
+fn compile_inline_style_runs(
+    chapter: &ChapterIr,
+    block: &BlockText,
+    text: &str,
+    kind: BlockKind,
+    depth: u32,
+    containing: ContainingBlock,
+    base_style: &ComputedLayoutStyle,
+) -> Vec<TextStyleRun> {
+    if block.style_runs.is_empty() {
+        return Vec::new();
+    }
+    let text_end = u32::try_from(text.len()).unwrap_or(u32::MAX);
+    let mut source_runs = block.style_runs.iter().collect::<Vec<_>>();
+    source_runs.sort_by_key(|run| (run.start, run.end));
+    let mut compiled = Vec::with_capacity(source_runs.len().saturating_add(2));
+    let mut cursor = 0_u32;
+    for run in source_runs {
+        let start = run.start.max(cursor).min(text_end);
+        let end = run.end.min(text_end);
+        let start_index = usize::try_from(start).unwrap_or(usize::MAX);
+        let end_index = usize::try_from(end).unwrap_or(usize::MAX);
+        if start >= end || !text.is_char_boundary(start_index) || !text.is_char_boundary(end_index)
+        {
+            continue;
+        }
+        if cursor < start {
+            push_compiled_text_run(&mut compiled, text_style_run(cursor, start, base_style));
+        }
+        let inline_style = ComputedLayoutStyle::from_document(
+            &chapter.styles,
+            run.style,
+            kind,
+            depth,
+            containing.inline_width,
+            containing.inset_left,
+            containing.inset_right,
+        );
+        push_compiled_text_run(&mut compiled, text_style_run(start, end, &inline_style));
+        cursor = end;
+    }
+    if cursor < text_end {
+        push_compiled_text_run(&mut compiled, text_style_run(cursor, text_end, base_style));
+    }
+    compiled
+}
+
+fn text_style_run(start: u32, end: u32, style: &ComputedLayoutStyle) -> TextStyleRun {
+    TextStyleRun {
+        start,
+        end,
+        font_size: style.font_size,
+        letter_spacing: style.letter_spacing,
+        fonts: style.font_candidates.clone(),
+    }
+}
+
+fn push_compiled_text_run(runs: &mut Vec<TextStyleRun>, run: TextStyleRun) {
+    if let Some(previous) = runs.last_mut() {
+        if previous.end == run.start
+            && previous.font_size == run.font_size
+            && previous.letter_spacing == run.letter_spacing
+            && previous.fonts == run.fonts
+        {
+            previous.end = run.end;
+            return;
+        }
+    }
+    runs.push(run);
 }
 
 fn layout_placeholder(
@@ -2930,18 +3034,17 @@ fn measure_request(
     paragraph_id: u32,
     text: &str,
     style: &ComputedLayoutStyle,
+    style_runs: &[TextStyleRun],
     width: LayoutUnit,
 ) -> MeasureRequest {
     let mut request = MeasureRequest::new(request_id, text, style.font_size, width);
     let text_end = u32::try_from(text.len()).unwrap_or(u32::MAX);
     request.paragraph_id = paragraph_id;
-    request.style_runs = vec![TextStyleRun {
-        start: 0,
-        end: text_end,
-        font_size: style.font_size,
-        letter_spacing: style.letter_spacing,
-        fonts: style.font_candidates.clone(),
-    }];
+    request.style_runs = if style_runs.is_empty() {
+        vec![text_style_run(0, text_end, style)]
+    } else {
+        style_runs.to_vec()
+    };
     request.locale = style.locale.clone();
     request.direction = style.direction;
     request.font_candidates = style.font_candidates.clone();
@@ -3211,6 +3314,7 @@ fn aligned_x(
 fn link_regions(
     chapter: &ChapterIr,
     text_paints: &[TextPaintFragment],
+    paragraphs: &[SceneParagraph],
     fragments: &[SceneFragment],
 ) -> Vec<LinkRegion> {
     let mut regions = Vec::new();
@@ -3219,7 +3323,22 @@ fn link_regions(
             .iter()
             .filter(|paint| paint.node_id == link.source_node)
         {
-            regions.push(link_region(link, paint.layout_rect));
+            if let Some(text_range) = &link.text_range {
+                if let Some(paragraph) = paragraphs
+                    .iter()
+                    .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+                {
+                    regions.extend(
+                        text_range_rects(paragraph, paint, text_range.clone())
+                            .into_iter()
+                            .map(|rect| link_region(link, rect)),
+                    );
+                } else {
+                    regions.push(link_region(link, paint.layout_rect));
+                }
+            } else {
+                regions.push(link_region(link, paint.layout_rect));
+            }
         }
         for fragment in fragments
             .iter()
@@ -3245,19 +3364,38 @@ fn link_region(link: &LinkTarget, rect: Rect) -> LinkRegion {
 fn anchor_regions(
     chapter: &ChapterIr,
     text_paints: &[TextPaintFragment],
+    paragraphs: &[SceneParagraph],
     fragments: &[SceneFragment],
 ) -> Vec<AnchorRegion> {
     let mut regions = Vec::new();
     for anchor in chapter.anchors.anchors.values() {
-        if let Some(paint) = text_paints
+        let mut text_region_added = false;
+        for paint in text_paints
             .iter()
-            .find(|paint| paint.node_id == anchor.node_id)
+            .filter(|paint| paint.node_id == anchor.node_id)
         {
-            regions.push(AnchorRegion {
-                rect: paint.layout_rect,
-                key: anchor.key.clone(),
-                node_id: anchor.node_id,
-            });
+            if let Some(paragraph) = paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == paint.paragraph_id)
+            {
+                if let Some(rect) = anchor_caret_rect(paragraph, paint, anchor.utf8_byte_offset) {
+                    regions.push(AnchorRegion {
+                        rect,
+                        key: anchor.key.clone(),
+                        node_id: anchor.node_id,
+                    });
+                    text_region_added = true;
+                }
+            } else {
+                regions.push(AnchorRegion {
+                    rect: paint.layout_rect,
+                    key: anchor.key.clone(),
+                    node_id: anchor.node_id,
+                });
+                text_region_added = true;
+            }
+        }
+        if text_region_added {
             continue;
         }
         if let Some(fragment) = fragments
@@ -3272,6 +3410,118 @@ fn anchor_regions(
         }
     }
     regions
+}
+
+fn text_range_rects(
+    paragraph: &SceneParagraph,
+    paint: &TextPaintFragment,
+    range: std::ops::Range<u32>,
+) -> Vec<Rect> {
+    let start = range.start.max(paint.visible_text_range.start);
+    let end = range.end.min(paint.visible_text_range.end);
+    if start >= end {
+        return Vec::new();
+    }
+    let first_line = paint.first_line;
+    let line_end = first_line.saturating_add(paint.line_count);
+    let mut rects = Vec::new();
+    let mut current: Option<(u32, Rect)> = None;
+    for cluster in paragraph.clusters.iter().filter(|cluster| {
+        cluster.text_end > start
+            && cluster.text_start < end
+            && cluster.line_index >= first_line
+            && cluster.line_index < line_end
+    }) {
+        let Some(line) = paragraph
+            .lines
+            .get(usize::try_from(cluster.line_index).unwrap_or(usize::MAX))
+        else {
+            continue;
+        };
+        let cluster_rect = Rect {
+            x: paint.paint_origin.x + line.layout_rect.x + cluster.x_start,
+            y: paint.paint_origin.y + line.layout_rect.y,
+            width: cluster.x_end - cluster.x_start,
+            height: line.layout_rect.height,
+        };
+        if let Some((line_index, rect)) = &mut current {
+            if *line_index == cluster.line_index {
+                let right = (rect.x + rect.width).max(cluster_rect.x + cluster_rect.width);
+                rect.x = rect.x.min(cluster_rect.x);
+                rect.width = right - rect.x;
+                continue;
+            }
+        }
+        if let Some((_, rect)) = current.take() {
+            if let Some(clipped) = intersect_rect(rect, paint.clip_rect) {
+                rects.push(clipped);
+            }
+        }
+        current = Some((cluster.line_index, cluster_rect));
+    }
+    if let Some((_, rect)) = current {
+        if let Some(clipped) = intersect_rect(rect, paint.clip_rect) {
+            rects.push(clipped);
+        }
+    }
+    rects
+}
+
+fn anchor_caret_rect(
+    paragraph: &SceneParagraph,
+    paint: &TextPaintFragment,
+    offset: u32,
+) -> Option<Rect> {
+    let is_paragraph_end = offset == paragraph.text_range.end;
+    if offset < paint.visible_text_range.start
+        || offset > paint.visible_text_range.end
+        || (offset == paint.visible_text_range.end && !is_paragraph_end)
+    {
+        return None;
+    }
+    let first_line = paint.first_line;
+    let line_end = first_line.saturating_add(paint.line_count);
+    let cluster =
+        paragraph
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.line_index >= first_line && cluster.line_index < line_end)
+            .find(|cluster| cluster.text_end > offset)
+            .or_else(|| {
+                paragraph.clusters.iter().rev().find(|cluster| {
+                    cluster.line_index >= first_line && cluster.line_index < line_end
+                })
+            })?;
+    let line = paragraph
+        .lines
+        .get(usize::try_from(cluster.line_index).unwrap_or(usize::MAX))?;
+    let x = if offset >= cluster.text_end {
+        cluster.x_end
+    } else {
+        cluster.x_start
+    };
+    intersect_rect(
+        Rect {
+            x: paint.paint_origin.x + line.layout_rect.x + x,
+            y: paint.paint_origin.y + line.layout_rect.y,
+            width: LayoutUnit::from_px(1),
+            height: line.layout_rect.height,
+        },
+        paint.clip_rect,
+    )
+}
+
+fn intersect_rect(first: Rect, second: Rect) -> Option<Rect> {
+    let left = first.x.max(second.x);
+    let top = first.y.max(second.y);
+    let right = (first.x + first.width).min(second.x + second.width);
+    let bottom = (first.y + first.height).min(second.y + second.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn selection_maps(
@@ -4628,6 +4878,7 @@ mod tests {
                     end: range.end,
                 },
                 style: paragraph_style,
+                style_runs: Vec::new(),
             }))
             .expect("paragraph");
         let inner = chapter
@@ -5024,6 +5275,7 @@ mod tests {
                     end: range.end,
                 },
                 style: StyleId::new(0),
+                style_runs: Vec::new(),
             }))
             .expect("paragraph")
     }

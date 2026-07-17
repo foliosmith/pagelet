@@ -435,6 +435,7 @@ fn push_chapter_ir_value(out: &mut String, chapter: &ChapterIr, level: usize) {
         push_json_str_prop(out, "document_href", &anchor.document_href, &mut first);
         push_json_str_prop(out, "fragment", &anchor.fragment, &mut first);
         push_json_u32_prop(out, "node_id", anchor.node_id.get(), &mut first);
+        push_json_u32_prop(out, "utf8_byte_offset", anchor.utf8_byte_offset, &mut first);
         push_json_source_range_prop(out, "source_range", anchor.source_range, &mut first);
         out.push('}');
         if index + 1 < chapter.anchors.anchors.len() {
@@ -461,6 +462,7 @@ fn push_chapter_ir_value(out: &mut String, chapter: &ChapterIr, level: usize) {
         );
         push_json_opt_str_prop(out, "fragment", link.fragment.as_deref(), &mut first);
         push_json_str_prop(out, "kind", link_kind_name(link.kind), &mut first);
+        push_json_text_range_prop(out, "text_range", link.text_range.as_ref(), &mut first);
         push_json_source_range_prop(out, "source_range", link.source_range, &mut first);
         out.push('}');
         if index + 1 < chapter.links.len() {
@@ -495,18 +497,20 @@ fn push_chapter_node_json(
 
     match node {
         DocumentNode::Paragraph(text) => {
-            push_json_str_prop(out, "text", block_text(chapter, *text), &mut first);
+            push_json_str_prop(out, "text", block_text(chapter, text), &mut first);
             push_json_u32_prop(out, "style", text.style.get(), &mut first);
+            push_json_inline_style_runs_prop(out, &text.style_runs, &mut first);
         }
         DocumentNode::Heading(heading) => {
             push_json_u8_prop(out, "level", heading.level, &mut first);
             push_json_str_prop(
                 out,
                 "text",
-                block_text(chapter, heading.content),
+                block_text(chapter, &heading.content),
                 &mut first,
             );
             push_json_u32_prop(out, "style", heading.content.style.get(), &mut first);
+            push_json_inline_style_runs_prop(out, &heading.content.style_runs, &mut first);
         }
         DocumentNode::List(list) => {
             push_json_bool_prop(out, "ordered", list.ordered, &mut first);
@@ -557,8 +561,30 @@ fn push_chapter_node_json(
     out.push('}');
 }
 
-fn block_text(chapter: &ChapterIr, text: crate::document::BlockText) -> &str {
+fn block_text<'a>(chapter: &'a ChapterIr, text: &crate::document::BlockText) -> &'a str {
     chapter.text_pool.get(text.text).unwrap_or("")
+}
+
+fn push_json_inline_style_runs_prop(
+    out: &mut String,
+    runs: &[crate::document::InlineStyleRun],
+    first: &mut bool,
+) {
+    push_json_prop_name(out, "style_runs", first);
+    out.push('[');
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push('{');
+        let mut first_run_field = true;
+        push_json_u32_prop(out, "start", run.start, &mut first_run_field);
+        push_json_u32_prop(out, "end", run.end, &mut first_run_field);
+        push_json_u32_prop(out, "style", run.style.get(), &mut first_run_field);
+        push_json_source_range_prop(out, "source_range", run.source_range, &mut first_run_field);
+        out.push('}');
+    }
+    out.push(']');
 }
 
 fn push_json_prop_name(out: &mut String, name: &str, first: &mut bool) {
@@ -629,6 +655,25 @@ fn push_json_source_range_prop(
     out: &mut String,
     name: &str,
     range: Option<SourceRange>,
+    first: &mut bool,
+) {
+    push_json_prop_name(out, name, first);
+    if let Some(range) = range {
+        out.push('{');
+        out.push_str("\"start\": ");
+        out.push_str(&range.start.to_string());
+        out.push_str(", \"end\": ");
+        out.push_str(&range.end.to_string());
+        out.push('}');
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn push_json_text_range_prop(
+    out: &mut String,
+    name: &str,
+    range: Option<&std::ops::Range<u32>>,
     first: &mut bool,
 ) {
     push_json_prop_name(out, name, first);

@@ -1972,6 +1972,22 @@ fn is_inherited_css_property(property: &str) -> bool {
     )
 }
 
+fn apply_inline_user_agent_defaults(element_name: &str, style: &mut document::ComputedStyle) {
+    match element_name {
+        "em" | "i" => {
+            style
+                .properties
+                .insert(Arc::from("font-style"), Arc::from("italic"));
+        }
+        "strong" | "b" => {
+            style
+                .properties
+                .insert(Arc::from("font-weight"), Arc::from("bold"));
+        }
+        _ => {}
+    }
+}
+
 fn selector_matches(
     selector: &CssSelector,
     element: &CssElementSnapshot,
@@ -2092,9 +2108,6 @@ fn build_xhtml_tree(
                 close_xhtml_element(&mut nodes, &mut stack, name, token.source_range, mode)?;
             }
             XhtmlTokenKind::Text(text) => {
-                if text.trim().is_empty() {
-                    continue;
-                }
                 let observed = u64::try_from(nodes.len().saturating_add(1)).unwrap_or(u64::MAX);
                 if observed > u64::from(limits.max_dom_nodes) {
                     return Err(limit_error(
@@ -2452,6 +2465,7 @@ fn salvage_chapter_ir(
         .push(document::DocumentNode::Paragraph(document::BlockText {
             text,
             style: StyleId::new(0),
+            style_runs: Vec::new(),
         }))?;
     let root = chapter
         .nodes
@@ -2561,6 +2575,102 @@ impl ChapterBuilder<'_> {
         Ok(out)
     }
 
+    fn convert_flow_children(
+        &mut self,
+        node_id: usize,
+        parent_style: StyleId,
+    ) -> Result<Vec<NodeId>, PageletError> {
+        let Some(element) = self.tree.node(node_id).and_then(XhtmlNode::element) else {
+            return Ok(Vec::new());
+        };
+        let children = element.children.clone();
+        let mut out = Vec::new();
+        let mut inline_group = Vec::new();
+        for child in children {
+            if self.is_inline_flow_node(child) {
+                inline_group.push(child);
+                continue;
+            }
+            self.flush_inline_group(&mut inline_group, parent_style, &mut out)?;
+            if let Some(converted) = self.convert_node(child)? {
+                out.push(converted);
+            }
+        }
+        self.flush_inline_group(&mut inline_group, parent_style, &mut out)?;
+        Ok(out)
+    }
+
+    fn is_inline_flow_node(&self, node_id: usize) -> bool {
+        let Some(node) = self.tree.node(node_id) else {
+            return false;
+        };
+        match &node.kind {
+            XhtmlNodeKind::Text(_) => true,
+            XhtmlNodeKind::Element(element) => matches!(
+                element.local_name(),
+                "a" | "abbr"
+                    | "b"
+                    | "bdi"
+                    | "bdo"
+                    | "br"
+                    | "cite"
+                    | "code"
+                    | "data"
+                    | "dfn"
+                    | "em"
+                    | "i"
+                    | "kbd"
+                    | "mark"
+                    | "q"
+                    | "ruby"
+                    | "s"
+                    | "samp"
+                    | "small"
+                    | "span"
+                    | "strong"
+                    | "sub"
+                    | "sup"
+                    | "time"
+                    | "u"
+                    | "var"
+                    | "wbr"
+            ),
+        }
+    }
+
+    fn flush_inline_group(
+        &mut self,
+        inline_group: &mut Vec<usize>,
+        parent_style: StyleId,
+        out: &mut Vec<NodeId>,
+    ) -> Result<(), PageletError> {
+        if inline_group.is_empty() {
+            return Ok(());
+        }
+        let nodes = std::mem::take(inline_group);
+        let content = self.inline_content_for_nodes(&nodes, parent_style)?;
+        if content.text.is_empty() {
+            return Ok(());
+        }
+        let source_range = nodes
+            .iter()
+            .filter_map(|node_id| self.tree.node(*node_id).map(|node| node.source_range))
+            .reduce(|first, next| SourceRange {
+                start: first.start.min(next.start),
+                end: first.end.max(next.end),
+            })
+            .unwrap_or_default();
+        let block_style = self.anonymous_block_style(parent_style)?;
+        let node_id = self.push_inline_text_node(
+            DocumentNodeKind::Paragraph,
+            content,
+            source_range,
+            block_style,
+        )?;
+        out.push(node_id);
+        Ok(())
+    }
+
     fn convert_node(&mut self, node_id: usize) -> Result<Option<NodeId>, PageletError> {
         let Some(node) = self.tree.node(node_id) else {
             return Ok(None);
@@ -2596,7 +2706,7 @@ impl ChapterBuilder<'_> {
         let style = self.style_for_node(node_id)?;
         let converted = match element.local_name() {
             "html" | "body" | "section" | "article" | "main" | "div" | "nav" => {
-                let children = self.convert_children(node_id)?;
+                let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
                     document::DocumentNode::Container(document::ContainerNode { children, style }),
                     source_range,
@@ -2619,37 +2729,21 @@ impl ChapterBuilder<'_> {
                 )?)
             }
             "li" => {
-                let mut children = self.convert_children(node_id)?;
-                if children.is_empty() {
-                    let text = self.inline_text(node_id).0.trim().to_owned();
-                    if !text.is_empty() {
-                        children.push(
-                            self.text_block_node(
-                                DocumentNodeKind::Paragraph,
-                                &text,
-                                self.tree
-                                    .node(node_id)
-                                    .map(|node| node.source_range)
-                                    .unwrap_or_default(),
-                                style,
-                            )?,
-                        );
-                    }
-                }
+                let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
                     document::DocumentNode::ListItem(document::ListItemNode { children, style }),
                     source_range,
                 )?)
             }
             "blockquote" => {
-                let children = self.convert_children(node_id)?;
+                let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
                     document::DocumentNode::BlockQuote(document::ContainerNode { children, style }),
                     source_range,
                 )?)
             }
             "figure" => {
-                let children = self.convert_children(node_id)?;
+                let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
                     document::DocumentNode::Figure(document::ContainerNode { children, style }),
                     source_range,
@@ -2698,9 +2792,8 @@ impl ChapterBuilder<'_> {
         tree_node_id: usize,
         style: StyleId,
     ) -> Result<Option<NodeId>, PageletError> {
-        let (text, links, anchors) = self.inline_text(tree_node_id);
-        let text = text.trim();
-        if text.is_empty() {
+        let content = self.inline_content(tree_node_id)?;
+        if content.text.is_empty() {
             return Ok(None);
         }
         let source_range = self
@@ -2709,8 +2802,7 @@ impl ChapterBuilder<'_> {
             .map(|node| node.source_range)
             .unwrap_or_default();
         let node_id =
-            self.text_block_node(DocumentNodeKind::Paragraph, text, source_range, style)?;
-        self.add_inline_metadata(node_id, links, anchors);
+            self.push_inline_text_node(DocumentNodeKind::Paragraph, content, source_range, style)?;
         Ok(Some(node_id))
     }
 
@@ -2720,12 +2812,9 @@ impl ChapterBuilder<'_> {
         kind: DocumentNodeKind,
         style: StyleId,
     ) -> Result<NodeId, PageletError> {
-        let (text, links, anchors) = self.inline_text(tree_node_id);
+        let content = self.inline_content(tree_node_id)?;
         let source_range = self.tree.node(tree_node_id).map(|node| node.source_range);
-        let node_id =
-            self.text_block_node(kind, text.trim(), source_range.unwrap_or_default(), style)?;
-        self.add_inline_metadata(node_id, links, anchors);
-        Ok(node_id)
+        self.push_inline_text_node(kind, content, source_range.unwrap_or_default(), style)
     }
 
     fn heading_node(
@@ -2734,16 +2823,20 @@ impl ChapterBuilder<'_> {
         level: u8,
         style: StyleId,
     ) -> Result<NodeId, PageletError> {
-        let (text, links, anchors) = self.inline_text(tree_node_id);
-        let text = self.chapter.text_pool.push(text.trim())?;
+        let content = self.inline_content(tree_node_id)?;
+        let text = self.chapter.text_pool.push(&content.text)?;
         let node_id = self.push_node(
             document::DocumentNode::Heading(document::HeadingNode {
                 level,
-                content: document::BlockText { text, style },
+                content: document::BlockText {
+                    text,
+                    style,
+                    style_runs: content.style_runs,
+                },
             }),
             self.tree.node(tree_node_id).map(|node| node.source_range),
         )?;
-        self.add_inline_metadata(node_id, links, anchors);
+        self.add_inline_metadata(node_id, content.links, content.anchors);
         Ok(node_id)
     }
 
@@ -2754,12 +2847,46 @@ impl ChapterBuilder<'_> {
         source_range: SourceRange,
         style: StyleId,
     ) -> Result<NodeId, PageletError> {
+        let text_end = u32::try_from(text.len()).unwrap_or(u32::MAX);
         let text = self.chapter.text_pool.push(text)?;
-        let block = document::BlockText { text, style };
+        let block = document::BlockText {
+            text,
+            style,
+            style_runs: (text_end > 0)
+                .then_some(document::InlineStyleRun {
+                    start: 0,
+                    end: text_end,
+                    style,
+                    source_range: Some(source_range),
+                })
+                .into_iter()
+                .collect(),
+        };
         let node = match kind {
             DocumentNodeKind::Paragraph => document::DocumentNode::Paragraph(block),
         };
         self.push_node(node, Some(source_range))
+    }
+
+    fn push_inline_text_node(
+        &mut self,
+        kind: DocumentNodeKind,
+        content: InlineContent,
+        source_range: SourceRange,
+        style: StyleId,
+    ) -> Result<NodeId, PageletError> {
+        let text = self.chapter.text_pool.push(&content.text)?;
+        let block = document::BlockText {
+            text,
+            style,
+            style_runs: content.style_runs,
+        };
+        let node = match kind {
+            DocumentNodeKind::Paragraph => document::DocumentNode::Paragraph(block),
+        };
+        let node_id = self.push_node(node, Some(source_range))?;
+        self.add_inline_metadata(node_id, content.links, content.anchors);
+        Ok(node_id)
     }
 
     fn image_node(
@@ -2792,10 +2919,9 @@ impl ChapterBuilder<'_> {
         element: &XhtmlElement,
         style: StyleId,
     ) -> Result<NodeId, PageletError> {
-        let mut children = self.convert_children(tree_node_id)?;
+        let mut children = self.convert_flow_children(tree_node_id, style)?;
         if children.is_empty() {
-            let text = self.inline_text(tree_node_id).0;
-            let text = text.trim();
+            let text = self.inline_content(tree_node_id)?.text;
             if !text.is_empty() {
                 let source_range = self
                     .tree
@@ -2804,7 +2930,7 @@ impl ChapterBuilder<'_> {
                     .unwrap_or_default();
                 children.push(self.text_block_node(
                     DocumentNodeKind::Paragraph,
-                    text,
+                    &text,
                     source_range,
                     style,
                 )?);
@@ -2861,7 +2987,9 @@ impl ChapterBuilder<'_> {
             &self.css,
             &document::ComputedStyle::new(),
         );
-        let mut style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &inherited);
+        let mut cascade_base = inherited.clone();
+        apply_inline_user_agent_defaults(element.local_name(), &mut cascade_base);
+        let mut style = cascade_css_for_element(&snapshot, &ancestors, &self.css, &cascade_base);
         if let Some(locale) = element
             .attr("xml:lang")
             .or_else(|| element.attr("lang"))
@@ -2903,6 +3031,18 @@ impl ChapterBuilder<'_> {
         self.computed_styles.insert(tree_node_id, (style_id, style));
         self.font_contexts.insert(tree_node_id, font_context);
         Ok(style_id)
+    }
+
+    fn anonymous_block_style(&mut self, parent_style: StyleId) -> Result<StyleId, PageletError> {
+        let mut style = document::ComputedStyle::new();
+        if let Some(parent) = self.chapter.styles.get(parent_style) {
+            for (name, value) in &parent.properties {
+                if is_inherited_css_property(name) || name.as_ref() == "-pagelet-locale" {
+                    style.properties.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        self.chapter.styles.intern(style)
     }
 
     fn snapshot_for_element(&self, element: &XhtmlElement) -> CssElementSnapshot {
@@ -3019,6 +3159,7 @@ impl ChapterBuilder<'_> {
                 .push(document::DocumentNode::Paragraph(document::BlockText {
                     text: text_range,
                     style: self.default_style,
+                    style_runs: Vec::new(),
                 }))?;
         let footnote =
             self.chapter
@@ -3047,68 +3188,88 @@ impl ChapterBuilder<'_> {
         Ok(node_id)
     }
 
-    fn inline_text(&self, node_id: usize) -> (String, Vec<LinkDraft>, Vec<AnchorDraft>) {
-        let mut text = String::new();
-        let mut links = Vec::new();
-        let mut anchors = Vec::new();
-        self.collect_inline(node_id, &mut text, &mut links, &mut anchors);
-        (text, links, anchors)
+    fn inline_content(&mut self, node_id: usize) -> Result<InlineContent, PageletError> {
+        let style = self.style_for_node(node_id)?;
+        self.inline_content_for_nodes(&[node_id], style)
+    }
+
+    fn inline_content_for_nodes(
+        &mut self,
+        nodes: &[usize],
+        inherited_style: StyleId,
+    ) -> Result<InlineContent, PageletError> {
+        let mut accumulator = InlineAccumulator::default();
+        for node_id in nodes {
+            self.collect_inline(*node_id, inherited_style, &mut accumulator)?;
+        }
+        Ok(accumulator.finish())
     }
 
     fn collect_inline(
-        &self,
+        &mut self,
         node_id: usize,
-        text: &mut String,
-        links: &mut Vec<LinkDraft>,
-        anchors: &mut Vec<AnchorDraft>,
-    ) {
+        inherited_style: StyleId,
+        accumulator: &mut InlineAccumulator,
+    ) -> Result<(), PageletError> {
         let Some(node) = self.tree.node(node_id) else {
-            return;
+            return Ok(());
         };
-        match &node.kind {
-            XhtmlNodeKind::Text(value) => text.push_str(value),
+        let source_range = node.source_range;
+        let kind = node.kind.clone();
+        match kind {
+            XhtmlNodeKind::Text(value) => {
+                accumulator.append_collapsible(&value, inherited_style, source_range);
+            }
             XhtmlNodeKind::Element(element) => {
-                if let Some(id) = xhtml_element_id(element) {
-                    anchors.push(AnchorDraft {
+                let style = self.style_for_node(node_id)?;
+                if let Some(id) = xhtml_element_id(&element) {
+                    accumulator.anchors.push(AnchorDraft {
                         fragment: Arc::from(id),
-                        source_range: Some(node.source_range),
+                        utf8_byte_offset: accumulator.next_text_offset(),
+                        source_range: Some(source_range),
                     });
                 }
                 match element.local_name() {
-                    "br" => text.push('\n'),
+                    "br" => accumulator.append_break(style, source_range),
                     "img" => {
                         if let Some(alt) = element.attr("alt") {
-                            text.push_str(alt);
+                            accumulator.append_collapsible(alt, style, source_range);
                         }
                     }
                     "a" => {
-                        let before = text.len();
+                        accumulator.flush_pending_space();
+                        let before = accumulator.text.len();
                         for child in &element.children {
-                            self.collect_inline(*child, text, links, anchors);
+                            self.collect_inline(*child, style, accumulator)?;
                         }
                         if let Some(href) = element.attr("href") {
-                            links.push(LinkDraft {
+                            if accumulator.text.len() == before {
+                                accumulator.append_collapsible(href, style, source_range);
+                            }
+                            accumulator.links.push(LinkDraft {
                                 href: Arc::from(href),
-                                source_range: Some(node.source_range),
-                                kind: if is_noteref_element(element) {
+                                text_range: Some(
+                                    u32::try_from(before).unwrap_or(u32::MAX)
+                                        ..u32::try_from(accumulator.text.len()).unwrap_or(u32::MAX),
+                                ),
+                                source_range: Some(source_range),
+                                kind: if is_noteref_element(&element) {
                                     document::LinkKind::Footnote
                                 } else {
                                     document::LinkKind::Internal
                                 },
                             });
                         }
-                        if text.len() == before {
-                            text.push_str(element.attr("href").unwrap_or_default());
-                        }
                     }
                     _ => {
                         for child in &element.children {
-                            self.collect_inline(*child, text, links, anchors);
+                            self.collect_inline(*child, style, accumulator)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn add_inline_metadata(
@@ -3132,6 +3293,7 @@ impl ChapterBuilder<'_> {
                 document_href: Arc::from(self.document_href),
                 fragment: anchor.fragment,
                 node_id,
+                utf8_byte_offset: anchor.utf8_byte_offset,
                 source_range: anchor.source_range,
             });
         }
@@ -3149,6 +3311,7 @@ impl ChapterBuilder<'_> {
                 document_href: Arc::from(self.document_href),
                 fragment: Arc::from(fragment),
                 node_id,
+                utf8_byte_offset: 0,
                 source_range,
             });
         }
@@ -3393,6 +3556,7 @@ enum DocumentNodeKind {
 #[derive(Debug, Clone)]
 struct LinkDraft {
     href: Arc<str>,
+    text_range: Option<std::ops::Range<u32>>,
     source_range: Option<SourceRange>,
     kind: document::LinkKind,
 }
@@ -3400,7 +3564,102 @@ struct LinkDraft {
 #[derive(Debug, Clone)]
 struct AnchorDraft {
     fragment: Arc<str>,
+    utf8_byte_offset: u32,
     source_range: Option<SourceRange>,
+}
+
+#[derive(Debug, Default)]
+struct InlineContent {
+    text: String,
+    style_runs: Vec<document::InlineStyleRun>,
+    links: Vec<LinkDraft>,
+    anchors: Vec<AnchorDraft>,
+}
+
+#[derive(Debug, Default)]
+struct InlineAccumulator {
+    text: String,
+    style_runs: Vec<document::InlineStyleRun>,
+    links: Vec<LinkDraft>,
+    anchors: Vec<AnchorDraft>,
+    pending_space: Option<(StyleId, SourceRange)>,
+}
+
+impl InlineAccumulator {
+    fn append_collapsible(&mut self, value: &str, style: StyleId, source_range: SourceRange) {
+        for character in value.chars() {
+            if is_collapsible_xhtml_whitespace(character) {
+                if !self.text.is_empty() && !self.text.ends_with('\n') {
+                    self.pending_space.get_or_insert((style, source_range));
+                }
+                continue;
+            }
+            self.flush_pending_space();
+            let mut buffer = [0_u8; 4];
+            self.append_segment(character.encode_utf8(&mut buffer), style, source_range);
+        }
+    }
+
+    fn append_break(&mut self, style: StyleId, source_range: SourceRange) {
+        self.pending_space = None;
+        self.append_segment("\n", style, source_range);
+    }
+
+    fn flush_pending_space(&mut self) {
+        let Some((style, source_range)) = self.pending_space.take() else {
+            return;
+        };
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.append_segment(" ", style, source_range);
+        }
+    }
+
+    fn append_segment(&mut self, value: &str, style: StyleId, source_range: SourceRange) {
+        if value.is_empty() {
+            return;
+        }
+        let start = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+        self.text.push_str(value);
+        let end = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+        if let Some(last) = self.style_runs.last_mut() {
+            if last.end == start && last.style == style && last.source_range == Some(source_range) {
+                last.end = end;
+                return;
+            }
+        }
+        self.style_runs.push(document::InlineStyleRun {
+            start,
+            end,
+            style,
+            source_range: Some(source_range),
+        });
+    }
+
+    fn next_text_offset(&self) -> u32 {
+        let pending = u32::from(
+            self.pending_space.is_some() && !self.text.is_empty() && !self.text.ends_with('\n'),
+        );
+        u32::try_from(self.text.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(pending)
+    }
+
+    fn finish(mut self) -> InlineContent {
+        let text_end = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+        for anchor in &mut self.anchors {
+            anchor.utf8_byte_offset = anchor.utf8_byte_offset.min(text_end);
+        }
+        InlineContent {
+            text: self.text,
+            style_runs: self.style_runs,
+            links: self.links,
+            anchors: self.anchors,
+        }
+    }
+}
+
+fn is_collapsible_xhtml_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\n' | '\r' | '\t' | '\u{000c}')
 }
 
 fn resolve_link(
@@ -3419,6 +3678,7 @@ fn resolve_link(
     {
         return document::LinkTarget {
             source_node,
+            text_range: draft.text_range,
             source_range: draft.source_range,
             href: href_value,
             resolved_document: None,
@@ -3456,6 +3716,7 @@ fn resolve_link(
 
     document::LinkTarget {
         source_node,
+        text_range: draft.text_range,
         source_range: draft.source_range,
         href: href_value,
         resolved_document,
@@ -4346,6 +4607,179 @@ mod tests {
     }
 
     #[test]
+    fn mixed_inline_div_stays_one_paragraph_with_host_style_runs() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Mixed inline paragraph",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml">
+              <head>
+                <title>Chapter 1</title>
+                <style>
+                  .entry { font-family: "Body Serif"; font-size: 18px; }
+                  .title { font-family: "Literata"; }
+                  a { font-weight: 700; }
+                </style>
+              </head>
+              <body>
+                <div id="entry" class="entry">
+                  They sent letters of
+                  <span class="title"><em id="scum">Scum Family</em></span>
+                  and <a href="#target">stone-shattered windows</a>.
+                </div>
+                <p id="target">Target.</p>
+              </body>
+            </html>"##,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let entry = chapter
+            .anchors
+            .get("EPUB/chapter-1.xhtml#entry")
+            .expect("entry anchor");
+        let container = match chapter.nodes.get(entry.node_id) {
+            Some(document::DocumentNode::Container(container)) => container,
+            other => panic!("expected entry container, got {other:?}"),
+        };
+        assert_eq!(container.children.len(), 1);
+        let paragraph_id = container.children[0];
+        let paragraph = match chapter.nodes.get(paragraph_id) {
+            Some(document::DocumentNode::Paragraph(paragraph)) => paragraph,
+            other => panic!("expected anonymous paragraph, got {other:?}"),
+        };
+        let text = chapter
+            .text_pool
+            .get(paragraph.text)
+            .expect("paragraph text");
+        assert_eq!(
+            text,
+            "They sent letters of Scum Family and stone-shattered windows."
+        );
+        assert_eq!(paragraph.style_runs.first().map(|run| run.start), Some(0));
+        assert_eq!(
+            paragraph.style_runs.last().map(|run| run.end),
+            Some(u32::try_from(text.len()).expect("text length"))
+        );
+        for window in paragraph.style_runs.windows(2) {
+            assert_eq!(window[0].end, window[1].start);
+        }
+        assert!(paragraph
+            .style_runs
+            .iter()
+            .all(|run| run.source_range.is_some()));
+
+        let scum_run = paragraph
+            .style_runs
+            .iter()
+            .find(|run| slice_text_range(text, run.start..run.end) == "Scum Family")
+            .expect("italic title run");
+        let scum_style = chapter.styles.get(scum_run.style).expect("scum style");
+        assert_eq!(style_value(scum_style, "font-family"), Some("\"Literata\""));
+        assert_eq!(style_value(scum_style, "font-style"), Some("italic"));
+
+        let scum_anchor = chapter
+            .anchors
+            .get("EPUB/chapter-1.xhtml#scum")
+            .expect("inline anchor");
+        assert_eq!(scum_anchor.node_id, paragraph_id);
+        assert!(text
+            .get(usize::try_from(scum_anchor.utf8_byte_offset).expect("anchor offset")..)
+            .is_some_and(|suffix| suffix.starts_with("Scum Family")));
+
+        let inline_link = chapter
+            .links
+            .iter()
+            .find(|link| link.href.as_ref() == "#target")
+            .expect("inline link");
+        assert_eq!(inline_link.source_node, paragraph_id);
+        assert_eq!(
+            inline_link
+                .text_range
+                .clone()
+                .map(|range| slice_text_range(text, range).to_owned())
+                .as_deref(),
+            Some("stone-shattered windows")
+        );
+        assert!(inline_link.source_range.is_some());
+        assert!(chapter.source_map.get(paragraph_id).is_some());
+
+        let constraints = crate::layout::LayoutConstraints::new(
+            LayoutUnit::from_px(1_000),
+            LayoutUnit::from_px(500),
+        )
+        .with_margin(LayoutUnit::from_px(24));
+        let options = crate::layout::LayoutOptions::new(constraints);
+        let batch = crate::layout::prepare_measure_batch(&chapter, options);
+        let request = batch
+            .requests
+            .iter()
+            .find(|request| request.text.as_ref() == text)
+            .expect("mixed inline request");
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .filter(|request| request.text.as_ref() == text)
+                .count(),
+            1
+        );
+        let measured_scum = request
+            .style_runs
+            .iter()
+            .find(|run| slice_text_range(text, run.start..run.end) == "Scum Family")
+            .expect("measured italic run");
+        assert_eq!(measured_scum.fonts.primary.family.as_ref(), "Literata");
+        assert_eq!(
+            measured_scum.fonts.primary.style,
+            crate::text::FontStyle::Italic
+        );
+        let measured_link = request
+            .style_runs
+            .iter()
+            .find(|run| slice_text_range(text, run.start..run.end) == "stone-shattered windows")
+            .expect("measured link run");
+        assert_eq!(measured_link.fonts.primary.weight, 700);
+
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            options,
+        )
+        .expect("paginate mixed inline chapter");
+        let page = pages
+            .pages
+            .iter()
+            .find(|page| {
+                page.links
+                    .iter()
+                    .any(|link| link.href.as_ref() == "#target")
+            })
+            .expect("page with inline link");
+        let paint = page
+            .text_paints
+            .iter()
+            .find(|paint| paint.node_id == paragraph_id)
+            .expect("paragraph paint");
+        let link_region = page
+            .links
+            .iter()
+            .find(|link| link.href.as_ref() == "#target")
+            .expect("precise link region");
+        assert!(link_region.rect.x > paint.layout_rect.x);
+        assert!(link_region.rect.width < paint.layout_rect.width);
+        let anchor_region = page
+            .anchors
+            .iter()
+            .find(|anchor| anchor.key.as_ref() == "EPUB/chapter-1.xhtml#scum")
+            .expect("inline anchor region");
+        assert_eq!(anchor_region.rect.width, LayoutUnit::from_px(1));
+    }
+
+    #[test]
     fn standalone_anchor_elements_keep_link_metadata() {
         let fixture = crate::testkit::EpubFixtureBuilder::epub3(
             crate::testkit::FixtureKind::FootnoteCollision,
@@ -4839,6 +5273,12 @@ mod tests {
 
     fn style_value<'a>(style: &'a document::ComputedStyle, property: &str) -> Option<&'a str> {
         style.properties.get(property).map(AsRef::as_ref)
+    }
+
+    fn slice_text_range(text: &str, range: std::ops::Range<u32>) -> &str {
+        let start = usize::try_from(range.start).expect("range start");
+        let end = usize::try_from(range.end).expect("range end");
+        text.get(start..end).expect("valid text range")
     }
 
     fn first_paragraph_style(chapter: &document::ChapterIr) -> Option<&document::ComputedStyle> {
