@@ -4,7 +4,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::{
@@ -129,6 +132,8 @@ impl Engine {
                 opened,
                 options,
                 chapters: Mutex::new(BTreeMap::new()),
+                chapter_cache_hits: AtomicU64::new(0),
+                chapter_cache_misses: AtomicU64::new(0),
             }),
         })
     }
@@ -143,6 +148,17 @@ struct BookSessionInner {
     opened: epub::OpenedBook,
     options: OpenOptions,
     chapters: Mutex<BTreeMap<usize, Arc<ChapterIr>>>,
+    chapter_cache_hits: AtomicU64,
+    chapter_cache_misses: AtomicU64,
+}
+
+/// Observable counters for caches currently owned by one book session.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct EngineStats {
+    /// ChapterIR lookups served from the book-session cache.
+    pub chapter_cache_hits: u64,
+    /// ChapterIR lookups that required parsing before insertion.
+    pub chapter_cache_misses: u64,
 }
 
 /// An opened publication. Dropping the last clone releases its index and chapter cache.
@@ -170,8 +186,14 @@ impl BookSession {
             .expect("chapter cache poisoned")
             .get(&spine_index)
         {
+            self.inner
+                .chapter_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(chapter));
         }
+        self.inner
+            .chapter_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
         let chapter = Arc::new(epub::open_spine_item_from_context(
             &self.inner.opened,
             spine_index,
@@ -179,6 +201,15 @@ impl BookSession {
         )?);
         let mut chapters = self.inner.chapters.lock().expect("chapter cache poisoned");
         Ok(Arc::clone(chapters.entry(spine_index).or_insert(chapter)))
+    }
+
+    /// Return a point-in-time snapshot of session-owned cache counters.
+    #[must_use]
+    pub fn stats(&self) -> EngineStats {
+        EngineStats {
+            chapter_cache_hits: self.inner.chapter_cache_hits.load(Ordering::Relaxed),
+            chapter_cache_misses: self.inner.chapter_cache_misses.load(Ordering::Relaxed),
+        }
     }
 
     pub fn create_layout_session(
@@ -444,6 +475,13 @@ mod tests {
         let first = session.open_spine_item(0).expect("first open");
         let second = session.open_spine_item(0).expect("cached open");
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            session.stats(),
+            EngineStats {
+                chapter_cache_hits: 1,
+                chapter_cache_misses: 1,
+            }
+        );
     }
 
     #[test]

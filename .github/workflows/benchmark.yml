@@ -6,6 +6,10 @@ on:
       - ".github/workflows/benchmark.yml"
       - "benches/**"
       - "crates/**"
+      - "docs/performance.md"
+      - "perf/**"
+      - "tools/pagelet-testkit/**"
+      - "tools/xtask/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -34,3 +38,48 @@ jobs:
 
       - name: Test benchmark-facing crate
         run: cargo test -p pagelet --all-features --release
+
+      - name: Generate observation report
+        run: >-
+          cargo run --release -p xtask -- bench report
+          --profile smoke
+          --samples 5
+          --runner github-hosted-observe
+
+      - name: Upload observation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagelet-performance-observation
+          path: |
+            target/pagelet-bench/current.csv
+            target/pagelet-bench/report.md
+
+  pinned-gate:
+    name: Pinned M2 Pro regression gate
+    if: vars.PAGELET_PERF_GATE_ENABLED == 'true'
+    runs-on: [self-hosted, macOS, ARM64, pagelet-perf-m2pro]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Run pinned performance gate
+        run: >-
+          cargo run --release -p xtask -- bench report
+          --profile full
+          --samples 30
+          --runner pagelet-macmini-m2pro
+          --baseline perf/baselines/macos-aarch64-m2pro.csv
+
+      - name: Upload pinned report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagelet-performance-pinned
+          path: |
+            target/pagelet-bench/current.csv
+            target/pagelet-bench/report.md

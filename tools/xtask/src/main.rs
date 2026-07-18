@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod benchmark;
 mod external;
 
 use std::{
@@ -585,6 +586,13 @@ fn manifest_lint() -> Result<(), XtaskError> {
 }
 
 fn run_bench(args: &[String]) -> Result<(), XtaskError> {
+    if matches!(args.first().map(String::as_str), Some("report")) {
+        return benchmark::run(&args[1..]).map_err(XtaskError::Command);
+    }
+    let args = match args.first().map(String::as_str) {
+        Some("fixtures") => &args[1..],
+        _ => args,
+    };
     if matches!(
         args.first().map(String::as_str),
         Some("-h" | "--help" | "help")
@@ -976,7 +984,10 @@ fn print_manifests_help() {
 
 fn print_bench_help() {
     println!("Usage:");
-    println!("  cargo xtask bench --profile smoke|full [--iterations <n>]");
+    println!("  cargo xtask bench [fixtures] --profile smoke|full [--iterations <n>]");
+    println!("  cargo xtask bench report [options]");
+    println!();
+    println!("Run `cargo xtask bench report --help` for lifecycle report and baseline options.");
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

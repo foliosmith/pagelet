@@ -16,13 +16,57 @@ Criterion microbenchmark suite and iai-callgrind instruction regression suite
 should reuse the same fixture IDs once the dependency policy and runner setup
 are finalized.
 
+`cargo xtask bench fixtures --profile smoke|full` validates the generated
+fixture budgets. `cargo xtask bench report` runs the engine lifecycle suite in
+a child process and automatically writes a machine-readable snapshot plus a
+Markdown report under `target/pagelet-bench/`:
+
+```sh
+cargo run --release -p xtask -- bench report \
+  --profile full \
+  --runner pagelet-macmini-m2pro \
+  --baseline perf/baselines/macos-aarch64-m2pro.csv
+```
+
+The pinned suite uses one deterministic `small-novel` EPUB and fixed layout/text
+metrics. Its fixture SHA-256, OS, architecture, Rust toolchain, profile, and
+runner ID must all match before a comparison is allowed. Peak RSS is sampled
+from the isolated child process; allocated bytes are measured around the cold
+open → ChapterIR → first three pages → binary PageBatch lifecycle.
+
 ## Metrics
 
 Track open-to-metadata, open-to-navigation, chapter-to-IR, first-page-ready,
 page-batch-ready, full-chapter-pagination, anchor-to-page, peak RSS, allocated
 bytes, wire bytes, cache hit rate, cache miss rate, and cancellation counts.
 
+The current metadata and navigation APIs share one publication-open boundary,
+so those two timings intentionally cover the same parse stage through different
+consumer observations. Chapter cache hit/miss counters are real `BookSession`
+counters, but remain observation-only until the layered cache task adds the
+remaining cache families.
+
 ## Regression Policy
 
 Pinned runner baselines own release decisions. A repeatable regression greater
 than 10 percent must be explained, fixed, or explicitly accepted before release.
+The automated gate requires both p50 and p95 to regress by more than 10 percent
+and the p95 change to exceed the metric-specific minimum effect. This prevents a
+single outlier or timer noise from blocking a change.
+
+The checked-in baseline was captured on the dedicated Apple M2 Pro Mac mini with
+Rust 1.95.0. Replacing it is an explicit operation and requires a reason:
+
+```sh
+cargo run --release -p xtask -- bench report \
+  --profile full \
+  --runner pagelet-macmini-m2pro \
+  --record-baseline perf/baselines/macos-aarch64-m2pro.csv \
+  --replace-baseline \
+  --reason "explain the accepted hardware or algorithm change"
+```
+
+Shared GitHub-hosted runners upload observation-only reports. The blocking job
+targets the self-hosted labels `macOS`, `ARM64`, and `pagelet-perf-m2pro`; set the
+repository variable `PAGELET_PERF_GATE_ENABLED=true` only after that runner is
+registered and reserved for performance work.

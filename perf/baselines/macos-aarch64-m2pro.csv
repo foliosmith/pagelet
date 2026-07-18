@@ -1,0 +1,23 @@
+schema_version,1
+runner_id,pagelet-macmini-m2pro
+os,macos
+arch,aarch64
+rust_toolchain,rustc 1.95.0 (59807616e 2026-04-14)
+profile,full
+fixture_id,small-novel
+fixture_sha256,14c05942ccd5ae0ed273c4c31d9ab9dbddc5120bfe65944219f4bbf7847a92e4
+samples,30
+reason,Task 5.2.6 initial pinned baseline
+metric,unit,direction,policy,minimum_effect,p50,p95
+allocated_bytes,bytes,lower,block,16384,1811257,1811257
+anchor_to_page,ns,lower,block,5,15,18
+chapter_cache_hits,count,higher,observe,1,1,1
+chapter_cache_misses,count,lower,observe,1,1,1
+chapter_to_ir,ns,lower,block,10000,553416,755500
+first_page_ready,ns,lower,block,10000,64459,97750
+full_chapter_paginate,ns,lower,block,10000,366750,463167
+open_to_metadata,ns,lower,block,10000,77000,115667
+open_to_navigation,ns,lower,block,10000,64875,81500
+page_batch_ready,ns,lower,block,10000,171959,252667
+peak_rss_bytes,bytes,lower,block,262144,6979584,6979584
+wire_bytes,bytes,lower,block,256,108885,108885

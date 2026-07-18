@@ -11,6 +11,7 @@ description = "Private pagelet development automation."
 pagelet = { path = "../../crates/pagelet", version = "0.1.0" }
 pagelet-testkit = { path = "../pagelet-testkit", version = "0.1.0" }
 sha2 = "0.10.9"
+stats_alloc = "0.1.10"
 
 [lints]
 workspace = true

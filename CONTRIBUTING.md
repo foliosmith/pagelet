@@ -88,6 +88,13 @@ Performance work must identify the fixture, profile stage, target platform, and
 budget being changed. Do not merge algorithm changes that improve one corpus by
 silently regressing another stable corpus class.
 
+Run the lifecycle report in release mode. Local runs without a baseline are
+observation-only; pinned-runner comparisons enforce the checked-in 10% gate.
+
+```sh
+cargo run --release -p xtask -- bench report --profile smoke
+```
+
 ## Pull Requests
 
 - Keep PRs scoped to one task or one coherent behavior change.
