@@ -9,8 +9,8 @@ use crate::{
         Severity, SourceRange, TextAffinity, TextAnchor,
     },
     document::{
-        BlockText, ChapterIr, ComputedStyle as DocumentComputedStyle, DocumentNode, ImageNode,
-        LinkKind, LinkTarget, StyleTable,
+        BlockText, ChapterIr, ComputedStyle as DocumentComputedStyle, DocumentNode,
+        ImageLayoutRole, ImageNode, LinkKind, LinkTarget, StyleTable,
     },
     text::{
         FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
@@ -653,7 +653,7 @@ impl Default for ComputedLayoutStyle {
     fn default() -> Self {
         Self {
             font_size: LayoutUnit::from_px(16),
-            line_height: LayoutUnit::from_px(22),
+            line_height: LayoutUnit::from_px(20),
             font_candidates: FontFallbackChain::default(),
             font_weight: 400,
             font_style: FontStyle::Normal,
@@ -661,9 +661,9 @@ impl Default for ComputedLayoutStyle {
             letter_spacing: LayoutUnit::ZERO,
             locale: Arc::from("und"),
             direction: TextDirection::Auto,
-            margin_top: LayoutUnit::from_px(4),
+            margin_top: LayoutUnit::ZERO,
             margin_right: LayoutUnit::ZERO,
-            margin_bottom: LayoutUnit::from_px(8),
+            margin_bottom: LayoutUnit::ZERO,
             margin_left: LayoutUnit::ZERO,
             padding_top: LayoutUnit::ZERO,
             padding_right: LayoutUnit::ZERO,
@@ -2345,13 +2345,12 @@ impl PageBuilder {
     ) -> (bool, Option<Diagnostic>) {
         let top_spacing = self.block_start_spacing(&block.style, false);
         let available_width = block_available_width(self.constraints, &block.style);
-        let mut width = image.intrinsic_width.unwrap_or(LayoutUnit::from_px(180));
-        let mut height = image.intrinsic_height.unwrap_or(LayoutUnit::from_px(140));
-        if width > available_width {
-            let ratio_raw = (available_width.raw() * LayoutUnit::SCALE) / width.raw().max(1);
-            width = available_width;
-            height = LayoutUnit::from_raw((height.raw() * ratio_raw) / LayoutUnit::SCALE);
-        }
+        let available_height = (self.constraints.content_height()
+            - block.style.padding_top
+            - block.style.padding_bottom)
+            .max(LayoutUnit::from_px(1));
+        let (width, mut height) =
+            resolve_image_size(image, &block.style, available_width, available_height);
         if self.y + top_spacing + height + block.style.padding_bottom > content_bottom
             && !self.is_empty()
         {
@@ -2369,13 +2368,32 @@ impl PageBuilder {
                 "image height exceeded page content and was clipped",
             ));
         }
+        let base_x = block_x(self.constraints, &block.style);
+        let remaining_inline = (available_width - width).max(LayoutUnit::ZERO);
+        let x = match (image.layout_role, block.style.alignment) {
+            (ImageLayoutRole::Cover | ImageLayoutRole::Standalone, _)
+            | (_, TextAlignment::Center) => {
+                base_x + LayoutUnit::from_raw(remaining_inline.raw() / 2)
+            }
+            (_, TextAlignment::End) => base_x + remaining_inline,
+            (_, TextAlignment::Start | TextAlignment::Justify) => base_x,
+        };
+        let vertically_centered = matches!(
+            image.layout_role,
+            ImageLayoutRole::Cover | ImageLayoutRole::Standalone
+        ) && !image.has_authored_size();
+        if vertically_centered {
+            let remaining_block = (content_bottom - self.y - block.style.padding_bottom - height)
+                .max(LayoutUnit::ZERO);
+            self.y += LayoutUnit::from_raw(remaining_block.raw() / 2);
+        }
         let fragment_id = self.alloc_fragment_id();
         self.push_fragment(SceneFragment {
             id: fragment_id,
             kind: SceneFragmentKind::Image,
             node_id: block.node_id,
             rect: Rect {
-                x: block_x(self.constraints, &block.style),
+                x,
                 y: self.y,
                 width,
                 height,
@@ -2506,6 +2524,20 @@ struct LayoutImage {
     alt: Arc<str>,
     intrinsic_width: Option<LayoutUnit>,
     intrinsic_height: Option<LayoutUnit>,
+    layout_role: ImageLayoutRole,
+    width: Option<Arc<str>>,
+    height: Option<Arc<str>>,
+    max_width: Option<Arc<str>>,
+    max_height: Option<Arc<str>>,
+}
+
+impl LayoutImage {
+    fn has_authored_size(&self) -> bool {
+        self.width.is_some()
+            || self.height.is_some()
+            || self.max_width.is_some()
+            || self.max_height.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2993,25 +3025,195 @@ fn layout_image(
     depth: u32,
     containing: ContainingBlock,
 ) -> LayoutBlock {
+    let document_style = chapter.styles.get(image.style);
+    let mut style = ComputedLayoutStyle::from_document(
+        &chapter.styles,
+        image.style,
+        BlockKind::Image,
+        depth,
+        containing.inline_width,
+        containing.inset_left,
+        containing.inset_right,
+    );
+    if image.layout_role != ImageLayoutRole::Inline
+        && document_style.is_none_or(|style| !has_explicit_margin(style))
+    {
+        style.margin_top = LayoutUnit::ZERO;
+        style.margin_right = LayoutUnit::ZERO;
+        style.margin_bottom = LayoutUnit::ZERO;
+        style.margin_left = LayoutUnit::ZERO;
+    }
     LayoutBlock {
         node_id,
         kind: BlockKind::Image,
         content: LayoutBlockContent::Image(LayoutImage {
             alt: image.alt.clone(),
-            intrinsic_width: None,
-            intrinsic_height: None,
+            intrinsic_width: image
+                .intrinsic_size
+                .map(|size| LayoutUnit::from_px(i64::from(size.width))),
+            intrinsic_height: image
+                .intrinsic_size
+                .map(|size| LayoutUnit::from_px(i64::from(size.height))),
+            layout_role: image.layout_role,
+            width: image_style_property(document_style, "width", image.layout_role),
+            height: image_style_property(document_style, "height", image.layout_role),
+            max_width: image_style_property(document_style, "max-width", image.layout_role),
+            max_height: image_style_property(document_style, "max-height", image.layout_role),
         }),
-        style: ComputedLayoutStyle::from_document(
-            &chapter.styles,
-            image.style,
-            BlockKind::Image,
-            depth,
-            containing.inline_width,
-            containing.inset_left,
-            containing.inset_right,
-        ),
+        style,
         source_range: chapter.source_map.get(node_id),
     }
+}
+
+fn image_style_property(
+    style: Option<&DocumentComputedStyle>,
+    property: &str,
+    role: ImageLayoutRole,
+) -> Option<Arc<str>> {
+    let value = style
+        .and_then(|style| style.properties.get(property))
+        .filter(|value| !value.trim().eq_ignore_ascii_case("auto"))
+        .cloned()?;
+    if matches!(role, ImageLayoutRole::Cover | ImageLayoutRole::Standalone)
+        && matches!(property, "height" | "max-height")
+        && value
+            .trim()
+            .strip_suffix('%')
+            .and_then(parse_number)
+            .is_some()
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn has_explicit_margin(style: &DocumentComputedStyle) -> bool {
+    [
+        "margin",
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+    ]
+    .iter()
+    .any(|property| style.properties.contains_key(*property))
+}
+
+fn resolve_image_size(
+    image: &LayoutImage,
+    style: &ComputedLayoutStyle,
+    available_width: LayoutUnit,
+    available_height: LayoutUnit,
+) -> (LayoutUnit, LayoutUnit) {
+    const INLINE_IMAGE_MAX_WIDTH_PX: i64 = 280;
+    const FALLBACK_IMAGE_WIDTH_PX: i64 = 180;
+    const FALLBACK_IMAGE_HEIGHT_PX: i64 = 140;
+
+    let intrinsic_width = image
+        .intrinsic_width
+        .unwrap_or(LayoutUnit::from_px(FALLBACK_IMAGE_WIDTH_PX));
+    let intrinsic_height = image
+        .intrinsic_height
+        .unwrap_or(LayoutUnit::from_px(FALLBACK_IMAGE_HEIGHT_PX));
+    let authored_width = image
+        .width
+        .as_deref()
+        .and_then(|value| resolve_used_length(value, style.font_size, available_width, false));
+    let authored_height = image
+        .height
+        .as_deref()
+        .and_then(|value| resolve_used_length(value, style.font_size, available_height, false));
+    let authored_max_width = image
+        .max_width
+        .as_deref()
+        .and_then(|value| resolve_used_length(value, style.font_size, available_width, false));
+    let authored_max_height = image
+        .max_height
+        .as_deref()
+        .and_then(|value| resolve_used_length(value, style.font_size, available_height, false));
+
+    let role_max_width = match image.layout_role {
+        ImageLayoutRole::Inline => {
+            available_width.min(LayoutUnit::from_px(INLINE_IMAGE_MAX_WIDTH_PX))
+        }
+        ImageLayoutRole::Cover | ImageLayoutRole::Standalone => available_width,
+    };
+    let max_width = authored_max_width
+        .map_or(role_max_width, |value| value.min(role_max_width))
+        .max(LayoutUnit::from_px(1));
+    let max_height = authored_max_height
+        .map_or(available_height, |value| value.min(available_height))
+        .max(LayoutUnit::from_px(1));
+
+    let (mut width, mut height) = match (authored_width, authored_height) {
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) => (
+            width,
+            scale_dimension(intrinsic_height, width, intrinsic_width),
+        ),
+        (None, Some(height)) => (
+            scale_dimension(intrinsic_width, height, intrinsic_height),
+            height,
+        ),
+        (None, None) => (intrinsic_width, intrinsic_height),
+    };
+
+    let preserve_aspect = authored_width.is_none() || authored_height.is_none();
+    if preserve_aspect {
+        let allow_upscale = authored_width.is_none()
+            && authored_height.is_none()
+            && matches!(
+                image.layout_role,
+                ImageLayoutRole::Cover | ImageLayoutRole::Standalone
+            );
+        let constrain_height = image.intrinsic_width.is_some()
+            || image.intrinsic_height.is_some()
+            || image.has_authored_size();
+        (width, height) = fit_preserving_aspect(
+            width,
+            height,
+            max_width,
+            constrain_height.then_some(max_height),
+            allow_upscale,
+        );
+    } else {
+        width = width.min(max_width).max(LayoutUnit::from_px(1));
+        height = height.min(max_height).max(LayoutUnit::from_px(1));
+    }
+    (width, height)
+}
+
+fn scale_dimension(value: LayoutUnit, target: LayoutUnit, original: LayoutUnit) -> LayoutUnit {
+    if original.raw() <= 0 {
+        return LayoutUnit::from_px(1);
+    }
+    LayoutUnit::from_f64_px(value.to_f64_px() * target.to_f64_px() / original.to_f64_px())
+        .max(LayoutUnit::from_px(1))
+}
+
+fn fit_preserving_aspect(
+    width: LayoutUnit,
+    height: LayoutUnit,
+    max_width: LayoutUnit,
+    max_height: Option<LayoutUnit>,
+    allow_upscale: bool,
+) -> (LayoutUnit, LayoutUnit) {
+    if width.raw() <= 0 || height.raw() <= 0 {
+        return (LayoutUnit::from_px(1), LayoutUnit::from_px(1));
+    }
+    let width_scale = max_width.to_f64_px() / width.to_f64_px();
+    let height_scale = max_height.map_or(f64::INFINITY, |max_height| {
+        max_height.to_f64_px() / height.to_f64_px()
+    });
+    let mut scale = width_scale.min(height_scale);
+    if !allow_upscale {
+        scale = scale.min(1.0);
+    }
+    scale = scale.max(0.0);
+    (
+        LayoutUnit::from_f64_px(width.to_f64_px() * scale).max(LayoutUnit::from_px(1)),
+        LayoutUnit::from_f64_px(height.to_f64_px() * scale).max(LayoutUnit::from_px(1)),
+    )
 }
 
 fn measure_text(
@@ -5006,7 +5208,7 @@ mod tests {
             first_line.x,
             LayoutUnit::from_px(40) + margin_left + padding_inline + text_indent
         );
-        assert_eq!(first_line.y, LayoutUnit::from_px(160));
+        assert_eq!(first_line.y, LayoutUnit::from_px(156));
     }
 
     #[test]
@@ -5051,7 +5253,7 @@ mod tests {
         let lines = visible_text_line_rects(&pages.pages[0]);
 
         assert_eq!(lines[0].y, LayoutUnit::from_px(32));
-        assert_eq!(lines[1].y, LayoutUnit::from_px(78));
+        assert_eq!(lines[1].y, LayoutUnit::from_px(76));
     }
 
     #[test]
@@ -5129,6 +5331,53 @@ mod tests {
         let line = visible_text_line_rects(&pages.pages[0])[0];
 
         assert_eq!(line.height, LayoutUnit::from_px(30));
+    }
+
+    #[test]
+    fn default_line_height_matches_epubjs_reader_baseline() {
+        let mut chapter = chapter_with_paragraph("reader default line height");
+        let style = document::ComputedStyle::new().with_property("font-size", "12.8px");
+        let style_id = chapter.styles.intern(style).expect("style");
+        let paragraph = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| {
+                matches!(node, DocumentNode::Paragraph(_)).then_some(node_id)
+            })
+            .expect("paragraph");
+        if let Some(DocumentNode::Paragraph(text)) = chapter.nodes.get_mut(paragraph) {
+            text.style = style_id;
+        }
+
+        let pages = paginate_chapter(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("pagination");
+        let line = visible_text_line_rects(&pages.pages[0])[0];
+
+        assert_eq!(line.height, LayoutUnit::from_px(20));
+    }
+
+    #[test]
+    fn default_paragraphs_do_not_add_implicit_block_margins() {
+        let mut chapter = empty_chapter();
+        let first = push_paragraph(&mut chapter, "first");
+        let second = push_paragraph(&mut chapter, "second");
+        set_root_children(&mut chapter, vec![first, second]);
+        chapter.rebuild_utf16_index();
+
+        let pages = paginate_chapter(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutConstraints::default(),
+        )
+        .expect("pagination");
+        let lines = visible_text_line_rects(&pages.pages[0]);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].y - lines[0].y, LayoutUnit::from_px(20));
     }
 
     struct StrutCheckingBackend;
@@ -5288,7 +5537,7 @@ mod tests {
             LayoutOptions {
                 constraints: LayoutConstraints::new(
                     LayoutUnit::from_px(220),
-                    LayoutUnit::from_px(42),
+                    LayoutUnit::from_px(20),
                 ),
                 max_pages: 2_000,
                 ..LayoutOptions::default()

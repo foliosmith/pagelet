@@ -172,6 +172,12 @@ impl ResourceTable {
     pub fn id_for_path(&self, path: &str) -> Option<ResourceId> {
         self.by_path.get(path).copied()
     }
+
+    /// Look up lazy image metadata by its typed resource id.
+    #[must_use]
+    pub fn image(&self, id: ResourceId) -> Option<&ImageResource> {
+        self.images.iter().find(|image| image.id == id)
+    }
 }
 
 /// One indexed publication resource.
@@ -775,9 +781,25 @@ pub struct ImageNode {
     pub src: Arc<str>,
     pub resolved_path: Option<Arc<str>>,
     pub resource_id: Option<ResourceId>,
+    /// Intrinsic dimensions copied from bounded resource-header metadata.
+    pub intrinsic_size: Option<ImageSize>,
+    /// Pagination strategy selected from publication and chapter semantics.
+    pub layout_role: ImageLayoutRole,
     pub alt: Arc<str>,
     pub title: Option<Arc<str>>,
     pub style: StyleId,
+}
+
+/// How an image participates in page geometry.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ImageLayoutRole {
+    /// An image embedded among normal chapter content.
+    #[default]
+    Inline,
+    /// The publication-declared cover bitmap.
+    Cover,
+    /// The sole visible content of one spine document.
+    Standalone,
 }
 
 /// Footnote payload.

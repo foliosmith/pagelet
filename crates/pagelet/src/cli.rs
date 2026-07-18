@@ -163,10 +163,13 @@ pub fn paginate_bytes_debug_svg_with_options(
 /// Create layout options from whole-pixel viewport dimensions.
 #[must_use]
 pub fn layout_options_from_px(width: i64, height: i64) -> LayoutOptions {
-    LayoutOptions::new(
-        LayoutConstraints::new(LayoutUnit::from_px(width), LayoutUnit::from_px(height))
-            .with_margin(LayoutUnit::from_px(24)),
-    )
+    let mut constraints =
+        LayoutConstraints::new(LayoutUnit::from_px(width), LayoutUnit::from_px(height));
+    constraints.margin_start = LayoutUnit::from_px(24);
+    constraints.margin_end = LayoutUnit::from_px(24);
+    constraints.margin_top = LayoutUnit::from_px(36);
+    constraints.margin_bottom = LayoutUnit::from_px(36);
+    LayoutOptions::new(constraints)
 }
 
 /// Parse one spine item and return renderable ChapterIR JSON for Web/WASM consumers.
@@ -542,6 +545,24 @@ fn push_chapter_node_json(
                 image.resource_id.map(|resource| resource.get()),
                 &mut first,
             );
+            push_json_opt_u32_prop(
+                out,
+                "intrinsic_width",
+                image.intrinsic_size.map(|size| size.width),
+                &mut first,
+            );
+            push_json_opt_u32_prop(
+                out,
+                "intrinsic_height",
+                image.intrinsic_size.map(|size| size.height),
+                &mut first,
+            );
+            push_json_str_prop(
+                out,
+                "layout_role",
+                image_layout_role_name(image.layout_role),
+                &mut first,
+            );
             push_json_str_prop(out, "alt", &image.alt, &mut first);
             push_json_opt_str_prop(out, "title", image.title.as_deref(), &mut first);
             push_json_u32_prop(out, "style", image.style.get(), &mut first);
@@ -742,6 +763,14 @@ fn document_node_kind(node: &DocumentNode) -> &'static str {
     }
 }
 
+fn image_layout_role_name(role: crate::document::ImageLayoutRole) -> &'static str {
+    match role {
+        crate::document::ImageLayoutRole::Inline => "inline",
+        crate::document::ImageLayoutRole::Cover => "cover",
+        crate::document::ImageLayoutRole::Standalone => "standalone",
+    }
+}
+
 const fn link_kind_name(kind: LinkKind) -> &'static str {
     match kind {
         LinkKind::Internal => "internal",
@@ -888,5 +917,19 @@ mod tests {
         assert!(json.contains(r#""chapter_ir""#));
         assert!(json.contains(r#""visible_text": "Hello pagelet.""#));
         assert!(json.contains(r#""capability_report""#));
+    }
+
+    #[test]
+    fn browser_layout_viewport_uses_reflowable_page_insets() {
+        let options = layout_options_from_px(522, 718);
+
+        assert_eq!(
+            options.constraints.content_width(),
+            LayoutUnit::from_px(474)
+        );
+        assert_eq!(
+            options.constraints.content_height(),
+            LayoutUnit::from_px(646)
+        );
     }
 }

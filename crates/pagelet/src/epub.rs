@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::document;
 
-const IMAGE_HEADER_PREFIX_BYTES: usize = 4096;
+const IMAGE_HEADER_PREFIX_BYTES: usize = 64 * 1024;
 
 /// EPUB compatibility mode used while opening a book.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
@@ -653,9 +653,12 @@ pub fn open_spine_item_chapter_ir_with_options(
         &manifest_item.resolved_path,
         &title,
         &xhtml,
-        &book_ir.resources,
-        Some(&opened.store),
-        options,
+        ChapterResourceContext {
+            resources: &book_ir.resources,
+            cover_image: book_ir.metadata.cover_image.as_deref(),
+            store: Some(&opened.store),
+            options,
+        },
     )
 }
 
@@ -1225,12 +1228,17 @@ pub fn parse_opf(input: &str, rootfile_path: &str) -> Result<PackageDocument, Pa
         });
     }
 
+    let epub2_cover_id = scan_start_tags(input)
+        .into_iter()
+        .find(|tag| tag.local_name() == "meta" && tag.attr("name") == Some("cover"))
+        .and_then(|tag| tag.attr("content").map(ToOwned::to_owned));
     let cover_image = manifest
         .iter()
         .find(|item| {
             item.properties
                 .iter()
                 .any(|property| property == "cover-image")
+                || epub2_cover_id.as_deref() == Some(item.id.as_str())
         })
         .map(|item| item.resolved_path.clone());
 
@@ -2402,15 +2410,27 @@ fn merge_css_stylesheet(target: &mut CssStylesheet, mut source: CssStylesheet) {
     target.unsupported.extend(source.unsupported);
 }
 
+#[derive(Clone, Copy)]
+struct ChapterResourceContext<'a> {
+    resources: &'a document::ResourceTable,
+    cover_image: Option<&'a str>,
+    store: Option<&'a ZipPublicationStore>,
+    options: OpenOptions,
+}
+
 fn chapter_ir_from_xhtml(
     document_id: DocumentId,
     href: &str,
     title: &str,
     input: &str,
-    resources: &document::ResourceTable,
-    store: Option<&ZipPublicationStore>,
-    options: OpenOptions,
+    context: ChapterResourceContext<'_>,
 ) -> Result<document::ChapterIr, PageletError> {
+    let ChapterResourceContext {
+        resources,
+        cover_image,
+        store,
+        options,
+    } = context;
     let content_hash = ContentHash::from_bytes(input.as_bytes());
     let tree = match parse_xhtml_tree(input, CompatibilityMode::Strict, options.limits) {
         Ok(tree) => tree,
@@ -2437,6 +2457,7 @@ fn chapter_ir_from_xhtml(
         document_href: href,
         base_dir,
         resources,
+        cover_image,
         store,
         options,
         css,
@@ -2487,6 +2508,7 @@ struct ChapterBuilder<'a> {
     document_href: &'a str,
     base_dir: String,
     resources: &'a document::ResourceTable,
+    cover_image: Option<&'a str>,
     store: Option<&'a ZipPublicationStore>,
     options: OpenOptions,
     css: CssStylesheet,
@@ -2539,6 +2561,7 @@ impl ChapterBuilder<'_> {
         )?;
         self.chapter.root = root;
         self.resolve_footnotes()?;
+        self.classify_standalone_image();
         self.chapter.rebuild_utf16_index();
         self.chapter.rebuild_blocks();
         Ok(self.chapter.clone())
@@ -2606,35 +2629,40 @@ impl ChapterBuilder<'_> {
         };
         match &node.kind {
             XhtmlNodeKind::Text(_) => true,
-            XhtmlNodeKind::Element(element) => matches!(
-                element.local_name(),
-                "a" | "abbr"
-                    | "b"
-                    | "bdi"
-                    | "bdo"
-                    | "br"
-                    | "cite"
-                    | "code"
-                    | "data"
-                    | "dfn"
-                    | "em"
-                    | "i"
-                    | "kbd"
-                    | "mark"
-                    | "q"
-                    | "ruby"
-                    | "s"
-                    | "samp"
-                    | "small"
-                    | "span"
-                    | "strong"
-                    | "sub"
-                    | "sup"
-                    | "time"
-                    | "u"
-                    | "var"
-                    | "wbr"
-            ),
+            XhtmlNodeKind::Element(element) => {
+                if element.local_name() == "a" && self.sole_image_child(node_id).is_some() {
+                    return false;
+                }
+                matches!(
+                    element.local_name(),
+                    "a" | "abbr"
+                        | "b"
+                        | "bdi"
+                        | "bdo"
+                        | "br"
+                        | "cite"
+                        | "code"
+                        | "data"
+                        | "dfn"
+                        | "em"
+                        | "i"
+                        | "kbd"
+                        | "mark"
+                        | "q"
+                        | "ruby"
+                        | "s"
+                        | "samp"
+                        | "small"
+                        | "span"
+                        | "strong"
+                        | "sub"
+                        | "sup"
+                        | "time"
+                        | "u"
+                        | "var"
+                        | "wbr"
+                )
+            }
         }
     }
 
@@ -2742,7 +2770,7 @@ impl ChapterBuilder<'_> {
                     source_range,
                 )?)
             }
-            "figure" => {
+            "figure" | "svg" => {
                 let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
                     document::DocumentNode::Figure(document::ContainerNode { children, style }),
@@ -2756,13 +2784,16 @@ impl ChapterBuilder<'_> {
                     source_range,
                 )?)
             }
-            "img" => Some(self.image_node(element, source_range, style)?),
+            "img" | "image" => Some(self.image_node(element, source_range, style)?),
             "hr" => Some(self.push_node(document::DocumentNode::Divider, source_range)?),
             "br" => Some(self.push_node(document::DocumentNode::ForcedBreak, source_range)?),
             "aside" if is_footnote_element(element) && self.footnote_is_referenced(element) => {
                 Some(self.footnote_node(node_id, element, style)?)
             }
             "aside" if is_footnote_element(element) => None,
+            "a" if self.sole_image_child(node_id).is_some() => {
+                self.linked_image_anchor_node(node_id, element)?
+            }
             "a" | "span" | "em" | "strong" | "b" | "i" => {
                 self.inline_element_text_node(node_id, style)?
             }
@@ -2804,6 +2835,67 @@ impl ChapterBuilder<'_> {
         let node_id =
             self.push_inline_text_node(DocumentNodeKind::Paragraph, content, source_range, style)?;
         Ok(Some(node_id))
+    }
+
+    fn sole_image_child(&self, tree_node_id: usize) -> Option<usize> {
+        let element = self.tree.node(tree_node_id)?.element()?;
+        let mut image_child = None;
+        for child_id in &element.children {
+            let child = self.tree.node(*child_id)?;
+            match &child.kind {
+                XhtmlNodeKind::Text(text) if text.chars().all(is_collapsible_xhtml_whitespace) => {}
+                XhtmlNodeKind::Element(child_element)
+                    if matches!(child_element.local_name(), "img" | "image")
+                        && image_child.is_none() =>
+                {
+                    image_child = Some(*child_id);
+                }
+                _ => return None,
+            }
+        }
+        image_child
+    }
+
+    fn linked_image_anchor_node(
+        &mut self,
+        tree_node_id: usize,
+        anchor: &XhtmlElement,
+    ) -> Result<Option<NodeId>, PageletError> {
+        let Some(image_tree_id) = self.sole_image_child(tree_node_id) else {
+            return Ok(None);
+        };
+        let Some(image_tree_node) = self.tree.node(image_tree_id) else {
+            return Ok(None);
+        };
+        let image_source_range = image_tree_node.source_range;
+        let XhtmlNodeKind::Element(image_element) = image_tree_node.kind.clone() else {
+            return Ok(None);
+        };
+        let image_style = self.style_for_node(image_tree_id)?;
+        let image_node = self.image_node(&image_element, Some(image_source_range), image_style)?;
+        self.register_element_anchor(&image_element, image_node, Some(image_source_range));
+
+        if let Some(href) = anchor.attr("href") {
+            let anchor_source_range = self.tree.node(tree_node_id).map(|node| node.source_range);
+            self.chapter.links.push(resolve_link(
+                self.document_href,
+                &self.base_dir,
+                image_node,
+                LinkDraft {
+                    href: Arc::from(href),
+                    text_range: None,
+                    source_range: anchor_source_range,
+                    kind: if is_noteref_element(anchor) {
+                        document::LinkKind::Footnote
+                    } else {
+                        document::LinkKind::Internal
+                    },
+                },
+                self.resources,
+            ));
+        }
+
+        Ok(Some(image_node))
     }
 
     fn block_text_node(
@@ -2895,22 +2987,81 @@ impl ChapterBuilder<'_> {
         source_range: Option<SourceRange>,
         style: StyleId,
     ) -> Result<NodeId, PageletError> {
-        let src = element.attr("src").unwrap_or_default();
+        let src = element
+            .attr("src")
+            .or_else(|| element.attr("xlink:href"))
+            .or_else(|| element.attr("href"))
+            .unwrap_or_default();
         let resolved_path = resolve_resource_path(&self.base_dir, src).ok();
         let resource_id = resolved_path
             .as_deref()
             .and_then(|path| self.resources.id_for_path(path));
+        let intrinsic_size = resource_id
+            .and_then(|resource_id| self.resources.image(resource_id))
+            .and_then(|resource| resource.intrinsic_size);
+        let layout_role = if resolved_path.as_deref() == self.cover_image {
+            document::ImageLayoutRole::Cover
+        } else {
+            document::ImageLayoutRole::Inline
+        };
         self.push_node(
             document::DocumentNode::Image(document::ImageNode {
                 src: Arc::from(src),
                 resolved_path: resolved_path.as_deref().map(Arc::from),
                 resource_id,
+                intrinsic_size,
+                layout_role,
                 alt: Arc::from(element.attr("alt").unwrap_or_default()),
                 title: element.attr("title").map(Arc::from),
                 style,
             }),
             source_range,
         )
+    }
+
+    fn classify_standalone_image(&mut self) {
+        let mut image_ids = Vec::new();
+        let mut has_other_visible_content = false;
+        for (node_id, node) in self.chapter.nodes.iter_with_ids() {
+            match node {
+                document::DocumentNode::Image(_) => image_ids.push(node_id),
+                document::DocumentNode::Paragraph(block) => {
+                    has_other_visible_content |= self
+                        .chapter
+                        .text_pool
+                        .get(block.text)
+                        .is_some_and(|text| !text.trim().is_empty());
+                }
+                document::DocumentNode::Heading(heading) => {
+                    has_other_visible_content |= self
+                        .chapter
+                        .text_pool
+                        .get(heading.content.text)
+                        .is_some_and(|text| !text.trim().is_empty());
+                }
+                document::DocumentNode::Divider | document::DocumentNode::ForcedBreak => {
+                    has_other_visible_content = true;
+                }
+                document::DocumentNode::List(_)
+                | document::DocumentNode::ListItem(_)
+                | document::DocumentNode::BlockQuote(_)
+                | document::DocumentNode::Figure(_)
+                | document::DocumentNode::Table(_)
+                | document::DocumentNode::Footnote(_)
+                | document::DocumentNode::Container(_)
+                | document::DocumentNode::Unsupported(_) => {}
+            }
+        }
+        if has_other_visible_content || image_ids.len() != 1 {
+            return;
+        }
+        let Some(document::DocumentNode::Image(image)) = self.chapter.nodes.get_mut(image_ids[0])
+        else {
+            return;
+        };
+        if image.layout_role == document::ImageLayoutRole::Inline {
+            image.layout_role = document::ImageLayoutRole::Standalone;
+        }
     }
 
     fn footnote_node(
@@ -5238,6 +5389,73 @@ mod tests {
     }
 
     #[test]
+    fn linked_image_preserves_image_node_and_clickable_region() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "Linked image",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<a href="chapter-2.xhtml#target"><img src="images/part.jpg" alt="" /></a>"##,
+        )
+        .add_entry("EPUB/images/part.jpg", "image/jpeg", jpeg_header(600, 900))
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let (image_id, image) = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(node_id, node)| match node {
+                document::DocumentNode::Image(image) => Some((node_id, image)),
+                _ => None,
+            })
+            .expect("linked image node");
+
+        assert_eq!(image.resolved_path.as_deref(), Some("EPUB/images/part.jpg"));
+        assert_eq!(image.layout_role, document::ImageLayoutRole::Standalone);
+        assert!(!chapter.visible_text().contains("chapter-2.xhtml"));
+        assert!(!chapter
+            .nodes
+            .iter_with_ids()
+            .any(|(_, node)| matches!(node, document::DocumentNode::Paragraph(_))));
+        let link = chapter
+            .links
+            .iter()
+            .find(|link| link.source_node == image_id)
+            .expect("image link");
+        assert_eq!(link.href.as_ref(), "chapter-2.xhtml#target");
+        assert_eq!(
+            link.resolved_document.as_deref(),
+            Some("EPUB/chapter-2.xhtml")
+        );
+        assert_eq!(link.fragment.as_deref(), Some("target"));
+        assert_eq!(link.kind, document::LinkKind::Internal);
+        assert_eq!(link.text_range, None);
+
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::default(),
+        )
+        .expect("paginate linked image");
+        let page = pages.pages.first().expect("image page");
+        let image_fragment = page
+            .fragments
+            .iter()
+            .find(|fragment| {
+                fragment.node_id == image_id
+                    && fragment.kind == crate::layout::SceneFragmentKind::Image
+            })
+            .expect("image fragment");
+        let link_region = page
+            .links
+            .iter()
+            .find(|region| region.node_id == image_id)
+            .expect("clickable image region");
+        assert_eq!(link_region.rect, image_fragment.rect);
+    }
+
+    #[test]
     fn book_ir_indexes_lazy_image_dimensions_and_font_fingerprints() {
         let fixture = crate::testkit::EpubFixtureBuilder::epub3(
             crate::testkit::FixtureKind::HugeImage,
@@ -5281,6 +5499,217 @@ mod tests {
         assert_ne!(
             font.fingerprint,
             crate::core::ContentHash::from_bytes(b"EPUB/fonts/body.ttf")
+        );
+    }
+
+    #[test]
+    fn intrinsic_image_dimensions_drive_pagination_geometry() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "Intrinsic image layout",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<p>Before.</p><img src="images/pic.png" alt="intrinsic"/><p>After.</p>"#,
+        )
+        .add_entry("EPUB/images/pic.png", "image/png", png_header(240, 120))
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                LayoutUnit::from_px(400),
+                LayoutUnit::from_px(500),
+            )),
+        )
+        .expect("paginate");
+        let image = pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::Image)
+            .expect("image fragment");
+
+        assert_eq!(image.rect.width, LayoutUnit::from_px(240));
+        assert_eq!(image.rect.height, LayoutUnit::from_px(120));
+    }
+
+    #[test]
+    fn authored_image_dimensions_and_maxima_shape_pagination_geometry() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Authored image layout",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title><link rel="stylesheet" href="styles/book.css"/></head><body><p>Before.</p><img src="images/pic.png" alt="styled"/><p>After.</p></body></html>"#,
+        )
+        .add_stylesheet(
+            "EPUB/styles/book.css",
+            "img { width: 50%; height: auto; max-width: 120px; max-height: 90px; }",
+        )
+        .add_entry("EPUB/images/pic.png", "image/png", png_header(400, 200))
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                LayoutUnit::from_px(400),
+                LayoutUnit::from_px(500),
+            )),
+        )
+        .expect("paginate");
+        let image = pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::Image)
+            .expect("image fragment");
+
+        assert_eq!(image.rect.width, LayoutUnit::from_px(120));
+        assert_eq!(image.rect.height, LayoutUnit::from_px(60));
+    }
+
+    #[test]
+    fn image_only_page_treats_indefinite_percentage_height_as_auto() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "Image-only page",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<img src="images/pic.png" alt="standalone" style="height: 70%"/>"#,
+        )
+        .add_entry("EPUB/images/pic.png", "image/png", png_header(600, 900))
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        assert!(chapter.nodes.iter_with_ids().any(|(_, node)| matches!(
+            node,
+            document::DocumentNode::Image(image)
+                if image.layout_role == document::ImageLayoutRole::Standalone
+                    && image.intrinsic_size
+                        == Some(document::ImageSize { width: 600, height: 900 })
+        )));
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                LayoutUnit::from_px(400),
+                LayoutUnit::from_px(400),
+            )),
+        )
+        .expect("paginate");
+        let image = pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::Image)
+            .expect("image fragment");
+
+        assert!((image.rect.width.to_f64_px() - 266.67).abs() < 0.05);
+        assert_eq!(image.rect.height, LayoutUnit::from_px(400));
+    }
+
+    #[test]
+    fn svg_wrapped_cover_surfaces_only_the_safe_bitmap_resource() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "SVG-wrapped cover",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Cover",
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 917"><image width="600" height="917" xlink:href="images/cover.jpg"/></svg>"#,
+        )
+        .add_entry(
+            "EPUB/images/cover.jpg",
+            "image/jpeg",
+            jpeg_header(600, 917),
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let image_node = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(_, node)| match node {
+                document::DocumentNode::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("sanitized bitmap image node");
+
+        assert_eq!(
+            image_node.resolved_path.as_deref(),
+            Some("EPUB/images/cover.jpg")
+        );
+        assert_eq!(
+            image_node.intrinsic_size,
+            Some(document::ImageSize {
+                width: 600,
+                height: 917,
+            })
+        );
+        assert!(!chapter.nodes.iter_with_ids().any(|(_, node)| matches!(
+            node,
+            document::DocumentNode::Unsupported(unsupported)
+                if unsupported.element.as_ref() == "svg" || unsupported.element.as_ref() == "image"
+        )));
+    }
+
+    #[test]
+    fn publication_cover_path_marks_cover_image_role() {
+        let resource_id = ResourceId::new(7);
+        let mut resources = document::ResourceTable::new();
+        resources.push(document::ResourceInfo {
+            id: resource_id,
+            path: Arc::from("EPUB/images/cover.jpg"),
+            media_type: Arc::from("image/jpeg"),
+            kind: document::ResourceKind::Image,
+            compressed_size: 12,
+            uncompressed_size: 12,
+            compression_method: 0,
+        });
+        resources.set_image_size(
+            resource_id,
+            Some(document::ImageSize {
+                width: 600,
+                height: 917,
+            }),
+        );
+
+        let chapter = chapter_ir_from_xhtml(
+            DocumentId::new(0),
+            "EPUB/titlepage.xhtml",
+            "Cover",
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><img src="images/cover.jpg"/></body></html>"#,
+            ChapterResourceContext {
+                resources: &resources,
+                cover_image: Some("EPUB/images/cover.jpg"),
+                store: None,
+                options: OpenOptions::default(),
+            },
+        )
+        .expect("chapter ir");
+        let image = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(_, node)| match node {
+                document::DocumentNode::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("cover image");
+
+        assert_eq!(image.layout_role, document::ImageLayoutRole::Cover);
+        assert_eq!(
+            image.intrinsic_size,
+            Some(document::ImageSize {
+                width: 600,
+                height: 917,
+            })
         );
     }
 
@@ -5339,6 +5768,19 @@ mod tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
         bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes
+    }
+
+    fn jpeg_header(width: u16, height: u16) -> Vec<u8> {
+        const APP_PAYLOAD_BYTES: usize = 8 * 1024;
+        let app_segment_len = u16::try_from(APP_PAYLOAD_BYTES + 2).expect("APP segment length");
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+        bytes.extend_from_slice(&app_segment_len.to_be_bytes());
+        bytes.resize(bytes.len() + APP_PAYLOAD_BYTES, 0);
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03, 0x01, 0x11, 0x00]);
         bytes
     }
 }
