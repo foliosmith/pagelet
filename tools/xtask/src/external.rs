@@ -455,7 +455,10 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
@@ -463,6 +466,7 @@ mod tests {
     const W3C_SHA256: &str = "4d0f257acd4f441bbbc1a7c7e6b6c7dac60f250008f2bd25dd150af2dcdfcdfa";
     const EPUBCHECK_SHA256: &str =
         "6c07e68584b2e2ce2f89fe06e1246dfead3eb36b46b340e7d93524f29dcff6c5";
+    static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn manifest_parses_versioned_external_artifacts() {
@@ -561,8 +565,9 @@ id = "generated/minimal-epub3"
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
+        let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!(
-            "pagelet-external-test-{}-{nonce}",
+            "pagelet-external-test-{}-{nonce}-{sequence}",
             std::process::id()
         ))
     }
