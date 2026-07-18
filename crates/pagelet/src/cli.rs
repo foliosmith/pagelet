@@ -766,6 +766,7 @@ fn document_node_kind(node: &DocumentNode) -> &'static str {
 fn image_layout_role_name(role: crate::document::ImageLayoutRole) -> &'static str {
     match role {
         crate::document::ImageLayoutRole::Inline => "inline",
+        crate::document::ImageLayoutRole::Block => "block",
         crate::document::ImageLayoutRole::Cover => "cover",
         crate::document::ImageLayoutRole::Standalone => "standalone",
     }

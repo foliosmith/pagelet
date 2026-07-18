@@ -10,7 +10,7 @@ use crate::{
     },
     document::{
         BlockText, ChapterIr, ComputedStyle as DocumentComputedStyle, DocumentNode,
-        ImageLayoutRole, ImageNode, LinkKind, LinkTarget, StyleTable,
+        ImageLayoutRole, ImageNode, LinkKind, LinkTarget, ListNode, StyleTable,
     },
     text::{
         FontDescriptor, FontFallbackChain, FontSetFingerprint, FontStyle, HeightBehavior,
@@ -2630,19 +2630,8 @@ fn collect_blocks(
             let (geometry, child_containing) =
                 container_geometry(&chapter.styles, list.style, containing);
             for (index, child) in list.children.iter().enumerate() {
-                let marker = if list.ordered {
-                    Arc::from(format!("{}.", index + 1))
-                } else {
-                    Arc::from("•")
-                };
-                collect_blocks(
-                    chapter,
-                    *child,
-                    depth + 1,
-                    Some(marker),
-                    child_containing,
-                    blocks,
-                );
+                let marker = list_marker(chapter, list, index);
+                collect_blocks(chapter, *child, depth + 1, marker, child_containing, blocks);
             }
             apply_container_vertical_geometry(blocks, start, geometry);
         }
@@ -2816,6 +2805,30 @@ fn collect_blocks(
             }
         }
     }
+}
+
+fn list_marker(chapter: &ChapterIr, list: &ListNode, index: usize) -> Option<Arc<str>> {
+    let style = chapter.styles.get(list.style);
+    let marker_is_hidden = style.is_some_and(|style| {
+        style
+            .properties
+            .get("list-style-type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+            || style.properties.get("list-style").is_some_and(|value| {
+                value
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("none"))
+            })
+    });
+    if marker_is_hidden {
+        return None;
+    }
+
+    Some(if list.ordered {
+        Arc::from(format!("{}.", index + 1))
+    } else {
+        Arc::from("•")
+    })
 }
 
 fn container_geometry(
@@ -3035,8 +3048,10 @@ fn layout_image(
         containing.inset_left,
         containing.inset_right,
     );
-    if image.layout_role != ImageLayoutRole::Inline
-        && document_style.is_none_or(|style| !has_explicit_margin(style))
+    if matches!(
+        image.layout_role,
+        ImageLayoutRole::Cover | ImageLayoutRole::Standalone
+    ) && document_style.is_none_or(|style| !has_explicit_margin(style))
     {
         style.margin_top = LayoutUnit::ZERO;
         style.margin_right = LayoutUnit::ZERO;
@@ -3136,7 +3151,12 @@ fn resolve_image_size(
         ImageLayoutRole::Inline => {
             available_width.min(LayoutUnit::from_px(INLINE_IMAGE_MAX_WIDTH_PX))
         }
-        ImageLayoutRole::Cover | ImageLayoutRole::Standalone => available_width,
+        ImageLayoutRole::Block if authored_width.is_none() => {
+            available_width.min(LayoutUnit::from_px(INLINE_IMAGE_MAX_WIDTH_PX))
+        }
+        ImageLayoutRole::Block | ImageLayoutRole::Cover | ImageLayoutRole::Standalone => {
+            available_width
+        }
     };
     let max_width = authored_max_width
         .map_or(role_max_width, |value| value.min(role_max_width))

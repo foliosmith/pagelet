@@ -793,9 +793,11 @@ pub struct ImageNode {
 /// How an image participates in page geometry.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ImageLayoutRole {
-    /// An image embedded among normal chapter content.
+    /// An image embedded in an inline formatting context.
     #[default]
     Inline,
+    /// An image emitted as an independent block among chapter content.
+    Block,
     /// The publication-declared cover bitmap.
     Cover,
     /// The sole visible content of one spine document.

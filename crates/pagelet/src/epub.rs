@@ -1968,6 +1968,8 @@ fn is_supported_css_property(property: &str) -> bool {
             | "font-stretch"
             | "line-height"
             | "letter-spacing"
+            | "list-style"
+            | "list-style-type"
             | "text-align"
             | "text-indent"
             | "margin"
@@ -3039,7 +3041,7 @@ impl ChapterBuilder<'_> {
         let layout_role = if resolved_path.as_deref() == self.cover_image {
             document::ImageLayoutRole::Cover
         } else {
-            document::ImageLayoutRole::Inline
+            document::ImageLayoutRole::Block
         };
         self.push_node(
             document::DocumentNode::Image(document::ImageNode {
@@ -3096,7 +3098,10 @@ impl ChapterBuilder<'_> {
         else {
             return;
         };
-        if image.layout_role == document::ImageLayoutRole::Inline {
+        if matches!(
+            image.layout_role,
+            document::ImageLayoutRole::Inline | document::ImageLayoutRole::Block
+        ) {
             image.layout_role = document::ImageLayoutRole::Standalone;
         }
     }
@@ -5344,6 +5349,34 @@ mod tests {
     }
 
     #[test]
+    fn authored_list_style_none_suppresses_ordered_list_markers() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Markerless contents",
+        )
+        .add_xhtml(
+            "EPUB/contents.xhtml",
+            "contents",
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Contents</title><link rel="stylesheet" href="styles.css"/></head><body><ol class="contents"><li><a href="chapter.xhtml">Chapter</a></li></ol></body></html>"#,
+        )
+        .add_stylesheet("EPUB/styles.css", ".contents { list-style: none; }")
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("contents chapter ir");
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::default()),
+        )
+        .expect("paginate markerless contents");
+
+        assert!(pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .all(|fragment| fragment.kind != crate::layout::SceneFragmentKind::Marker));
+    }
+
+    #[test]
     fn footnote_noterefs_get_backlinks_and_unreferenced_notes_are_skipped() {
         let fixture = crate::testkit::EpubFixtureBuilder::epub3(
             crate::testkit::FixtureKind::FootnoteCollision,
@@ -5609,6 +5642,95 @@ mod tests {
 
         assert_eq!(image.rect.width, LayoutUnit::from_px(120));
         assert_eq!(image.rect.height, LayoutUnit::from_px(60));
+    }
+
+    #[test]
+    fn part0010_full_width_banner_uses_authored_width() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::CssCascade,
+            "Part 0010 banner",
+        )
+        .add_xhtml(
+            "EPUB/part0010.xhtml",
+            "part0010",
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>part0010</title><link rel="stylesheet" type="text/css" href="stylesheet.css"/></head><body><div class="class218-0"><img src="image217.jpg" alt="" class="class218-1"/></div><div class="class222">Pip knew where they lived.</div></body></html>"#,
+        )
+        .add_stylesheet(
+            "EPUB/stylesheet.css",
+            ".class218-0 { text-align: center; } .class218-1 { width: 100%; } .class222 { margin-top: 3.2em; }",
+        )
+        .add_entry(
+            "EPUB/image217.jpg",
+            "image/jpeg",
+            jpeg_header(1522, 422),
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("part0010 chapter ir");
+        let banner = chapter
+            .nodes
+            .iter_with_ids()
+            .find_map(|(_, node)| match node {
+                document::DocumentNode::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("part0010 banner node");
+        assert_eq!(banner.layout_role, document::ImageLayoutRole::Block);
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                LayoutUnit::from_px(496),
+                LayoutUnit::from_px(800),
+            )),
+        )
+        .expect("paginate part0010");
+        let image = pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::Image)
+            .expect("part0010 banner fragment");
+
+        assert_eq!(image.rect.width, LayoutUnit::from_px(496));
+        assert!((image.rect.height.to_f64_px() - 137.52).abs() < 0.02);
+    }
+
+    #[test]
+    fn block_image_without_authored_width_keeps_safety_cap() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::HugeImage,
+            "Unauthored block image",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r#"<div><img src="images/banner.jpg" alt=""/></div><p>After the image.</p>"#,
+        )
+        .add_entry(
+            "EPUB/images/banner.jpg",
+            "image/jpeg",
+            jpeg_header(1522, 422),
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+        let pages = crate::layout::paginate_chapter_with_options(
+            &chapter,
+            &crate::text::DefaultTextBackend::new(),
+            crate::layout::LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                LayoutUnit::from_px(496),
+                LayoutUnit::from_px(800),
+            )),
+        )
+        .expect("paginate");
+        let image = pages
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .find(|fragment| fragment.kind == crate::layout::SceneFragmentKind::Image)
+            .expect("image fragment");
+
+        assert_eq!(image.rect.width, LayoutUnit::from_px(280));
+        assert!((image.rect.height.to_f64_px() - 77.64).abs() < 0.02);
     }
 
     #[test]
