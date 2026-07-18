@@ -584,8 +584,9 @@ pub struct BookSummary {
     pub store_stats: StoreStats,
 }
 
-struct OpenedBook {
-    summary: BookSummary,
+#[derive(Debug)]
+pub(crate) struct OpenedBook {
+    pub(crate) summary: BookSummary,
     store: ZipPublicationStore,
 }
 
@@ -715,6 +716,42 @@ fn open_book_context(
         },
         store,
     })
+}
+
+pub(crate) fn open_book_session_context(
+    bytes: impl Into<Vec<u8>>,
+    options: OpenOptions,
+) -> Result<OpenedBook, PageletError> {
+    open_book_context(bytes, options)
+}
+
+pub(crate) fn open_spine_item_from_context(
+    opened: &OpenedBook,
+    spine_index: usize,
+    options: OpenOptions,
+) -> Result<document::ChapterIr, PageletError> {
+    let book_ir = book_ir_from_opened(opened, options)?;
+    let manifest_item = spine_manifest_item(&opened.summary.package, spine_index)?;
+    let bytes = opened
+        .store
+        .read_path(&manifest_item.resolved_path, options.compatibility_mode)?;
+    let xhtml = resource_text(&bytes)?;
+    let title = text_of_first(&xhtml, &["title"]).unwrap_or_else(|| {
+        navigation_title_for_href(&opened.summary.navigation, &manifest_item.resolved_path)
+            .unwrap_or_else(|| manifest_item.id.clone())
+    });
+    chapter_ir_from_xhtml(
+        DocumentId::new(u32::try_from(spine_index).unwrap_or(u32::MAX)),
+        &manifest_item.resolved_path,
+        &title,
+        &xhtml,
+        ChapterResourceContext {
+            resources: &book_ir.resources,
+            cover_image: book_ir.metadata.cover_image.as_deref(),
+            store: Some(&opened.store),
+            options,
+        },
+    )
 }
 
 fn book_ir_from_summary(book: &BookSummary) -> document::BookIr {
