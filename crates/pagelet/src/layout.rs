@@ -1,6 +1,12 @@
 //! Deterministic layout, fragmentation, pagination, and page scenes.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crate::{
     core::{
@@ -1265,6 +1271,131 @@ pub struct PaginatedDocument {
     pub complete: bool,
 }
 
+/// Minimum layout work required after a document or configuration change.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum LayoutImpact {
+    /// Only paint properties changed; page scenes remain layout-identical.
+    PaintOnly,
+    /// Page height or vertical insets changed; existing text measurements can be replayed.
+    RepackOnly,
+    /// Line-breaking inputs changed and text must be reshaped.
+    Reflow,
+    /// Parsed content, layout CSS, or an engine dependency changed.
+    Reparse,
+}
+
+/// Monotonic identity of one layout request.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct LayoutGeneration(u64);
+
+impl LayoutGeneration {
+    /// Create a generation from its session-owned counter.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the raw generation counter.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Inputs required to incrementally repaginate one chapter.
+#[derive(Debug, Clone, Copy)]
+pub struct IncrementalPaginationRequest<'a> {
+    /// Chapter used to produce `previous_document`.
+    pub previous_chapter: &'a ChapterIr,
+    /// Previously accepted pagination result.
+    pub previous_document: &'a PaginatedDocument,
+    /// Options used to produce `previous_document`.
+    pub previous_options: LayoutOptions,
+    /// Current chapter to paginate.
+    pub chapter: &'a ChapterIr,
+    /// Current pagination options.
+    pub options: LayoutOptions,
+    /// Generation captured when this work was requested.
+    pub generation: LayoutGeneration,
+    /// Generation currently owned by the layout session.
+    pub current_generation: LayoutGeneration,
+    /// Engine dependencies used by the previous result.
+    pub previous_versions: EngineVersions,
+    /// Engine dependencies required by the current result.
+    pub versions: EngineVersions,
+}
+
+impl<'a> IncrementalPaginationRequest<'a> {
+    /// Create an incremental request using the current engine dependency versions.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        previous_chapter: &'a ChapterIr,
+        previous_document: &'a PaginatedDocument,
+        previous_options: LayoutOptions,
+        chapter: &'a ChapterIr,
+        options: LayoutOptions,
+        generation: LayoutGeneration,
+        current_generation: LayoutGeneration,
+    ) -> Self {
+        Self {
+            previous_chapter,
+            previous_document,
+            previous_options,
+            chapter,
+            options,
+            generation,
+            current_generation,
+            previous_versions: EngineVersions::CURRENT,
+            versions: EngineVersions::CURRENT,
+        }
+    }
+}
+
+/// Work and reuse observed during incremental pagination.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IncrementalPaginationReport {
+    /// Classified impact that selected the invalidation path.
+    pub impact: LayoutImpact,
+    /// First layout node whose derived block changed.
+    pub earliest_dirty_node: Option<NodeId>,
+    /// Page checkpoint from which regeneration began.
+    pub checkpoint_page: Option<u32>,
+    /// Unaffected leading pages retained from the previous result.
+    pub reused_prefix_pages: usize,
+    /// Pages actually regenerated, including convergence probes.
+    pub regenerated_pages: usize,
+    /// Previous tail pages attached after convergence.
+    pub reused_tail_pages: usize,
+    /// Paragraph measurement requests served from previous page scenes.
+    pub text_measurements_reused: usize,
+    /// Generation attached to the accepted result.
+    pub generation: LayoutGeneration,
+}
+
+/// Accepted incremental document and its observability report.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IncrementalPaginationResult {
+    /// Current page scenes.
+    pub document: PaginatedDocument,
+    /// Invalidation, regeneration, and reuse details.
+    pub report: IncrementalPaginationReport,
+}
+
+/// Result of checking a generated document against the session generation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum IncrementalPaginationOutcome {
+    /// The generation was current and may replace the accepted document.
+    Applied(IncrementalPaginationResult),
+    /// The work belongs to an obsolete generation and was discarded.
+    Stale {
+        /// Generation carried by the rejected work.
+        rejected_generation: LayoutGeneration,
+        /// Generation currently owned by the session.
+        current_generation: LayoutGeneration,
+    },
+}
+
 /// Prepared two-phase layout that requests all host text metrics in one batch.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostMeasuredLayout {
@@ -1394,6 +1525,507 @@ pub fn paginate_chapter_with_options(
 ) -> Result<PaginatedDocument, PageletError> {
     let blocks = layout_blocks(chapter, options.constraints);
     paginate_prepared_blocks(chapter, &blocks, text_backend, options)
+}
+
+/// Repaginate from the nearest safe page checkpoint and reuse a converged tail.
+///
+/// A stale generation is rejected before parsing layout blocks or measuring text.
+/// Tail reuse requires two consecutive page matches so a transient boundary match
+/// cannot attach an incompatible remainder.
+pub fn repaginate_incrementally(
+    request: IncrementalPaginationRequest<'_>,
+    text_backend: &dyn TextBackend,
+) -> Result<IncrementalPaginationOutcome, PageletError> {
+    if request.generation != request.current_generation {
+        return Ok(IncrementalPaginationOutcome::Stale {
+            rejected_generation: request.generation,
+            current_generation: request.current_generation,
+        });
+    }
+
+    let previous_blocks = layout_blocks(
+        request.previous_chapter,
+        request.previous_options.constraints,
+    );
+    let blocks = layout_blocks(request.chapter, request.options.constraints);
+    let dependencies_match = request.previous_versions == request.versions;
+    let text_identity_matches =
+        previous_text_identity_matches(request.previous_document, text_backend);
+    let impact = classify_layout_impact(
+        &request,
+        &previous_blocks,
+        &blocks,
+        dependencies_match,
+        text_identity_matches,
+    );
+
+    if impact == LayoutImpact::PaintOnly {
+        let mut document = request.previous_document.clone();
+        retag_pages(
+            &mut document.pages,
+            request.chapter,
+            request.options,
+            text_backend,
+        );
+        document.diagnostics = collect_page_diagnostics(&document.pages);
+        validate_layout_invariants(request.chapter, &document.pages)?;
+        return Ok(IncrementalPaginationOutcome::Applied(
+            IncrementalPaginationResult {
+                report: IncrementalPaginationReport {
+                    impact,
+                    earliest_dirty_node: None,
+                    checkpoint_page: None,
+                    reused_prefix_pages: document.pages.len(),
+                    regenerated_pages: 0,
+                    reused_tail_pages: 0,
+                    text_measurements_reused: 0,
+                    generation: request.generation,
+                },
+                document,
+            },
+        ));
+    }
+
+    let dirty_index = if impact == LayoutImpact::Reparse {
+        first_dirty_block(&previous_blocks, &blocks).unwrap_or(0)
+    } else {
+        0
+    };
+    let earliest_dirty_node = blocks
+        .get(dirty_index)
+        .or_else(|| previous_blocks.get(dirty_index))
+        .map(|block| block.node_id);
+    let checkpoint = if impact == LayoutImpact::Reparse {
+        checkpoint_for_dirty_block(request.previous_document, &previous_blocks, dirty_index)
+    } else {
+        0
+    }
+    .min(request.previous_document.pages.len());
+
+    let mut pages = request.previous_document.pages[..checkpoint].to_vec();
+    retag_pages(&mut pages, request.chapter, request.options, text_backend);
+
+    if blocks.is_empty() {
+        pages.clear();
+        let document = PaginatedDocument {
+            pages,
+            diagnostics: Vec::new(),
+            complete: true,
+        };
+        return Ok(IncrementalPaginationOutcome::Applied(
+            IncrementalPaginationResult {
+                document,
+                report: IncrementalPaginationReport {
+                    impact,
+                    earliest_dirty_node,
+                    checkpoint_page: Some(0),
+                    reused_prefix_pages: 0,
+                    regenerated_pages: 0,
+                    reused_tail_pages: 0,
+                    text_measurements_reused: 0,
+                    generation: request.generation,
+                },
+            },
+        ));
+    }
+
+    let allow_measurement_replay = dependencies_match
+        && text_identity_matches
+        && matches!(impact, LayoutImpact::RepackOnly | LayoutImpact::Reparse);
+    let replay_backend = ReplayTextBackend::new(
+        text_backend,
+        &request.previous_document.pages,
+        allow_measurement_replay,
+    );
+    let cancel = CancellationToken::new();
+    let mut token = checkpoint_token(
+        &request,
+        text_backend,
+        &previous_blocks,
+        &blocks,
+        dirty_index,
+        checkpoint,
+    );
+    let mut regenerated_pages = 0_usize;
+    let mut matching_run_start = None;
+    let mut consecutive_matches = 0_usize;
+    let mut reused_tail_pages = 0_usize;
+
+    while let Some(start) = token {
+        if pages.len() >= usize::try_from(request.options.max_pages).unwrap_or(usize::MAX) {
+            return Err(PageletError::ResourceLimitExceeded(
+                ResourceLimitError::new(
+                    ResourceLimitKind::LayoutFragments,
+                    u64::from(request.options.max_pages),
+                    u64::try_from(pages.len()).unwrap_or(u64::MAX),
+                ),
+            ));
+        }
+        let Some(page) = paginate_page_from_blocks(
+            request.chapter,
+            &blocks,
+            &replay_backend,
+            request.options,
+            &cancel,
+            start,
+        )?
+        else {
+            break;
+        };
+        if usize::try_from(page.page_index).unwrap_or(usize::MAX) != pages.len() {
+            return Err(layout_error(
+                "incremental pagination checkpoint produced a non-contiguous page index",
+            ));
+        }
+
+        regenerated_pages = regenerated_pages.saturating_add(1);
+        let page_index = pages.len();
+        let page_matches = dependencies_match
+            && request
+                .previous_document
+                .pages
+                .get(page_index)
+                .is_some_and(|previous| {
+                    page_matches_for_tail_reuse(
+                        &page,
+                        previous,
+                        request.chapter,
+                        request.options,
+                        text_backend,
+                    )
+                });
+        if page_matches {
+            if consecutive_matches == 0 {
+                matching_run_start = Some(page_index);
+            }
+            consecutive_matches = consecutive_matches.saturating_add(1);
+        } else {
+            matching_run_start = None;
+            consecutive_matches = 0;
+        }
+
+        token = page.next_break_token.clone();
+        pages.push(page);
+
+        if consecutive_matches >= 2 {
+            let tail_start = matching_run_start.expect("matching run has a start");
+            pages.truncate(tail_start);
+            let mut tail = request.previous_document.pages[tail_start..].to_vec();
+            retag_pages(&mut tail, request.chapter, request.options, text_backend);
+            reused_tail_pages = tail.len();
+            pages.extend(tail);
+            break;
+        }
+        if token.is_none() {
+            break;
+        }
+    }
+
+    let diagnostics = collect_page_diagnostics(&pages);
+    let complete = pages
+        .last()
+        .is_none_or(|page| page.next_break_token.is_none());
+    validate_layout_invariants(request.chapter, &pages)?;
+    let document = PaginatedDocument {
+        pages,
+        diagnostics,
+        complete,
+    };
+    Ok(IncrementalPaginationOutcome::Applied(
+        IncrementalPaginationResult {
+            document,
+            report: IncrementalPaginationReport {
+                impact,
+                earliest_dirty_node,
+                checkpoint_page: Some(u32::try_from(checkpoint).unwrap_or(u32::MAX)),
+                reused_prefix_pages: checkpoint,
+                regenerated_pages,
+                reused_tail_pages,
+                text_measurements_reused: replay_backend.cache_hits(),
+                generation: request.generation,
+            },
+        },
+    ))
+}
+
+fn classify_layout_impact(
+    request: &IncrementalPaginationRequest<'_>,
+    previous_blocks: &[LayoutBlock],
+    blocks: &[LayoutBlock],
+    dependencies_match: bool,
+    text_identity_matches: bool,
+) -> LayoutImpact {
+    if !dependencies_match
+        || request.previous_options.limits != request.options.limits
+        || request.previous_options.max_pages != request.options.max_pages
+    {
+        return LayoutImpact::Reparse;
+    }
+    if !text_identity_matches {
+        return LayoutImpact::Reflow;
+    }
+    let previous = request.previous_options.constraints;
+    let current = request.options.constraints;
+    let horizontal_matches = previous.viewport_width == current.viewport_width
+        && previous.margin_start == current.margin_start
+        && previous.margin_end == current.margin_end;
+    if !horizontal_matches {
+        return LayoutImpact::Reflow;
+    }
+    if previous_blocks != blocks
+        || !non_paint_chapter_inputs_match(request.previous_chapter, request.chapter)
+    {
+        return LayoutImpact::Reparse;
+    }
+    let vertical_matches = previous.viewport_height == current.viewport_height
+        && previous.margin_top == current.margin_top
+        && previous.margin_bottom == current.margin_bottom;
+    if vertical_matches {
+        LayoutImpact::PaintOnly
+    } else {
+        LayoutImpact::RepackOnly
+    }
+}
+
+fn non_paint_chapter_inputs_match(previous: &ChapterIr, current: &ChapterIr) -> bool {
+    normalized_non_paint_chapter(previous) == normalized_non_paint_chapter(current)
+}
+
+fn normalized_non_paint_chapter(chapter: &ChapterIr) -> ChapterIr {
+    let mut normalized = chapter.clone();
+    normalized.content_hash = ContentHash::from_bytes(b"incremental-layout-content");
+    normalized.styles = StyleTable::new();
+    let default_style = crate::core::StyleId::new(0);
+    for raw_id in 0..normalized.nodes.len() {
+        let node_id = NodeId::new(u32::try_from(raw_id).unwrap_or(u32::MAX));
+        let Some(node) = normalized.nodes.get_mut(node_id) else {
+            continue;
+        };
+        match node {
+            DocumentNode::Paragraph(block) => {
+                block.style = default_style;
+                for run in &mut block.style_runs {
+                    run.style = default_style;
+                }
+            }
+            DocumentNode::Heading(heading) => {
+                heading.content.style = default_style;
+                for run in &mut heading.content.style_runs {
+                    run.style = default_style;
+                }
+            }
+            DocumentNode::List(list) => list.style = default_style,
+            DocumentNode::ListItem(item) => item.style = default_style,
+            DocumentNode::BlockQuote(container)
+            | DocumentNode::Figure(container)
+            | DocumentNode::Table(container)
+            | DocumentNode::Container(container) => container.style = default_style,
+            DocumentNode::Image(image) => image.style = default_style,
+            DocumentNode::Footnote(note) => note.style = default_style,
+            DocumentNode::Unsupported(unsupported) => unsupported.style = default_style,
+            DocumentNode::Divider | DocumentNode::ForcedBreak => {}
+        }
+    }
+    normalized
+}
+
+fn previous_text_identity_matches(
+    previous: &PaginatedDocument,
+    text_backend: &dyn TextBackend,
+) -> bool {
+    previous.pages.iter().all(|page| {
+        page.text_backend_id == text_backend.backend_id()
+            && page.font_fingerprint == text_backend.font_fingerprint()
+    })
+}
+
+fn first_dirty_block(previous: &[LayoutBlock], current: &[LayoutBlock]) -> Option<usize> {
+    let common = previous.len().min(current.len());
+    previous[..common]
+        .iter()
+        .zip(&current[..common])
+        .position(|(left, right)| left != right)
+        .or_else(|| (previous.len() != current.len()).then_some(common))
+}
+
+fn checkpoint_for_dirty_block(
+    previous: &PaginatedDocument,
+    previous_blocks: &[LayoutBlock],
+    dirty_index: usize,
+) -> usize {
+    if let Some(dirty_node) = previous_blocks.get(dirty_index).map(|block| block.node_id) {
+        if let Some(page) = previous
+            .pages
+            .iter()
+            .position(|page| page_contains_node(page, dirty_node))
+        {
+            return page;
+        }
+    }
+    for (index, page) in previous.pages.iter().enumerate() {
+        let Some(end) = &page.next_break_token else {
+            return index;
+        };
+        let end_index = usize::try_from(end.child_index).unwrap_or(usize::MAX);
+        if end_index > dirty_index || (end_index == dirty_index && end.continuation) {
+            return index;
+        }
+        if end_index == dirty_index {
+            return index.saturating_add(1);
+        }
+    }
+    previous.pages.len()
+}
+
+fn page_contains_node(page: &PageScene, node_id: NodeId) -> bool {
+    page.text_paints
+        .iter()
+        .any(|paint| paint.node_id == node_id)
+        || page
+            .fragments
+            .iter()
+            .any(|fragment| fragment.node_id == node_id)
+}
+
+fn checkpoint_token(
+    request: &IncrementalPaginationRequest<'_>,
+    text_backend: &dyn TextBackend,
+    previous_blocks: &[LayoutBlock],
+    blocks: &[LayoutBlock],
+    dirty_index: usize,
+    checkpoint: usize,
+) -> Option<BreakToken> {
+    if checkpoint == 0 {
+        return blocks.first().map(|block| {
+            BreakToken::start(
+                request.chapter,
+                request.options,
+                text_backend,
+                block.node_id,
+            )
+        });
+    }
+    if let Some(previous_start) = request
+        .previous_document
+        .pages
+        .get(checkpoint.saturating_sub(1))
+        .and_then(|page| page.next_break_token.as_ref())
+    {
+        let block_index = usize::try_from(previous_start.child_index).unwrap_or(usize::MAX);
+        if let Some(block) = blocks.get(block_index) {
+            let unchanged_resume = previous_blocks
+                .get(block_index)
+                .zip(blocks.get(block_index))
+                .is_some_and(|(previous, current)| previous == current);
+            return Some(BreakToken::for_position(
+                TokenContext {
+                    chapter: request.chapter,
+                    options: request.options,
+                    text_backend,
+                },
+                BreakTokenPosition::new(
+                    block.node_id,
+                    block_index,
+                    if unchanged_resume {
+                        previous_start.text_offset
+                    } else {
+                        0
+                    },
+                    unchanged_resume && previous_start.continuation,
+                    u32::try_from(checkpoint).unwrap_or(u32::MAX),
+                ),
+            ));
+        }
+    }
+    let start_index = dirty_index.min(blocks.len());
+    blocks.get(start_index).map(|block| {
+        BreakToken::for_position(
+            TokenContext {
+                chapter: request.chapter,
+                options: request.options,
+                text_backend,
+            },
+            BreakTokenPosition::new(
+                block.node_id,
+                start_index,
+                0,
+                false,
+                u32::try_from(checkpoint).unwrap_or(u32::MAX),
+            ),
+        )
+    })
+}
+
+fn page_matches_for_tail_reuse(
+    current: &PageScene,
+    previous: &PageScene,
+    chapter: &ChapterIr,
+    options: LayoutOptions,
+    text_backend: &dyn TextBackend,
+) -> bool {
+    if current.fingerprint != previous.fingerprint
+        || !break_tokens_match_for_reuse(
+            current.next_break_token.as_ref(),
+            previous.next_break_token.as_ref(),
+        )
+    {
+        return false;
+    }
+    let mut retagged = previous.clone();
+    retag_page(&mut retagged, chapter, options, text_backend);
+    current == &retagged
+}
+
+fn break_tokens_match_for_reuse(
+    current: Option<&BreakToken>,
+    previous: Option<&BreakToken>,
+) -> bool {
+    match (current, previous) {
+        (None, None) => true,
+        (Some(current), Some(previous)) => {
+            current.node_id == previous.node_id
+                && current.child_index == previous.child_index
+                && current.text_offset == previous.text_offset
+                && current.continuation == previous.continuation
+                && current.page_index == previous.page_index
+                && current.config_fingerprint == previous.config_fingerprint
+                && current.text_backend_id == previous.text_backend_id
+                && current.font_fingerprint == previous.font_fingerprint
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn retag_pages(
+    pages: &mut [PageScene],
+    chapter: &ChapterIr,
+    options: LayoutOptions,
+    text_backend: &dyn TextBackend,
+) {
+    for page in pages {
+        retag_page(page, chapter, options, text_backend);
+    }
+}
+
+fn retag_page(
+    page: &mut PageScene,
+    chapter: &ChapterIr,
+    options: LayoutOptions,
+    text_backend: &dyn TextBackend,
+) {
+    if let Some(token) = &mut page.next_break_token {
+        token.content_fingerprint = chapter.content_hash;
+        token.config_fingerprint = config_fingerprint(options.constraints);
+        token.text_backend_id = text_backend.backend_id();
+        token.font_fingerprint = text_backend.font_fingerprint();
+    }
+}
+
+fn collect_page_diagnostics(pages: &[PageScene]) -> Vec<Diagnostic> {
+    pages
+        .iter()
+        .flat_map(|page| page.diagnostics.iter().cloned())
+        .collect()
 }
 
 fn paginate_prepared_blocks(
@@ -1824,6 +2456,7 @@ fn paginate_page_from_blocks(
     cancel: &CancellationToken,
     start: BreakToken,
 ) -> Result<Option<PageScene>, PageletError> {
+    validate_break_token(chapter, blocks, text_backend, options, &start)?;
     if usize::try_from(start.child_index).unwrap_or(usize::MAX) >= blocks.len() {
         return Ok(None);
     }
@@ -2052,9 +2685,41 @@ fn paginate_page_from_blocks(
     page.semantics = semantic_nodes(&page.text_paints, &page.paragraphs, &page.fragments);
     page.diagnostics = diagnostics;
     page.next_break_token = next_token;
-    page.fingerprint = fingerprint_page(chapter, options, text_backend, &page);
+    page.fingerprint = fingerprint_page(options, text_backend, &page);
 
     Ok(Some(page.finish()))
+}
+
+fn validate_break_token(
+    chapter: &ChapterIr,
+    blocks: &[LayoutBlock],
+    text_backend: &dyn TextBackend,
+    options: LayoutOptions,
+    token: &BreakToken,
+) -> Result<(), PageletError> {
+    if token.content_fingerprint != chapter.content_hash {
+        return Err(layout_error("break token content fingerprint is stale"));
+    }
+    if token.config_fingerprint != config_fingerprint(options.constraints) {
+        return Err(layout_error("break token layout config is stale"));
+    }
+    if token.text_backend_id != text_backend.backend_id()
+        || token.font_fingerprint != text_backend.font_fingerprint()
+    {
+        return Err(layout_error("break token text dependency is stale"));
+    }
+    let block_index = usize::try_from(token.child_index).unwrap_or(usize::MAX);
+    if let Some(block) = blocks.get(block_index) {
+        if block.node_id != token.node_id {
+            return Err(layout_error("break token node position is stale"));
+        }
+        if token.text_offset > 0 && !matches!(block.content, LayoutBlockContent::Text { .. }) {
+            return Err(layout_error(
+                "break token text offset targets a non-text block",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3236,6 +3901,131 @@ fn fit_preserving_aspect(
     )
 }
 
+struct ReplayTextBackend<'a> {
+    fallback: &'a dyn TextBackend,
+    cached: BTreeMap<u64, Vec<SceneParagraph>>,
+    cache_hits: AtomicUsize,
+}
+
+impl<'a> ReplayTextBackend<'a> {
+    fn new(fallback: &'a dyn TextBackend, pages: &[PageScene], cache_enabled: bool) -> Self {
+        let mut cached = BTreeMap::<u64, Vec<SceneParagraph>>::new();
+        if cache_enabled {
+            for paragraph in pages.iter().flat_map(|page| &page.paragraphs) {
+                let entries = cached.entry(paragraph.request_fingerprint).or_default();
+                if !entries.iter().any(|entry| entry == paragraph) {
+                    entries.push(paragraph.clone());
+                }
+            }
+        }
+        Self {
+            fallback,
+            cached,
+            cache_hits: AtomicUsize::new(0),
+        }
+    }
+
+    fn cache_hits(&self) -> usize {
+        self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    fn cached_measurement(&self, request: &MeasureRequest) -> Option<MeasuredText> {
+        let paragraph = self
+            .cached
+            .get(&request.request_fingerprint)?
+            .iter()
+            .find(|paragraph| paragraph_matches_request(paragraph, request))?;
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(measured_text_from_scene(paragraph, request.id))
+    }
+}
+
+impl TextBackend for ReplayTextBackend<'_> {
+    fn backend_id(&self) -> crate::text::TextBackendId {
+        self.fallback.backend_id()
+    }
+
+    fn font_fingerprint(&self) -> FontSetFingerprint {
+        self.fallback.font_fingerprint()
+    }
+
+    fn measure_batch(
+        &self,
+        request: &MeasureBatch,
+        cancel: &CancellationToken,
+    ) -> Result<MeasuredBatch, PageletError> {
+        let mut results = Vec::with_capacity(request.requests.len());
+        let mut missing = Vec::new();
+        for item in &request.requests {
+            if cancel.is_cancelled() {
+                return Err(PageletError::Cancelled);
+            }
+            if let Some(measured) = self.cached_measurement(item) {
+                results.push(measured);
+            } else {
+                missing.push(item.clone());
+            }
+        }
+        if !missing.is_empty() {
+            let measured = self
+                .fallback
+                .measure_batch(&MeasureBatch::new(missing.clone()), cancel)?;
+            for item in missing {
+                let result = measured.get(item.id).cloned().ok_or_else(|| {
+                    layout_error("text backend did not return requested incremental measurement")
+                })?;
+                results.push(result);
+            }
+        }
+        Ok(MeasuredBatch::new(
+            self.backend_id(),
+            self.font_fingerprint(),
+            results,
+        ))
+    }
+}
+
+fn paragraph_matches_request(paragraph: &SceneParagraph, request: &MeasureRequest) -> bool {
+    paragraph.paragraph_id == request.paragraph_id
+        && paragraph.request_fingerprint == request.request_fingerprint
+        && paragraph.text == request.text
+        && paragraph.text_range == request.text_range
+        && paragraph.style_runs == request.style_runs
+        && paragraph.font_size == request.font_size
+        && paragraph.available_width == request.available_width
+        && paragraph.max_width == request.max_width
+        && paragraph.locale == request.locale
+        && paragraph.direction == request.direction
+        && paragraph.text_scale == request.text_scale
+        && paragraph.font_candidates == request.font_candidates
+        && paragraph.strut == request.strut
+        && paragraph.height_behavior == request.height_behavior
+}
+
+fn measured_text_from_scene(paragraph: &SceneParagraph, request_id: u32) -> MeasuredText {
+    let lines = paragraph
+        .lines
+        .iter()
+        .map(|line| line.metrics)
+        .collect::<Vec<_>>();
+    let width = lines
+        .iter()
+        .fold(LayoutUnit::ZERO, |width, line| width.max(line.width));
+    let height = lines
+        .iter()
+        .fold(LayoutUnit::ZERO, |height, line| height + line.line_height);
+    MeasuredText::new(
+        request_id,
+        paragraph.request_fingerprint,
+        width,
+        height,
+        u32::try_from(paragraph.text.len()).unwrap_or(u32::MAX),
+        lines,
+        paragraph.clusters.clone(),
+        paragraph.measurement_fingerprint,
+    )
+}
+
 fn measure_text(
     text_backend: &dyn TextBackend,
     cancel: &CancellationToken,
@@ -3843,7 +4633,6 @@ fn translate_rect(rect: Rect, origin: Point) -> Rect {
 }
 
 fn fingerprint_page(
-    chapter: &ChapterIr,
     options: LayoutOptions,
     text_backend: &dyn TextBackend,
     page: &PageBuilder,
@@ -3856,7 +4645,6 @@ fn fingerprint_page(
         text_backend.backend_id().0,
         text_backend.font_fingerprint().0
     ));
-    input.push_str(&hex_hash(chapter.content_hash));
     for fragment in &page.fragments {
         input.push_str(&format!(
             "|{}:{:?}:{}:{}:{}:{}",
@@ -4604,14 +5392,6 @@ fn escape_json(value: &str) -> String {
     out
 }
 
-fn hex_hash(hash: ContentHash) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in hash.as_bytes() {
-        push_hex_byte(&mut out, *byte);
-    }
-    out
-}
-
 fn push_hex_byte(out: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(HEX[(byte >> 4) as usize] as char);
@@ -4707,6 +5487,8 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::{
         core::{DocumentId, StyleId},
@@ -4715,6 +5497,48 @@ mod tests {
         },
         text::{DefaultTextBackend, FontSetFingerprint, MeasuredBatch, TextBackend, TextBackendId},
     };
+
+    struct CountingTextBackend {
+        inner: DefaultTextBackend,
+        measured_requests: AtomicUsize,
+    }
+
+    impl CountingTextBackend {
+        fn new() -> Self {
+            Self {
+                inner: DefaultTextBackend::new(),
+                measured_requests: AtomicUsize::new(0),
+            }
+        }
+
+        fn reset(&self) {
+            self.measured_requests.store(0, Ordering::SeqCst);
+        }
+
+        fn measured_requests(&self) -> usize {
+            self.measured_requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TextBackend for CountingTextBackend {
+        fn backend_id(&self) -> TextBackendId {
+            self.inner.backend_id()
+        }
+
+        fn font_fingerprint(&self) -> FontSetFingerprint {
+            self.inner.font_fingerprint()
+        }
+
+        fn measure_batch(
+            &self,
+            request: &MeasureBatch,
+            cancel: &CancellationToken,
+        ) -> Result<MeasuredBatch, PageletError> {
+            self.measured_requests
+                .fetch_add(request.requests.len(), Ordering::SeqCst);
+            self.inner.measure_batch(request, cancel)
+        }
+    }
 
     fn visible_text_line_rects(page: &PageScene) -> Vec<Rect> {
         let mut rects = Vec::new();
@@ -5542,6 +6366,448 @@ mod tests {
     }
 
     #[test]
+    fn paginate_next_page_rejects_stale_break_token_dependencies() {
+        let chapter = chapter_with_paragraph(
+            "one two three four five six seven eight nine ten eleven twelve",
+        );
+        let backend = DefaultTextBackend::new();
+        let options = LayoutOptions {
+            constraints: LayoutConstraints::new(LayoutUnit::from_px(90), LayoutUnit::from_px(72))
+                .with_margin(LayoutUnit::from_px(8)),
+            ..LayoutOptions::default()
+        };
+        let first = paginate_next_page(&chapter, &backend, options, None)
+            .expect("first page")
+            .expect("page scene");
+        let token = first.next_break_token.expect("continuation token");
+
+        let width_options = LayoutOptions {
+            constraints: LayoutConstraints {
+                viewport_width: options.constraints.viewport_width + LayoutUnit::from_px(1),
+                ..options.constraints
+            },
+            ..options
+        };
+        assert!(
+            paginate_next_page(&chapter, &backend, width_options, Some(token.clone())).is_err()
+        );
+
+        let mut changed_chapter = chapter.clone();
+        changed_chapter.content_hash = ContentHash::from_bytes(b"changed content");
+        assert!(
+            paginate_next_page(&changed_chapter, &backend, options, Some(token.clone())).is_err()
+        );
+
+        let counting = CountingTextBackend::new();
+        let changed_font = FontIdentityBackend {
+            inner: &counting,
+            font_fingerprint: FontSetFingerprint(0x1234),
+        };
+        assert!(paginate_next_page(&chapter, &changed_font, options, Some(token)).is_err());
+        assert_eq!(counting.measured_requests(), 0);
+    }
+
+    #[test]
+    fn paint_only_change_reuses_pages_without_measurement_or_repagination() {
+        let mut previous_chapter = chapter_with_paragraph("paint stays outside pagination");
+        previous_chapter.rebuild_blocks();
+        let backend = CountingTextBackend::new();
+        let options = LayoutOptions::default();
+        let previous = paginate_chapter_with_options(&previous_chapter, &backend, options)
+            .expect("initial pagination");
+        backend.reset();
+
+        let mut chapter = previous_chapter.clone();
+        let paint_style = chapter
+            .styles
+            .intern(
+                document::ComputedStyle::new()
+                    .with_property("color", "#123456")
+                    .with_property("background-color", "#fefefe"),
+            )
+            .expect("paint style");
+        set_paragraph_style(&mut chapter, NodeId::new(1), paint_style);
+        chapter.content_hash = ContentHash::from_bytes(b"paint-only-change");
+        chapter.rebuild_blocks();
+
+        let outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &previous_chapter,
+                &previous,
+                options,
+                &chapter,
+                options,
+                LayoutGeneration::new(2),
+                LayoutGeneration::new(2),
+            ),
+            &backend,
+        )
+        .expect("incremental paint update");
+        let IncrementalPaginationOutcome::Applied(result) = outcome else {
+            panic!("current generation must be applied");
+        };
+
+        assert_eq!(result.report.impact, LayoutImpact::PaintOnly);
+        assert_eq!(result.report.regenerated_pages, 0);
+        assert_eq!(result.report.reused_prefix_pages, previous.pages.len());
+        assert_eq!(backend.measured_requests(), 0);
+        assert_eq!(
+            result
+                .document
+                .pages
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>(),
+            previous
+                .pages
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>()
+        );
+        assert!(result.document.pages.iter().all(|page| {
+            page.next_break_token.as_ref().is_none_or(|token| {
+                token.content_fingerprint == chapter.content_hash
+                    && token.config_fingerprint == config_fingerprint(options.constraints)
+            })
+        }));
+    }
+
+    #[test]
+    fn height_only_change_repacks_with_cached_measurements() {
+        let mut chapter = chapter_with_paragraph(
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+        );
+        chapter.rebuild_blocks();
+        let backend = CountingTextBackend::new();
+        let previous_options = LayoutOptions {
+            constraints: LayoutConstraints::new(LayoutUnit::from_px(100), LayoutUnit::from_px(88))
+                .with_margin(LayoutUnit::from_px(8)),
+            ..LayoutOptions::default()
+        };
+        let previous =
+            paginate_chapter_with_options(&chapter, &backend, previous_options).expect("initial");
+        backend.reset();
+        let options = LayoutOptions {
+            constraints: LayoutConstraints {
+                viewport_height: LayoutUnit::from_px(128),
+                margin_top: LayoutUnit::from_px(12),
+                margin_bottom: LayoutUnit::from_px(12),
+                ..previous_options.constraints
+            },
+            ..previous_options
+        };
+
+        let outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &chapter,
+                &previous,
+                previous_options,
+                &chapter,
+                options,
+                LayoutGeneration::new(3),
+                LayoutGeneration::new(3),
+            ),
+            &backend,
+        )
+        .expect("height-only repack");
+        let IncrementalPaginationOutcome::Applied(result) = outcome else {
+            panic!("current generation must be applied");
+        };
+
+        assert_eq!(result.report.impact, LayoutImpact::RepackOnly);
+        assert!(result.report.text_measurements_reused > 0);
+        assert_eq!(
+            backend.measured_requests(),
+            0,
+            "height must not reshape text"
+        );
+        assert_ne!(result.document.pages.len(), previous.pages.len());
+        assert!(result.document.pages.iter().all(|page| {
+            page.paragraphs.iter().all(|paragraph| {
+                previous.pages.iter().any(|previous_page| {
+                    previous_page.paragraphs.iter().any(|previous_paragraph| {
+                        previous_paragraph.replay_identity() == paragraph.replay_identity()
+                    })
+                })
+            })
+        }));
+    }
+
+    #[test]
+    fn dirty_frontier_rewinds_to_the_page_containing_the_changed_node() {
+        let (previous_chapter, children) = chapter_with_numbered_paragraphs(18);
+        let backend = CountingTextBackend::new();
+        let options = two_paragraph_page_options();
+        let previous = paginate_chapter_with_options(&previous_chapter, &backend, options)
+            .expect("initial pagination");
+        backend.reset();
+        let dirty_node = children[8];
+        let mut chapter = previous_chapter.clone();
+        replace_paragraph_text(&mut chapter, dirty_node, "changed 08");
+
+        let outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &previous_chapter,
+                &previous,
+                options,
+                &chapter,
+                options,
+                LayoutGeneration::new(4),
+                LayoutGeneration::new(4),
+            ),
+            &backend,
+        )
+        .expect("dirty frontier pagination");
+        let IncrementalPaginationOutcome::Applied(result) = outcome else {
+            panic!("current generation must be applied");
+        };
+
+        assert_eq!(result.report.impact, LayoutImpact::Reparse);
+        assert_eq!(result.report.earliest_dirty_node, Some(dirty_node));
+        let checkpoint = result.report.checkpoint_page.expect("checkpoint") as usize;
+        let containing_page = previous
+            .pages
+            .iter()
+            .position(|page| {
+                page.text_paints
+                    .iter()
+                    .any(|paint| paint.node_id == dirty_node)
+            })
+            .expect("dirty node page");
+        assert_eq!(checkpoint, containing_page);
+        assert_eq!(result.report.reused_prefix_pages, checkpoint);
+        assert_eq!(
+            result.document.pages[..checkpoint]
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>(),
+            previous.pages[..checkpoint]
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>()
+        );
+        assert!(result.document.pages[..checkpoint].iter().all(|page| {
+            page.next_break_token
+                .as_ref()
+                .is_none_or(|token| token.content_fingerprint == chapter.content_hash)
+        }));
+        assert!(
+            backend.measured_requests() > 0,
+            "changed text must be shaped"
+        );
+    }
+
+    #[test]
+    fn converged_pages_reuse_old_tail_after_two_consecutive_matches() {
+        let (previous_chapter, children) = chapter_with_numbered_paragraphs(28);
+        let backend = CountingTextBackend::new();
+        let options = two_paragraph_page_options();
+        let previous = paginate_chapter_with_options(&previous_chapter, &backend, options)
+            .expect("initial pagination");
+        backend.reset();
+        let mut chapter = previous_chapter.clone();
+        replace_paragraph_text(&mut chapter, children[8], "altered 08");
+
+        let outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &previous_chapter,
+                &previous,
+                options,
+                &chapter,
+                options,
+                LayoutGeneration::new(5),
+                LayoutGeneration::new(5),
+            ),
+            &backend,
+        )
+        .expect("tail reuse pagination");
+        let IncrementalPaginationOutcome::Applied(result) = outcome else {
+            panic!("current generation must be applied");
+        };
+
+        assert!(result.report.reused_tail_pages >= 2);
+        let tail_start = result.document.pages.len() - result.report.reused_tail_pages;
+        assert_eq!(
+            result.document.pages[tail_start..]
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>(),
+            previous.pages[tail_start..]
+                .iter()
+                .map(|page| page.fingerprint)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stale_generation_is_rejected_before_layout_work() {
+        let mut chapter = chapter_with_paragraph("stale work must not win");
+        chapter.rebuild_blocks();
+        let backend = CountingTextBackend::new();
+        let options = LayoutOptions::default();
+        let previous = paginate_chapter_with_options(&chapter, &backend, options).expect("initial");
+        backend.reset();
+
+        let outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &chapter,
+                &previous,
+                options,
+                &chapter,
+                options,
+                LayoutGeneration::new(6),
+                LayoutGeneration::new(7),
+            ),
+            &backend,
+        )
+        .expect("stale generation result");
+
+        assert_eq!(
+            outcome,
+            IncrementalPaginationOutcome::Stale {
+                rejected_generation: LayoutGeneration::new(6),
+                current_generation: LayoutGeneration::new(7),
+            }
+        );
+        assert_eq!(backend.measured_requests(), 0);
+    }
+
+    #[test]
+    fn width_font_content_and_version_changes_use_safe_impacts() {
+        let mut previous_chapter = chapter_with_paragraph("identity boundaries");
+        previous_chapter.rebuild_blocks();
+        let backend = CountingTextBackend::new();
+        let previous_options = LayoutOptions::default();
+        let previous = paginate_chapter_with_options(&previous_chapter, &backend, previous_options)
+            .expect("initial");
+
+        let width_options = LayoutOptions {
+            constraints: LayoutConstraints {
+                viewport_width: previous_options.constraints.viewport_width
+                    + LayoutUnit::from_px(20),
+                ..previous_options.constraints
+            },
+            ..previous_options
+        };
+        let width_outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &previous_chapter,
+                &previous,
+                previous_options,
+                &previous_chapter,
+                width_options,
+                LayoutGeneration::new(8),
+                LayoutGeneration::new(8),
+            ),
+            &backend,
+        )
+        .expect("width reflow");
+        let IncrementalPaginationOutcome::Applied(width_result) = width_outcome else {
+            panic!("current generation must be applied");
+        };
+        assert_eq!(width_result.report.impact, LayoutImpact::Reflow);
+        assert_eq!(width_result.report.text_measurements_reused, 0);
+
+        let changed_font = CountingTextBackend {
+            inner: DefaultTextBackend::new(),
+            measured_requests: AtomicUsize::new(0),
+        };
+        let font_outcome = repaginate_incrementally(
+            IncrementalPaginationRequest::new(
+                &previous_chapter,
+                &previous,
+                previous_options,
+                &previous_chapter,
+                previous_options,
+                LayoutGeneration::new(9),
+                LayoutGeneration::new(9),
+            ),
+            &FontIdentityBackend {
+                inner: &changed_font,
+                font_fingerprint: FontSetFingerprint(0xdead_beef),
+            },
+        )
+        .expect("font reflow");
+        let IncrementalPaginationOutcome::Applied(font_result) = font_outcome else {
+            panic!("current generation must be applied");
+        };
+        assert_eq!(font_result.report.impact, LayoutImpact::Reflow);
+        assert_eq!(font_result.report.text_measurements_reused, 0);
+        assert!(changed_font.measured_requests() > 0);
+
+        let mut changed_chapter = previous_chapter.clone();
+        replace_paragraph_text(&mut changed_chapter, NodeId::new(1), "changed boundaries");
+        assert_eq!(
+            applied_impact(
+                IncrementalPaginationRequest::new(
+                    &previous_chapter,
+                    &previous,
+                    previous_options,
+                    &changed_chapter,
+                    previous_options,
+                    LayoutGeneration::new(10),
+                    LayoutGeneration::new(10),
+                ),
+                &backend,
+            ),
+            LayoutImpact::Reparse
+        );
+
+        let mut incompatible = IncrementalPaginationRequest::new(
+            &previous_chapter,
+            &previous,
+            previous_options,
+            &previous_chapter,
+            previous_options,
+            LayoutGeneration::new(11),
+            LayoutGeneration::new(11),
+        );
+        incompatible.versions.pagination_algorithm += 1;
+        assert_eq!(
+            applied_impact(incompatible, &backend),
+            LayoutImpact::Reparse
+        );
+    }
+
+    struct FontIdentityBackend<'a> {
+        inner: &'a CountingTextBackend,
+        font_fingerprint: FontSetFingerprint,
+    }
+
+    impl TextBackend for FontIdentityBackend<'_> {
+        fn backend_id(&self) -> TextBackendId {
+            self.inner.backend_id()
+        }
+
+        fn font_fingerprint(&self) -> FontSetFingerprint {
+            self.font_fingerprint
+        }
+
+        fn measure_batch(
+            &self,
+            request: &MeasureBatch,
+            cancel: &CancellationToken,
+        ) -> Result<MeasuredBatch, PageletError> {
+            let measured = self.inner.measure_batch(request, cancel)?;
+            Ok(MeasuredBatch::new(
+                self.backend_id(),
+                self.font_fingerprint,
+                measured.results,
+            ))
+        }
+    }
+
+    fn applied_impact(
+        request: IncrementalPaginationRequest<'_>,
+        backend: &dyn TextBackend,
+    ) -> LayoutImpact {
+        match repaginate_incrementally(request, backend).expect("incremental pagination") {
+            IncrementalPaginationOutcome::Applied(result) => result.report.impact,
+            IncrementalPaginationOutcome::Stale { .. } => panic!("generation must be current"),
+        }
+    }
+
+    #[test]
     fn stress_1000_page_synthetic_document() {
         let mut chapter = empty_chapter();
         let mut children = Vec::new();
@@ -5575,6 +6841,48 @@ mod tests {
         set_root_children(&mut chapter, vec![paragraph]);
         chapter.rebuild_utf16_index();
         chapter
+    }
+
+    fn chapter_with_numbered_paragraphs(count: usize) -> (ChapterIr, Vec<NodeId>) {
+        let mut chapter = empty_chapter();
+        let children = (0..count)
+            .map(|index| push_paragraph(&mut chapter, &format!("paragraph {index:02}")))
+            .collect::<Vec<_>>();
+        set_root_children(&mut chapter, children.clone());
+        chapter.content_hash = ContentHash::from_bytes(b"numbered-paragraphs");
+        chapter.rebuild_blocks();
+        chapter.rebuild_utf16_index();
+        (chapter, children)
+    }
+
+    fn two_paragraph_page_options() -> LayoutOptions {
+        LayoutOptions {
+            constraints: LayoutConstraints::new(LayoutUnit::from_px(220), LayoutUnit::from_px(43)),
+            max_pages: 128,
+            ..LayoutOptions::default()
+        }
+    }
+
+    fn replace_paragraph_text(chapter: &mut ChapterIr, node_id: NodeId, text: &str) {
+        let range = chapter.text_pool.push(text).expect("replacement text");
+        let Some(DocumentNode::Paragraph(paragraph)) = chapter.nodes.get_mut(node_id) else {
+            panic!("replacement target must be a paragraph");
+        };
+        paragraph.text = TextRange {
+            start: range.start,
+            end: range.end,
+        };
+        chapter.content_hash =
+            ContentHash::from_bytes(format!("changed:{}:{text}", node_id.get()).as_bytes());
+        chapter.rebuild_blocks();
+        chapter.rebuild_utf16_index();
+    }
+
+    fn set_paragraph_style(chapter: &mut ChapterIr, node_id: NodeId, style: StyleId) {
+        let Some(DocumentNode::Paragraph(paragraph)) = chapter.nodes.get_mut(node_id) else {
+            panic!("style target must be a paragraph");
+        };
+        paragraph.style = style;
     }
 
     fn empty_chapter() -> ChapterIr {

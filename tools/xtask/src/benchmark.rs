@@ -11,11 +11,14 @@ use std::{
 };
 
 use pagelet::{
+    core::{CancellationToken, PageletError},
     engine::Engine,
     layout::{
-        anchor_to_page, paginate_chapter_with_options, paginate_next_page, BreakToken,
-        LayoutOptions, PageScene,
+        anchor_to_page, paginate_chapter_with_options, paginate_next_page,
+        repaginate_incrementally, BreakToken, IncrementalPaginationOutcome,
+        IncrementalPaginationRequest, LayoutGeneration, LayoutImpact, LayoutOptions, PageScene,
     },
+    text::{FontSetFingerprint, MeasureBatch, MeasuredBatch, TextBackend, TextBackendId},
     wire::PageBatch,
 };
 use pagelet_testkit::{DeterministicTextBackend, Fixture, ValidEpubBuilder};
@@ -124,6 +127,7 @@ fn print_help() {
     println!("  --record-baseline <path>    Record the current pinned snapshot");
     println!("  --replace-baseline          Permit replacing an existing baseline");
     println!("  --reason <message>          Required when recording a baseline");
+    println!("  --incremental-cases         Include incremental repagination observations");
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -138,6 +142,7 @@ struct BenchReportOptions {
     replace_baseline: bool,
     reason: Option<String>,
     child_snapshot: Option<PathBuf>,
+    incremental_cases: bool,
     help: bool,
 }
 
@@ -154,6 +159,7 @@ impl BenchReportOptions {
         let mut replace_baseline = false;
         let mut reason = None;
         let mut child_snapshot = None;
+        let mut incremental_cases = false;
         let mut help = false;
         let mut index = 0;
         while index < args.len() {
@@ -193,6 +199,7 @@ impl BenchReportOptions {
                         "--child-snapshot",
                     )?))
                 }
+                "--incremental-cases" => incremental_cases = true,
                 "-h" | "--help" | "help" => help = true,
                 other => return Err(format!("unknown bench report option: {other}")),
             }
@@ -222,12 +229,13 @@ impl BenchReportOptions {
             replace_baseline,
             reason,
             child_snapshot,
+            incremental_cases,
             help,
         })
     }
 
     fn child_args(&self, path: &Path) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "bench".into(),
             "report".into(),
             "--profile".into(),
@@ -238,7 +246,11 @@ impl BenchReportOptions {
             self.runner_id.clone(),
             "--child-snapshot".into(),
             path.display().to_string(),
-        ]
+        ];
+        if self.incremental_cases {
+            args.push("--incremental-cases".into());
+        }
+        args
     }
 }
 
@@ -374,9 +386,13 @@ fn collect_snapshot(options: &BenchReportOptions) -> Result<Snapshot, String> {
     let fixture = benchmark_fixture();
     let fixture_hash = sha256_hex(fixture.bytes());
     let mut samples = MetricSamples::default();
-    measure_iteration(&fixture, &mut MetricSamples::default())?;
+    measure_iteration(
+        &fixture,
+        &mut MetricSamples::default(),
+        options.incremental_cases,
+    )?;
     for _ in 0..options.samples {
-        measure_iteration(&fixture, &mut samples)?;
+        measure_iteration(&fixture, &mut samples, options.incremental_cases)?;
     }
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -406,7 +422,11 @@ fn benchmark_fixture() -> Fixture {
         .build()
 }
 
-fn measure_iteration(fixture: &Fixture, samples: &mut MetricSamples) -> Result<(), String> {
+fn measure_iteration(
+    fixture: &Fixture,
+    samples: &mut MetricSamples,
+    incremental_cases: bool,
+) -> Result<(), String> {
     let bytes = fixture.bytes();
     let engine = Engine::new();
     let backend = DeterministicTextBackend::new();
@@ -458,6 +478,11 @@ fn measure_iteration(fixture: &Fixture, samples: &mut MetricSamples) -> Result<(
     let document =
         paginate_chapter_with_options(&full_chapter, &backend, options).map_err(pagelet_error)?;
     samples.push("full_chapter_paginate", elapsed_ns(started));
+
+    if incremental_cases {
+        measure_height_only_repack(&full_chapter, &document, &backend, options, samples)?;
+    }
+
     let anchor = document
         .pages
         .last()
@@ -489,6 +514,78 @@ fn measure_iteration(fixture: &Fixture, samples: &mut MetricSamples) -> Result<(
         usize_to_u64(allocation_stats.bytes_allocated),
     );
     Ok(())
+}
+
+fn measure_height_only_repack(
+    chapter: &pagelet::document::ChapterIr,
+    document: &pagelet::layout::PaginatedDocument,
+    backend: &DeterministicTextBackend,
+    options: LayoutOptions,
+    samples: &mut MetricSamples,
+) -> Result<(), String> {
+    let repack_options = LayoutOptions {
+        constraints: pagelet::layout::LayoutConstraints {
+            viewport_height: options.constraints.viewport_height
+                - pagelet::core::LayoutUnit::from_px(80),
+            margin_top: options.constraints.margin_top + pagelet::core::LayoutUnit::from_px(8),
+            margin_bottom: options.constraints.margin_bottom
+                + pagelet::core::LayoutUnit::from_px(8),
+            ..options.constraints
+        },
+        ..options
+    };
+    let cached_only = CachedOnlyTextBackend {
+        backend_id: backend.backend_id(),
+        font_fingerprint: backend.font_fingerprint(),
+    };
+    let started = Instant::now();
+    let repacked = repaginate_incrementally(
+        IncrementalPaginationRequest::new(
+            chapter,
+            document,
+            options,
+            chapter,
+            repack_options,
+            LayoutGeneration::new(1),
+            LayoutGeneration::new(1),
+        ),
+        &cached_only,
+    )
+    .map_err(pagelet_error)?;
+    let IncrementalPaginationOutcome::Applied(repacked) = repacked else {
+        return Err("height-only repack unexpectedly became stale".into());
+    };
+    if repacked.report.impact != LayoutImpact::RepackOnly
+        || repacked.report.text_measurements_reused == 0
+    {
+        return Err("height-only repack did not reuse cached text measurements".into());
+    }
+    black_box(&repacked.document);
+    samples.push("height_only_repack", elapsed_ns(started));
+    Ok(())
+}
+
+struct CachedOnlyTextBackend {
+    backend_id: TextBackendId,
+    font_fingerprint: FontSetFingerprint,
+}
+
+impl TextBackend for CachedOnlyTextBackend {
+    fn backend_id(&self) -> TextBackendId {
+        self.backend_id
+    }
+
+    fn font_fingerprint(&self) -> FontSetFingerprint {
+        self.font_fingerprint
+    }
+
+    fn measure_batch(
+        &self,
+        _request: &MeasureBatch,
+        _cancel: &CancellationToken,
+    ) -> Result<MeasuredBatch, PageletError> {
+        panic!("height-only repack attempted to reshape text")
+    }
 }
 
 fn cold_page_batch_wire(
@@ -649,14 +746,16 @@ fn metric_spec(name: &str) -> MetricSpec {
         | "chapter_to_ir"
         | "first_page_ready"
         | "page_batch_ready"
-        | "full_chapter_paginate" => MetricSpec {
+        | "full_chapter_paginate"
+        | "height_only_repack" => MetricSpec {
             name: match name {
                 "open_to_metadata" => "open_to_metadata",
                 "open_to_navigation" => "open_to_navigation",
                 "chapter_to_ir" => "chapter_to_ir",
                 "first_page_ready" => "first_page_ready",
                 "page_batch_ready" => "page_batch_ready",
-                _ => "full_chapter_paginate",
+                "full_chapter_paginate" => "full_chapter_paginate",
+                _ => "height_only_repack",
             },
             unit: "ns",
             direction: Direction::Lower,
