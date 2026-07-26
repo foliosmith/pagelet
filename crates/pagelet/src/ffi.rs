@@ -2,7 +2,7 @@
 //!
 //! Hosts receive typed opaque tokens rather than pointers or Rust collection
 //! indexes. The control-plane C API is layered on top of this registry.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::{
     collections::BTreeMap,
@@ -19,9 +19,17 @@ use crate::{
     engine::{BookSession, Engine, LayoutSession},
 };
 
+mod buffer;
 mod control;
+mod native;
 
+pub use buffer::{BufferError, BufferPool, NativeBuffer};
 pub use control::{ControlLayoutRequest, ControlPlane};
+pub use native::{
+    FfiAnchorResult, FfiBufferResult, FfiByteSlice, FfiCopyResult, FfiHandleResult,
+    FfiHitTestResult, FfiLayoutOptions, FfiLayoutResult, FfiLayoutState, FfiMutableByteSlice,
+    FfiPageRequest, FfiResourceResult, FfiStatus, FfiStatusResult,
+};
 
 const HANDLE_KIND_BITS: u32 = 3;
 const HANDLE_KIND_MASK: u64 = (1 << HANDLE_KIND_BITS) - 1;

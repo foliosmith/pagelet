@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Deterministic EPUB parsing and pagination engine.
 //!
 //! `pagelet` is the only Rust library crate published by this repository.

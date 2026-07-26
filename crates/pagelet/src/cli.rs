@@ -208,6 +208,25 @@ pub fn book_summary_json(book: &BookSummary) -> String {
     book_summary_json_with_chapter(book, None)
 }
 
+/// Serialize the navigation model for native and generated host adapters.
+#[must_use]
+pub fn navigation_json(navigation: &crate::epub::Navigation) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    push_field(
+        &mut out,
+        1,
+        "source",
+        navigation_source_name(navigation.source),
+        true,
+    );
+    push_nav_array(&mut out, 1, "toc", &navigation.toc, true);
+    push_nav_array(&mut out, 1, "page_list", &navigation.page_list, true);
+    push_nav_array(&mut out, 1, "landmarks", &navigation.landmarks, false);
+    out.push_str("}\n");
+    out
+}
+
 /// Serialize renderable ChapterIR JSON for Web/WASM consumers.
 #[must_use]
 pub fn chapter_ir_json(chapter: &ChapterIr) -> String {
@@ -326,9 +345,9 @@ pub fn book_summary_json_with_chapter(book: &BookSummary, chapter: Option<&Chapt
         navigation_source_name(book.navigation.source),
         true,
     );
-    push_nav_array(&mut out, "toc", &book.navigation.toc, true);
-    push_nav_array(&mut out, "page_list", &book.navigation.page_list, true);
-    push_nav_array(&mut out, "landmarks", &book.navigation.landmarks, false);
+    push_nav_array(&mut out, 2, "toc", &book.navigation.toc, true);
+    push_nav_array(&mut out, 2, "page_list", &book.navigation.page_list, true);
+    push_nav_array(&mut out, 2, "landmarks", &book.navigation.landmarks, false);
     indent(&mut out, 1);
     out.push_str("},\n");
 
@@ -782,28 +801,50 @@ const fn link_kind_name(kind: LinkKind) -> &'static str {
     }
 }
 
-fn push_nav_array(out: &mut String, name: &str, items: &[NavigationItem], trailing: bool) {
-    indent(out, 2);
+fn push_nav_array(
+    out: &mut String,
+    level: usize,
+    name: &str,
+    items: &[NavigationItem],
+    trailing: bool,
+) {
+    indent(out, level);
     out.push('"');
     out.push_str(name);
     out.push_str("\": [\n");
     for (index, item) in items.iter().enumerate() {
-        indent(out, 3);
-        out.push('{');
-        push_inline_field(out, "label", &item.label, true);
-        push_inline_field(out, "href", &item.href, false);
-        out.push('}');
+        push_nav_item(out, level + 1, item);
         if index + 1 < items.len() {
             out.push(',');
         }
         out.push('\n');
     }
-    indent(out, 2);
+    indent(out, level);
     out.push(']');
     if trailing {
         out.push(',');
     }
     out.push('\n');
+}
+
+fn push_nav_item(out: &mut String, level: usize, item: &NavigationItem) {
+    indent(out, level);
+    out.push('{');
+    push_inline_field(out, "label", &item.label, true);
+    push_inline_field(out, "href", &item.href, true);
+    out.push_str("\"children\": [");
+    if !item.children.is_empty() {
+        out.push('\n');
+        for (index, child) in item.children.iter().enumerate() {
+            push_nav_item(out, level + 1, child);
+            if index + 1 < item.children.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        indent(out, level);
+    }
+    out.push_str("]}");
 }
 
 fn push_field(out: &mut String, level: usize, name: &str, value: &str, trailing: bool) {

@@ -48,6 +48,19 @@ Inputs crossing FFI are borrowed only for the duration of the call unless the
 API explicitly copies or adopts them. Outputs use versioned wire buffers or
 opaque handles with explicit release functions.
 
+The C declarations live in [`include/pagelet.h`](../include/pagelet.h).
+Buffer-bearing results return a `PageletNativeBuffer` containing a
+process-unique allocation id, a read-only pointer, and an exact byte length.
+The pointer remains valid until `pagelet_buffer_free`; releasing the same
+descriptor again is a safe no-op. Hosts that do not retain Rust-owned memory
+can call `pagelet_buffer_copy` with a Dart-owned or otherwise host-owned
+destination and then release the native descriptor.
+
+Non-empty borrowed slices must contain a valid pointer for the declared call
+duration. Null pointers are accepted only for zero-length slices. The small
+audited raw-pointer shim is isolated in `ffi::native`; the rest of the
+workspace continues to deny unsafe code.
+
 ## Threading
 
 Foreground work must be cancellable. Background work must respect engine worker
@@ -80,6 +93,16 @@ Host adapters paginate in two phases:
 Adapters must not cross FFI once per line or glyph. Missing, duplicate, unknown,
 stale, invalid UTF-8, or geometrically invalid results are protocol errors and
 must not reach layout or caches.
+
+The native data-plane sequence is:
+
+1. `pagelet_layout_request` returns one versioned wire `MeasureBatch`;
+2. the host submits one versioned wire `MeasuredBatch`;
+3. `pagelet_layout_submit_measurements` returns a versioned binary
+   `pageletScene` `PageBatch`.
+
+All three payloads use the same fixed little-endian envelope, explicit schema
+version, exact payload length, CRC-32 checksum, and decoder allocation limits.
 
 Renderers replay the complete paragraph using the same backend/font identity,
 request parameters, line baselines, and measurement fingerprint. They clip only

@@ -10,6 +10,9 @@ documentation = "https://docs.rs/pagelet"
 keywords = ["epub", "pagination", "layout", "reader"]
 categories = ["parser-implementations", "rendering", "text-processing"]
 
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [features]
 default = []
 native-shaping = []
