@@ -10,7 +10,7 @@ pub mod core;
 pub mod document;
 pub mod engine;
 pub mod epub;
-mod ffi;
+pub mod ffi;
 pub mod layout;
 #[cfg(test)]
 mod testkit;

@@ -7,6 +7,22 @@ This document defines the native host boundary for pagelet adapters.
 FFI handles are opaque identifiers owned by pagelet. Hosts must not infer memory
 layout, reuse released handles, or share handles across incompatible runtimes.
 
+The Rust registry issues process-unique, type-tagged generation tokens for
+`EngineHandle`, `BookHandle`, `ChapterHandle`, `LayoutSessionHandle`, and
+`RequestHandle`. The encoding is not part of the ABI contract and contains
+neither a pointer nor a collection index. Released tokens are never reused
+during the process lifetime, so stale handles cannot alias new objects.
+
+Handle release is idempotent. Releasing a book also releases its chapter and
+layout-session handles; releasing a layout session also releases and cancels
+its request handles. Releasing an engine closes its complete ownership tree.
+Use-after-release is rejected as an invalid handle. Debug builds report a
+non-empty registry on drop after first releasing its resources.
+
+Every exported control-plane function must use the shared panic boundary.
+Existing typed errors pass through unchanged, while a Rust panic becomes an
+opaque `InternalError` and its payload is never returned to the host.
+
 ## Ownership
 
 Inputs crossing FFI are borrowed only for the duration of the call unless the
