@@ -13,7 +13,9 @@ use std::{
 use crate::{
     core::{CancellationToken, PageletError, ResourceLimits},
     document::ChapterIr,
-    epub::{self, BookSummary, CompatibilityMode, Navigation, OpenOptions},
+    epub::{
+        self, BookSummary, CompatibilityMode, Navigation, OpenOptions, ResourceBytes, ResourceId,
+    },
     layout::{HostMeasuredLayout, LayoutOptions, PaginatedDocument},
     text::{MeasureBatch, MeasuredBatch},
 };
@@ -217,10 +219,15 @@ impl BookSession {
         spine_index: usize,
         options: LayoutOptions,
     ) -> Result<LayoutSession, PageletError> {
-        Ok(LayoutSession::new(
+        Ok(LayoutSession::prepare(
             self.open_spine_item(spine_index)?,
             options,
         ))
+    }
+
+    /// Read one indexed publication resource without reopening the EPUB.
+    pub fn read_resource(&self, resource_id: ResourceId) -> Result<ResourceBytes, PageletError> {
+        epub::read_resource_from_context(&self.inner.opened, resource_id)
     }
 }
 
@@ -254,15 +261,25 @@ pub struct LayoutSession {
     prepared: Option<HostMeasuredLayout>,
     request: PageRequest,
     delivered: bool,
+    document: Option<PaginatedDocument>,
 }
 
 impl LayoutSession {
-    fn new(chapter: Arc<ChapterIr>, options: LayoutOptions) -> Self {
+    /// Prepare a host-measured layout session for one cached chapter.
+    #[must_use]
+    pub fn prepare(chapter: Arc<ChapterIr>, options: LayoutOptions) -> Self {
         Self {
             prepared: Some(HostMeasuredLayout::prepare((*chapter).clone(), options)),
             request: PageRequest::default(),
             delivered: false,
+            document: None,
         }
+    }
+
+    /// Return the last accepted page document, if measurements completed.
+    #[must_use]
+    pub fn document(&self) -> Option<&PaginatedDocument> {
+        self.document.as_ref()
     }
 
     pub fn layout(&mut self, request: PageRequest) -> LayoutProgress {
@@ -288,14 +305,17 @@ impl LayoutSession {
         }
         let prepared = self
             .prepared
-            .take()
-            .expect("measurements submitted more than once");
+            .as_ref()
+            .expect("measurements submitted more than once")
+            .clone();
         let mut document = prepared.resume(measured)?;
+        self.prepared = None;
         let start = self.request.start_page.min(document.pages.len());
         let end = start
             .saturating_add(self.request.max_pages)
             .min(document.pages.len());
         document.pages = document.pages[start..end].to_vec();
+        self.document = Some(document.clone());
         self.delivered = true;
         Ok(LayoutProgress::Pages(document))
     }

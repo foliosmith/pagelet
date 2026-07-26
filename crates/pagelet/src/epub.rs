@@ -754,6 +754,13 @@ pub(crate) fn open_spine_item_from_context(
     )
 }
 
+pub(crate) fn read_resource_from_context(
+    opened: &OpenedBook,
+    resource_id: ResourceId,
+) -> Result<ResourceBytes, PageletError> {
+    opened.store.read(resource_id)
+}
+
 fn book_ir_from_summary(book: &BookSummary) -> document::BookIr {
     let mut resources = document::ResourceTable::new();
     for resource in &book.resources {

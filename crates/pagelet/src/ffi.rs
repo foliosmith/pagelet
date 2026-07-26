@@ -14,10 +14,14 @@ use std::{
 };
 
 use crate::{
-    core::{CancellationToken, InternalErrorId, PageletError},
+    core::{CancellationToken, InternalErrorId, PageletError, ProtocolError},
     document::ChapterIr,
     engine::{BookSession, Engine, LayoutSession},
 };
+
+mod control;
+
+pub use control::{ControlLayoutRequest, ControlPlane};
 
 const HANDLE_KIND_BITS: u32 = 3;
 const HANDLE_KIND_MASK: u64 = (1 << HANDLE_KIND_BITS) - 1;
@@ -161,6 +165,12 @@ impl fmt::Display for HandleError {
 }
 
 impl std::error::Error for HandleError {}
+
+impl From<HandleError> for PageletError {
+    fn from(error: HandleError) -> Self {
+        Self::Protocol(ProtocolError::new(error.to_string()))
+    }
+}
 
 /// Result of an idempotent handle disposal.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -360,6 +370,13 @@ impl HandleRegistry {
         }
     }
 
+    pub(crate) fn chapter_book(&self, handle: ChapterHandle) -> Result<BookHandle, HandleError> {
+        match self.lock_entries().get(&handle.raw()) {
+            Some(Entry::Chapter { book, .. }) => Ok(*book),
+            _ => Err(invalid(HandleKind::Chapter)),
+        }
+    }
+
     /// Resolve a layout session into separately synchronized shared state.
     pub fn layout_session(
         &self,
@@ -380,6 +397,27 @@ impl HandleRegistry {
             Some(Entry::Request { cancellation, .. }) => Ok(cancellation.clone()),
             _ => Err(invalid(HandleKind::Request)),
         }
+    }
+
+    pub(crate) fn request_layout(
+        &self,
+        handle: RequestHandle,
+    ) -> Result<LayoutSessionHandle, HandleError> {
+        match self.lock_entries().get(&handle.raw()) {
+            Some(Entry::Request { layout, .. }) => Ok(*layout),
+            _ => Err(invalid(HandleKind::Request)),
+        }
+    }
+
+    pub(crate) fn has_request_for_layout(
+        &self,
+        handle: LayoutSessionHandle,
+    ) -> Result<bool, HandleError> {
+        let entries = self.lock_entries();
+        require_kind(&entries, handle.raw(), HandleKind::LayoutSession)?;
+        Ok(entries
+            .values()
+            .any(|entry| matches!(entry, Entry::Request { layout, .. } if *layout == handle)))
     }
 
     /// Dispose whichever live object owns the opaque token.

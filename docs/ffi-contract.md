@@ -23,6 +23,25 @@ Every exported control-plane function must use the shared panic boundary.
 Existing typed errors pass through unchanged, while a Rust panic becomes an
 opaque `InternalError` and its payload is never returned to the host.
 
+## Control Plane
+
+`ControlPlane` is the transport-neutral implementation behind the C and
+generated host adapters. It owns one handle registry and exposes:
+
+- `engine_create`, `book_open_path`, and borrowed `book_open_fd`;
+- `book_summary`, `book_navigation`, and `chapter_open`;
+- `layout_session_create`, `layout_request`, and
+  `layout_submit_measurements`;
+- `resource_read`, `hit_test`, and `anchor_to_page`;
+- `request_cancel` and generic `handle_dispose`.
+
+Opening from a borrowed file descriptor never adopts or closes the descriptor
+and restores its original position. A layout session accepts one in-flight
+measurement request at a time. Cancelling or submitting that request retires
+its handle, while the layout session remains reusable. Accepted page scenes
+stay owned by the layout session so hit testing and anchor lookup do not require
+the host to send scene data back to Rust.
+
 ## Ownership
 
 Inputs crossing FFI are borrowed only for the duration of the call unless the
