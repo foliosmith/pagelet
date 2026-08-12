@@ -727,10 +727,10 @@ pub(crate) fn open_book_session_context(
 
 pub(crate) fn open_spine_item_from_context(
     opened: &OpenedBook,
+    book_ir: &document::BookIr,
     spine_index: usize,
     options: OpenOptions,
 ) -> Result<document::ChapterIr, PageletError> {
-    let book_ir = book_ir_from_opened(opened, options)?;
     let manifest_item = spine_manifest_item(&opened.summary.package, spine_index)?;
     let bytes = opened
         .store
@@ -850,7 +850,7 @@ fn book_ir_from_summary(book: &BookSummary) -> document::BookIr {
     }
 }
 
-fn book_ir_from_opened(
+pub(crate) fn book_ir_from_opened(
     opened: &OpenedBook,
     options: OpenOptions,
 ) -> Result<document::BookIr, PageletError> {

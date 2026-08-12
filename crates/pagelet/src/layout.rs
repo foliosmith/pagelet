@@ -1405,6 +1405,17 @@ pub struct HostMeasuredLayout {
     measure_batch: MeasureBatch,
 }
 
+/// A host-measured chapter that can be paginated and retained one page range at a time.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HostMeasuredPagination {
+    chapter: ChapterIr,
+    options: LayoutOptions,
+    blocks: Vec<LayoutBlock>,
+    text_backend: HostMeasuredTextBackend,
+    document: PaginatedDocument,
+    next_break_token: Option<BreakToken>,
+}
+
 impl HostMeasuredLayout {
     /// Prepare a chapter for one batched host measurement round trip.
     #[must_use]
@@ -1427,8 +1438,92 @@ impl HostMeasuredLayout {
 
     /// Validate host metrics and resume layout to completion.
     pub fn resume(self, measured: MeasuredBatch) -> Result<PaginatedDocument, PageletError> {
-        let backend = HostMeasuredTextBackend::new(&self.measure_batch, measured)?;
-        paginate_prepared_blocks(&self.chapter, &self.blocks, &backend, self.options)
+        let mut pagination = self.resume_progressively(measured)?;
+        pagination.page_range(0, usize::MAX)
+    }
+
+    /// Validate host metrics and retain them for progressive page-range requests.
+    pub fn resume_progressively(
+        self,
+        measured: MeasuredBatch,
+    ) -> Result<HostMeasuredPagination, PageletError> {
+        let text_backend = HostMeasuredTextBackend::new(&self.measure_batch, measured)?;
+        let next_break_token = self.blocks.first().map(|block| {
+            BreakToken::start(&self.chapter, self.options, &text_backend, block.node_id)
+        });
+        Ok(HostMeasuredPagination {
+            chapter: self.chapter,
+            options: self.options,
+            blocks: self.blocks,
+            text_backend,
+            document: PaginatedDocument {
+                pages: Vec::new(),
+                diagnostics: Vec::new(),
+                complete: next_break_token.is_none(),
+            },
+            next_break_token,
+        })
+    }
+}
+
+impl HostMeasuredPagination {
+    /// Return all page scenes retained by this measured layout session.
+    #[must_use]
+    pub const fn document(&self) -> &PaginatedDocument {
+        &self.document
+    }
+
+    /// Paginate only far enough to satisfy one range, retaining every generated scene.
+    pub fn page_range(
+        &mut self,
+        start_page: usize,
+        max_pages: usize,
+    ) -> Result<PaginatedDocument, PageletError> {
+        let requested_end = start_page.saturating_add(max_pages);
+        let cancel = CancellationToken::new();
+        while self.document.pages.len() < requested_end {
+            let Some(start) = self.next_break_token.take() else {
+                break;
+            };
+            if self.document.pages.len()
+                >= usize::try_from(self.options.max_pages).unwrap_or(usize::MAX)
+            {
+                self.next_break_token = Some(start);
+                return Err(PageletError::ResourceLimitExceeded(
+                    ResourceLimitError::new(
+                        ResourceLimitKind::LayoutFragments,
+                        u64::from(self.options.max_pages),
+                        u64::try_from(self.document.pages.len()).unwrap_or(u64::MAX),
+                    ),
+                ));
+            }
+            let Some(page) = paginate_page_from_blocks(
+                &self.chapter,
+                &self.blocks,
+                &self.text_backend,
+                self.options,
+                &cancel,
+                start,
+            )?
+            else {
+                break;
+            };
+            self.next_break_token = page.next_break_token.clone();
+            self.document.pages.push(page);
+        }
+
+        self.document.complete = self.next_break_token.is_none();
+        self.document.diagnostics = collect_page_diagnostics(&self.document.pages);
+        validate_layout_invariants(&self.chapter, &self.document.pages)?;
+
+        let start = start_page.min(self.document.pages.len());
+        let end = requested_end.min(self.document.pages.len());
+        let pages = self.document.pages[start..end].to_vec();
+        Ok(PaginatedDocument {
+            diagnostics: collect_page_diagnostics(&pages),
+            complete: self.document.complete,
+            pages,
+        })
     }
 }
 

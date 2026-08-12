@@ -12,11 +12,11 @@ use std::{
 
 use crate::{
     core::{CancellationToken, PageletError, ResourceLimits},
-    document::ChapterIr,
+    document::{BookIr, ChapterIr, ResourceKind},
     epub::{
         self, BookSummary, CompatibilityMode, Navigation, OpenOptions, ResourceBytes, ResourceId,
     },
-    layout::{HostMeasuredLayout, LayoutOptions, PaginatedDocument},
+    layout::{HostMeasuredLayout, HostMeasuredPagination, LayoutOptions, PaginatedDocument},
     text::{MeasureBatch, MeasuredBatch},
 };
 
@@ -129,11 +129,14 @@ impl Engine {
             limits: self.config.limits,
         };
         let opened = epub::open_book_session_context(bytes, options)?;
+        let package = Arc::new(epub::book_ir_from_opened(&opened, options)?);
         Ok(BookSession {
             inner: Arc::new(BookSessionInner {
                 opened,
+                package,
                 options,
                 chapters: Mutex::new(BTreeMap::new()),
+                resources: Mutex::new(BTreeMap::new()),
                 chapter_cache_hits: AtomicU64::new(0),
                 chapter_cache_misses: AtomicU64::new(0),
             }),
@@ -148,8 +151,10 @@ impl Engine {
 #[derive(Debug)]
 struct BookSessionInner {
     opened: epub::OpenedBook,
+    package: Arc<BookIr>,
     options: OpenOptions,
     chapters: Mutex<BTreeMap<usize, Arc<ChapterIr>>>,
+    resources: Mutex<BTreeMap<ResourceId, Arc<ResourceBytes>>>,
     chapter_cache_hits: AtomicU64,
     chapter_cache_misses: AtomicU64,
 }
@@ -170,6 +175,12 @@ pub struct BookSession {
 }
 
 impl BookSession {
+    /// Return the package-level IR parsed once when the book session opened.
+    #[must_use]
+    pub fn package(&self) -> &BookIr {
+        &self.inner.package
+    }
+
     #[must_use]
     pub fn summary(&self) -> &BookSummary {
         &self.inner.opened.summary
@@ -198,6 +209,7 @@ impl BookSession {
             .fetch_add(1, Ordering::Relaxed);
         let chapter = Arc::new(epub::open_spine_item_from_context(
             &self.inner.opened,
+            &self.inner.package,
             spine_index,
             self.inner.options,
         )?);
@@ -227,7 +239,32 @@ impl BookSession {
 
     /// Read one indexed publication resource without reopening the EPUB.
     pub fn read_resource(&self, resource_id: ResourceId) -> Result<ResourceBytes, PageletError> {
-        epub::read_resource_from_context(&self.inner.opened, resource_id)
+        if let Some(resource) = self
+            .inner
+            .resources
+            .lock()
+            .expect("resource cache poisoned")
+            .get(&resource_id)
+        {
+            return Ok((**resource).clone());
+        }
+        let resource = epub::read_resource_from_context(&self.inner.opened, resource_id)?;
+        let cacheable = self
+            .inner
+            .package
+            .resources
+            .resources
+            .iter()
+            .find(|entry| entry.id == resource_id)
+            .is_some_and(|entry| matches!(entry.kind, ResourceKind::Css | ResourceKind::Font));
+        if cacheable {
+            self.inner
+                .resources
+                .lock()
+                .expect("resource cache poisoned")
+                .insert(resource_id, Arc::new(resource.clone()));
+        }
+        Ok(resource)
     }
 }
 
@@ -259,9 +296,8 @@ pub enum LayoutProgress {
 #[derive(Debug)]
 pub struct LayoutSession {
     prepared: Option<HostMeasuredLayout>,
+    pagination: Option<HostMeasuredPagination>,
     request: PageRequest,
-    delivered: bool,
-    document: Option<PaginatedDocument>,
 }
 
 impl LayoutSession {
@@ -270,22 +306,30 @@ impl LayoutSession {
     pub fn prepare(chapter: Arc<ChapterIr>, options: LayoutOptions) -> Self {
         Self {
             prepared: Some(HostMeasuredLayout::prepare((*chapter).clone(), options)),
+            pagination: None,
             request: PageRequest::default(),
-            delivered: false,
-            document: None,
         }
     }
 
     /// Return the last accepted page document, if measurements completed.
     #[must_use]
     pub fn document(&self) -> Option<&PaginatedDocument> {
-        self.document.as_ref()
+        self.pagination
+            .as_ref()
+            .map(HostMeasuredPagination::document)
     }
 
-    pub fn layout(&mut self, request: PageRequest) -> LayoutProgress {
+    pub fn layout(&mut self, request: PageRequest) -> Result<LayoutProgress, PageletError> {
         self.request = request;
-        if self.delivered {
-            return LayoutProgress::Complete;
+        if let Some(pagination) = &mut self.pagination {
+            if pagination.document().complete
+                && request.start_page >= pagination.document().pages.len()
+            {
+                return Ok(LayoutProgress::Complete);
+            }
+            return pagination
+                .page_range(request.start_page, request.max_pages)
+                .map(LayoutProgress::Pages);
         }
         let batch = self
             .prepared
@@ -293,14 +337,14 @@ impl LayoutSession {
             .expect("layout already completed")
             .measure_batch()
             .clone();
-        LayoutProgress::NeedMeasurements(batch)
+        Ok(LayoutProgress::NeedMeasurements(batch))
     }
 
     pub fn submit_measurements(
         &mut self,
         measured: MeasuredBatch,
     ) -> Result<LayoutProgress, PageletError> {
-        if self.delivered {
+        if self.pagination.is_some() {
             return Ok(LayoutProgress::Complete);
         }
         let prepared = self
@@ -308,15 +352,10 @@ impl LayoutSession {
             .as_ref()
             .expect("measurements submitted more than once")
             .clone();
-        let mut document = prepared.resume(measured)?;
+        let mut pagination = prepared.resume_progressively(measured)?;
+        let document = pagination.page_range(self.request.start_page, self.request.max_pages)?;
         self.prepared = None;
-        let start = self.request.start_page.min(document.pages.len());
-        let end = start
-            .saturating_add(self.request.max_pages)
-            .min(document.pages.len());
-        document.pages = document.pages[start..end].to_vec();
-        self.document = Some(document.clone());
-        self.delivered = true;
+        self.pagination = Some(pagination);
         Ok(LayoutProgress::Pages(document))
     }
 }
@@ -480,7 +519,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::{
-        testkit::{FixtureKind, GeneratedEpubFixture},
+        testkit::{EpubFixtureBuilder, FixtureKind, GeneratedEpubFixture},
         text::{DefaultTextBackend, TextBackend},
     };
 
@@ -550,14 +589,31 @@ mod tests {
 
     #[test]
     fn layout_session_advances_through_measure_pages_and_complete() {
-        let fixture = GeneratedEpubFixture::preset(FixtureKind::MinimalEpub3);
+        let body = (0..12)
+            .map(|index| format!("<p>Progressive paragraph {index}.</p>"))
+            .collect::<String>();
+        let fixture = EpubFixtureBuilder::epub3(FixtureKind::MinimalEpub3, "Progressive")
+            .add_xhtml("EPUB/chapter-1.xhtml", "Chapter 1", body)
+            .build();
         let book = Engine::new()
             .open_bytes(fixture.bytes().to_vec())
             .expect("open fixture");
         let mut layout = book
-            .create_layout_session(0, LayoutOptions::default())
+            .create_layout_session(
+                0,
+                LayoutOptions::new(crate::layout::LayoutConstraints::new(
+                    crate::core::LayoutUnit::from_px(320),
+                    crate::core::LayoutUnit::from_px(96),
+                )),
+            )
             .expect("layout session");
-        let LayoutProgress::NeedMeasurements(batch) = layout.layout(PageRequest::default()) else {
+        let LayoutProgress::NeedMeasurements(batch) = layout
+            .layout(PageRequest {
+                start_page: 0,
+                max_pages: 1,
+            })
+            .expect("prepare layout")
+        else {
             panic!("layout must request measurements first");
         };
         let measured = DefaultTextBackend::default()
@@ -569,10 +625,20 @@ mod tests {
         else {
             panic!("measurements must produce pages");
         };
-        assert!(!document.pages.is_empty());
-        assert_eq!(
-            layout.layout(PageRequest::default()),
-            LayoutProgress::Complete
-        );
+        assert_eq!(document.pages.len(), 1);
+        assert!(!document.complete);
+        let LayoutProgress::Pages(next) = layout
+            .layout(PageRequest {
+                start_page: 1,
+                max_pages: 1,
+            })
+            .expect("request next page")
+        else {
+            panic!("next range must produce pages");
+        };
+        assert_eq!(next.pages.first().map(|page| page.page_index), Some(1));
+
+        let retained = layout.document().expect("retained progressive document");
+        assert_eq!(retained.pages.len(), 2);
     }
 }

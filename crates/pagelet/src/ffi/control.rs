@@ -134,7 +134,7 @@ impl ControlPlane {
                 ));
             }
             let session = self.registry.layout_session(layout)?;
-            let progress = lock_layout(&session).layout(request);
+            let progress = lock_layout(&session).layout(request)?;
             let request = if matches!(progress, LayoutProgress::NeedMeasurements(_)) {
                 Some(
                     self.registry
