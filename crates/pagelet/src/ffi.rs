@@ -863,6 +863,33 @@ mod tests {
         assert_ne!(first_id.0, 0);
     }
 
+    #[test]
+    fn concurrent_resolve_and_dispose_rejects_stale_handles() {
+        let registry = Arc::new(HandleRegistry::new());
+        let handle = registry.insert_engine(Engine::new()).expect("engine");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..64 {
+                    if index % 2 == 0 {
+                        let _ = registry.engine(handle);
+                    } else {
+                        let _ = registry.dispose(handle.as_raw());
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("registry worker");
+        }
+        assert!(registry.engine(handle).is_err());
+        assert!(registry.leak_report().is_empty());
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn debug_drop_detects_and_releases_leaked_handles() {

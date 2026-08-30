@@ -43,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
                     start: range.start,
                     end: range.end,
                 },
+                style_runs: Vec::new(),
                 style: StyleId::new(0),
             }))
             .expect("paragraph");

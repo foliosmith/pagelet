@@ -82,3 +82,17 @@ path = "fuzz_targets/layout_typed_ir.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ffi_sequence"
+path = "fuzz_targets/ffi_sequence.rs"
+test = false
+doc = false
+bench = false

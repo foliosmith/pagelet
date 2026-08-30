@@ -234,6 +234,43 @@ mod tests {
         assert!(pool.release(buffer));
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore = "NativeBuffer C descriptors are intentionally not Send")]
+    fn concurrent_copy_and_release_never_accepts_a_stale_buffer() {
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let buffer = pool.allocate(vec![1, 2, 3, 4]).expect("allocate");
+        let buffer_id = buffer.id;
+        let buffer_address = buffer.data as usize;
+        let buffer_len = buffer.len;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let pool = std::sync::Arc::clone(&pool);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let buffer = NativeBuffer {
+                    id: buffer_id,
+                    data: buffer_address as *const u8,
+                    len: buffer_len,
+                };
+                barrier.wait();
+                for _ in 0..64 {
+                    if index % 2 == 0 {
+                        let mut destination = [0_u8; 4];
+                        let _ = pool.copy_to(buffer, &mut destination);
+                    } else {
+                        let _ = pool.release(buffer);
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("buffer worker");
+        }
+        assert!(pool.to_vec(buffer).is_err());
+        assert_eq!(pool.live_count(), 0);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn debug_drop_detects_and_releases_leaked_buffers() {

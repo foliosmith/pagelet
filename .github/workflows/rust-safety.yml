@@ -1,0 +1,36 @@
+name: Rust wire and FFI safety
+
+on:
+  pull_request:
+    paths:
+      - "crates/pagelet/src/ffi/**"
+      - "crates/pagelet/src/ffi.rs"
+      - "crates/pagelet/src/wire.rs"
+      - "fuzz/**"
+      - ".github/workflows/rust-safety.yml"
+  workflow_dispatch:
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-30
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly-2026-08-30 fuzz run wire_decode -- -runs=10000
+      - run: cargo +nightly-2026-08-30 fuzz run ffi_sequence -- -runs=10000
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-30
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly-2026-08-30 miri test -p pagelet --lib ffi::buffer::tests
+      - run: cargo +nightly-2026-08-30 miri test -p pagelet --lib ffi::tests
