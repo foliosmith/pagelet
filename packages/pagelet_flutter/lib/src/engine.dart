@@ -6,6 +6,8 @@ import 'errors.dart';
 import 'native_api.dart';
 
 part 'book_session.dart';
+part 'chapter_session.dart';
+part 'layout_session.dart';
 part 'resource_loader.dart';
 
 /// Owns one native pagelet engine and every book opened under it.

@@ -193,6 +193,43 @@ final class _FakeNativeApi implements PageletNativeApi {
   }
 
   @override
+  PageletNativeHandleResult chapterOpen(int book, int spineIndex) {
+    return _okHandle(_nextHandle++);
+  }
+
+  @override
+  PageletNativeHandleResult layoutSessionCreate(
+    int chapter,
+    PageletNativeLayoutOptions options,
+  ) {
+    return _okHandle(_nextHandle++);
+  }
+
+  @override
+  PageletNativeLayoutResult layoutRequest(
+    int layout,
+    int startPage,
+    int maxPages,
+  ) {
+    return PageletNativeLayoutResult(
+      status: PageletStatus.ok,
+      statusCode: 0,
+      internalErrorId: 0,
+      stateCode: PageletLayoutState.complete.index,
+      requestHandle: 0,
+      bytes: Uint8List(0),
+    );
+  }
+
+  @override
+  PageletNativeLayoutResult layoutSubmitMeasurements(
+    int request,
+    Uint8List measuredBatch,
+  ) {
+    return layoutRequest(0, 0, 1);
+  }
+
+  @override
   PageletNativeResourceResult resourceRead(int book, int resourceId) {
     resourceReads.add((book, resourceId));
     return PageletNativeResourceResult(

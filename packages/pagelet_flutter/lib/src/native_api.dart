@@ -70,6 +70,44 @@ final class PageletNativeResourceResult {
   final Uint8List mediaType;
 }
 
+final class PageletNativeLayoutOptions {
+  const PageletNativeLayoutOptions({
+    required this.viewportWidth,
+    required this.viewportHeight,
+    required this.marginStart,
+    required this.marginEnd,
+    required this.marginTop,
+    required this.marginBottom,
+    required this.maxPages,
+  });
+
+  final int viewportWidth;
+  final int viewportHeight;
+  final int marginStart;
+  final int marginEnd;
+  final int marginTop;
+  final int marginBottom;
+  final int maxPages;
+}
+
+final class PageletNativeLayoutResult {
+  const PageletNativeLayoutResult({
+    required this.status,
+    required this.statusCode,
+    required this.internalErrorId,
+    required this.stateCode,
+    required this.requestHandle,
+    required this.bytes,
+  });
+
+  final PageletStatus status;
+  final int statusCode;
+  final int internalErrorId;
+  final int stateCode;
+  final int requestHandle;
+  final Uint8List bytes;
+}
+
 /// Narrow native surface required by the engine and book wrappers.
 ///
 /// The interface is intentionally internal to the package facade. It also
@@ -84,6 +122,24 @@ abstract interface class PageletNativeApi {
 
   /// Opens an EPUB from a borrowed POSIX file descriptor.
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd);
+
+  PageletNativeHandleResult chapterOpen(int book, int spineIndex);
+
+  PageletNativeHandleResult layoutSessionCreate(
+    int chapter,
+    PageletNativeLayoutOptions options,
+  );
+
+  PageletNativeLayoutResult layoutRequest(
+    int layout,
+    int startPage,
+    int maxPages,
+  );
+
+  PageletNativeLayoutResult layoutSubmitMeasurements(
+    int request,
+    Uint8List measuredBatch,
+  );
 
   /// Copies one publication resource into host-owned memory.
   PageletNativeResourceResult resourceRead(int book, int resourceId);
@@ -107,6 +163,20 @@ final class FfiPageletNativeApi implements PageletNativeApi {
         _bookOpenFileDescriptor = library.lookupFunction<
             _BookOpenFileDescriptorNative,
             _BookOpenFileDescriptorDart>('pagelet_book_open_fd'),
+        _chapterOpen =
+            library.lookupFunction<_ChapterOpenNative, _ChapterOpenDart>(
+          'pagelet_chapter_open',
+        ),
+        _layoutSessionCreate = library.lookupFunction<
+            _LayoutSessionCreateNative,
+            _LayoutSessionCreateDart>('pagelet_layout_session_create'),
+        _layoutRequest =
+            library.lookupFunction<_LayoutRequestNative, _LayoutRequestDart>(
+          'pagelet_layout_request',
+        ),
+        _layoutSubmitMeasurements = library.lookupFunction<
+                _LayoutSubmitMeasurementsNative, _LayoutSubmitMeasurementsDart>(
+            'pagelet_layout_submit_measurements'),
         _resourceRead =
             library.lookupFunction<_ResourceReadNative, _ResourceReadDart>(
           'pagelet_resource_read',
@@ -139,6 +209,10 @@ final class FfiPageletNativeApi implements PageletNativeApi {
   final _EngineCreateDart _engineCreate;
   final _BookOpenPathDart _bookOpenPath;
   final _BookOpenFileDescriptorDart _bookOpenFileDescriptor;
+  final _ChapterOpenDart _chapterOpen;
+  final _LayoutSessionCreateDart _layoutSessionCreate;
+  final _LayoutRequestDart _layoutRequest;
+  final _LayoutSubmitMeasurementsDart _layoutSubmitMeasurements;
   final _ResourceReadDart _resourceRead;
   final _BufferCopyDart _bufferCopy;
   final _BufferFreeDart _bufferFree;
@@ -174,6 +248,58 @@ final class FfiPageletNativeApi implements PageletNativeApi {
   @override
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd) {
     return _handleResult(_bookOpenFileDescriptor(engine, fd));
+  }
+
+  @override
+  PageletNativeHandleResult chapterOpen(int book, int spineIndex) {
+    return _handleResult(_chapterOpen(book, spineIndex));
+  }
+
+  @override
+  PageletNativeHandleResult layoutSessionCreate(
+    int chapter,
+    PageletNativeLayoutOptions options,
+  ) {
+    final nativeOptions = calloc<_NativeLayoutOptions>()
+      ..ref.viewportWidth = options.viewportWidth
+      ..ref.viewportHeight = options.viewportHeight
+      ..ref.marginStart = options.marginStart
+      ..ref.marginEnd = options.marginEnd
+      ..ref.marginTop = options.marginTop
+      ..ref.marginBottom = options.marginBottom
+      ..ref.maxPages = options.maxPages;
+    try {
+      return _handleResult(_layoutSessionCreate(chapter, nativeOptions.ref));
+    } finally {
+      calloc.free(nativeOptions);
+    }
+  }
+
+  @override
+  PageletNativeLayoutResult layoutRequest(
+    int layout,
+    int startPage,
+    int maxPages,
+  ) {
+    final request = calloc<_NativePageRequest>()
+      ..ref.startPage = startPage
+      ..ref.maxPages = maxPages;
+    try {
+      return _layoutResult(_layoutRequest(layout, request.ref));
+    } finally {
+      calloc.free(request);
+    }
+  }
+
+  @override
+  PageletNativeLayoutResult layoutSubmitMeasurements(
+    int request,
+    Uint8List measuredBatch,
+  ) {
+    return _withByteSlice(
+      measuredBatch,
+      (slice) => _layoutResult(_layoutSubmitMeasurements(request, slice)),
+    );
   }
 
   @override
@@ -247,6 +373,53 @@ final class FfiPageletNativeApi implements PageletNativeApi {
     } finally {
       if (destination != nullptr) {
         calloc.free(destination);
+      }
+      calloc.free(slice);
+    }
+  }
+
+  PageletNativeLayoutResult _layoutResult(_NativeLayoutResult result) {
+    final status = PageletStatus.fromCode(result.status);
+    if (status != PageletStatus.ok) {
+      return PageletNativeLayoutResult(
+        status: status,
+        statusCode: result.status,
+        internalErrorId: result.internalErrorId,
+        stateCode: result.state,
+        requestHandle: result.request,
+        bytes: Uint8List(0),
+      );
+    }
+    try {
+      final bytes = _copyBuffer(result.buffer);
+      _releaseBuffers(<_NativeBuffer>[result.buffer], checkStatus: true);
+      return PageletNativeLayoutResult(
+        status: status,
+        statusCode: result.status,
+        internalErrorId: result.internalErrorId,
+        stateCode: result.state,
+        requestHandle: result.request,
+        bytes: bytes,
+      );
+    } catch (_) {
+      _releaseBuffers(<_NativeBuffer>[result.buffer], checkStatus: false);
+      rethrow;
+    }
+  }
+
+  T _withByteSlice<T>(Uint8List bytes, T Function(_NativeByteSlice) body) {
+    final data = bytes.isEmpty ? nullptr : calloc<Uint8>(bytes.length);
+    if (bytes.isNotEmpty) {
+      data.asTypedList(bytes.length).setAll(0, bytes);
+    }
+    final slice = calloc<_NativeByteSlice>()
+      ..ref.data = data
+      ..ref.length = bytes.length;
+    try {
+      return body(slice.ref);
+    } finally {
+      if (data != nullptr) {
+        calloc.free(data);
       }
       calloc.free(slice);
     }
@@ -338,6 +511,37 @@ final class _NativeMutableByteSlice extends Struct {
   external int length;
 }
 
+final class _NativeLayoutOptions extends Struct {
+  @Int64()
+  external int viewportWidth;
+
+  @Int64()
+  external int viewportHeight;
+
+  @Int64()
+  external int marginStart;
+
+  @Int64()
+  external int marginEnd;
+
+  @Int64()
+  external int marginTop;
+
+  @Int64()
+  external int marginBottom;
+
+  @Uint32()
+  external int maxPages;
+}
+
+final class _NativePageRequest extends Struct {
+  @Uint64()
+  external int startPage;
+
+  @Uint64()
+  external int maxPages;
+}
+
 final class _NativeBuffer extends Struct {
   @Uint64()
   external int id;
@@ -394,6 +598,28 @@ final class _NativeResourceResult extends Struct {
   external _NativeBuffer mediaType;
 }
 
+final class _NativeLayoutResult extends Struct {
+  @Uint32()
+  external int status;
+
+  @Uint32()
+  external int statusPadding;
+
+  @Uint64()
+  external int internalErrorId;
+
+  @Uint32()
+  external int state;
+
+  @Uint32()
+  external int statePadding;
+
+  @Uint64()
+  external int request;
+
+  external _NativeBuffer buffer;
+}
+
 final class _NativeCopyResult extends Struct {
   @Uint32()
   external int status;
@@ -421,6 +647,22 @@ typedef _BookOpenFileDescriptorNative = _NativeHandleResult Function(
     Uint64 engine, Int32 fd);
 typedef _BookOpenFileDescriptorDart = _NativeHandleResult Function(
     int engine, int fd);
+typedef _ChapterOpenNative = _NativeHandleResult Function(
+    Uint64 book, Uint64 spineIndex);
+typedef _ChapterOpenDart = _NativeHandleResult Function(
+    int book, int spineIndex);
+typedef _LayoutSessionCreateNative = _NativeHandleResult Function(
+    Uint64 chapter, _NativeLayoutOptions options);
+typedef _LayoutSessionCreateDart = _NativeHandleResult Function(
+    int chapter, _NativeLayoutOptions options);
+typedef _LayoutRequestNative = _NativeLayoutResult Function(
+    Uint64 layout, _NativePageRequest request);
+typedef _LayoutRequestDart = _NativeLayoutResult Function(
+    int layout, _NativePageRequest request);
+typedef _LayoutSubmitMeasurementsNative = _NativeLayoutResult Function(
+    Uint64 request, _NativeByteSlice measured);
+typedef _LayoutSubmitMeasurementsDart = _NativeLayoutResult Function(
+    int request, _NativeByteSlice measured);
 typedef _ResourceReadNative = _NativeResourceResult Function(
     Uint64 book, Uint32 resourceId);
 typedef _ResourceReadDart = _NativeResourceResult Function(

@@ -1,0 +1,16 @@
+name: pagelet_flutter_example
+description: Minimal pagelet Flutter reader example.
+publish_to: none
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  pagelet_flutter:
+    path: ..
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
