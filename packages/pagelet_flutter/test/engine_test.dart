@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pagelet_flutter/pagelet_flutter.dart';
 import 'package:pagelet_flutter/src/engine.dart' show PageletEngineTesting;
@@ -115,12 +118,42 @@ void main() {
       expect(engine.isDisposed, isTrue);
       expect(native.disposedHandles, <int>[1, 1]);
     });
+
+    test('reads one resource only on demand into defensive host bytes', () {
+      final native = _FakeNativeApi();
+      final engine = PageletEngineTesting.create(native);
+      final book = engine.openBook('/books/example.epub');
+
+      expect(native.resourceReads, isEmpty);
+      final resource = book.resources.read(7);
+
+      expect(native.resourceReads, <(int, int)>[(2, 7)]);
+      expect(resource.id, 7);
+      expect(resource.path, 'EPUB/images/cover.png');
+      expect(resource.mediaType, 'image/png');
+      expect(resource.bytes, <int>[1, 2, 3]);
+      final callerBytes = resource.bytes..[0] = 9;
+      expect(callerBytes, <int>[9, 2, 3]);
+      expect(resource.bytes, <int>[1, 2, 3]);
+
+      book.dispose();
+      expect(() => book.resources.read(7), throwsStateError);
+    });
+
+    test('rejects a native resource id mismatch', () {
+      final native = _FakeNativeApi(resourceIdOffset: 1);
+      final engine = PageletEngineTesting.create(native);
+      final book = engine.openBook('/books/example.epub');
+
+      expect(() => book.resources.read(7), throwsFormatException);
+    });
   });
 }
 
 final class _FakeNativeApi implements PageletNativeApi {
   _FakeNativeApi({
     this.openPathResult,
+    this.resourceIdOffset = 0,
     List<PageletNativeStatusResult>? disposeResults,
   }) : _disposeResults = disposeResults ?? <PageletNativeStatusResult>[];
 
@@ -132,10 +165,12 @@ final class _FakeNativeApi implements PageletNativeApi {
 
   int _nextHandle = 1;
   final PageletNativeHandleResult? openPathResult;
+  final int resourceIdOffset;
   final List<PageletNativeStatusResult> _disposeResults;
   final List<int> createdEngineHandles = <int>[];
   final List<(int, String)> openedPaths = <(int, String)>[];
   final List<(int, int)> openedFileDescriptors = <(int, int)>[];
+  final List<(int, int)> resourceReads = <(int, int)>[];
   final List<int> disposedHandles = <int>[];
 
   @override
@@ -155,6 +190,20 @@ final class _FakeNativeApi implements PageletNativeApi {
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd) {
     openedFileDescriptors.add((engine, fd));
     return _okHandle(_nextHandle++);
+  }
+
+  @override
+  PageletNativeResourceResult resourceRead(int book, int resourceId) {
+    resourceReads.add((book, resourceId));
+    return PageletNativeResourceResult(
+      status: PageletStatus.ok,
+      statusCode: 0,
+      internalErrorId: 0,
+      resourceId: resourceId + resourceIdOffset,
+      bytes: Uint8List.fromList(<int>[1, 2, 3]),
+      path: Uint8List.fromList(utf8.encode('EPUB/images/cover.png')),
+      mediaType: Uint8List.fromList(utf8.encode('image/png')),
+    );
   }
 
   @override

@@ -8,6 +8,9 @@ final class BookSession {
   final int _handle;
   bool _isDisposed = false;
 
+  /// Lazily reads publication resources owned by this book.
+  late final PageletResourceLoader resources = PageletResourceLoader._(this);
+
   /// Whether this book was disposed directly or by its owning engine.
   bool get isDisposed => _isDisposed;
 
@@ -21,5 +24,11 @@ final class BookSession {
 
   void _markDisposedByOwner() {
     _isDisposed = true;
+  }
+
+  void _ensureOpen() {
+    if (_isDisposed) {
+      throw StateError('BookSession has been disposed.');
+    }
   }
 }

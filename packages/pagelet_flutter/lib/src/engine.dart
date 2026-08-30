@@ -1,9 +1,12 @@
+import 'dart:convert';
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'errors.dart';
 import 'native_api.dart';
 
 part 'book_session.dart';
+part 'resource_loader.dart';
 
 /// Owns one native pagelet engine and every book opened under it.
 final class PageletEngine {
