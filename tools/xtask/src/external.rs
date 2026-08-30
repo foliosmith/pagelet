@@ -12,6 +12,15 @@ use super::{require_schema_version, strip_toml_comment, toml_string, XtaskError}
 const EXTERNAL_MANIFEST_PATH: &str = "tests/corpus-manifest.toml";
 const DEFAULT_EXTERNAL_ROOT: &str = "target/pagelet-external";
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct VerifiedArtifacts {
+    pub w3c_archive: PathBuf,
+    pub w3c_commit: String,
+    pub epubcheck_archive: PathBuf,
+    pub epubcheck_version: String,
+    pub epubcheck_profile: String,
+}
+
 pub(super) fn run(args: &[String]) -> Result<(), XtaskError> {
     match args {
         [action, locked] if action == "sync" && locked == "--locked" => external_sync(),
@@ -36,6 +45,22 @@ pub(super) fn run(args: &[String]) -> Result<(), XtaskError> {
 pub(super) fn lint_manifest(path: &Path) -> Result<(), XtaskError> {
     let text = fs::read_to_string(path)?;
     parse_external_manifest(path, &text).map(|_| ())
+}
+
+pub(super) fn verified_artifacts() -> Result<VerifiedArtifacts, XtaskError> {
+    let manifest = read_external_manifest()?;
+    let root = external_root();
+    let w3c_archive = root.join(&manifest.w3c.file_name);
+    let epubcheck_archive = root.join(&manifest.epubcheck.file_name);
+    verify_artifact(&w3c_archive, &manifest.w3c)?;
+    verify_artifact(&epubcheck_archive, &manifest.epubcheck)?;
+    Ok(VerifiedArtifacts {
+        w3c_archive,
+        w3c_commit: manifest.w3c_commit,
+        epubcheck_archive,
+        epubcheck_version: manifest.epubcheck_version,
+        epubcheck_profile: manifest.epubcheck_profile,
+    })
 }
 
 fn external_sync() -> Result<(), XtaskError> {

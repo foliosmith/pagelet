@@ -1,0 +1,65 @@
+schema_version = 1
+
+[[tests]]
+id = "ocf-package_arbitrary"
+requirement_id = "REQ-EPUB-PKG-001"
+feature_id = "EPUB-PKG-CONTAINER"
+profile = "required"
+automation = "structural"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "ocf-zip-comp"
+requirement_id = "REQ-EPUB-PKG-001"
+feature_id = "EPUB-OCF-ZIP"
+profile = "required"
+automation = "structural"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "pkg-unique-id"
+requirement_id = "REQ-EPUB-PKG-001"
+feature_id = "EPUB-PKG-METADATA"
+profile = "required"
+automation = "semantic"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "pkg-spine-order"
+requirement_id = "REQ-EPUB-PKG-001"
+feature_id = "EPUB-PKG-SPINE"
+profile = "required"
+automation = "semantic"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "nav-spine_in-spine"
+requirement_id = "REQ-EPUB-NAV-001"
+feature_id = "EPUB-NAV-TOC"
+profile = "required"
+automation = "semantic"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "cnt-xhtml-support"
+requirement_id = "REQ-EPUB-CONTENT-001"
+feature_id = "EPUB-CONTENT-XHTML"
+profile = "required"
+automation = "semantic"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "css-epub-writing-mode"
+requirement_id = "REQ-EPUB-CSS-001"
+feature_id = "EPUB-CSS-WRITING-MODE"
+profile = "required"
+automation = "visual-manual"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]
+
+[[tests]]
+id = "scr-support"
+requirement_id = "REQ-EPUB-SEC-001"
+feature_id = "EPUB-SCRIPTING"
+profile = "required"
+automation = "not-applicable"
+references = ["apple-macos.json", "thorium22-osx-win-deb.json"]

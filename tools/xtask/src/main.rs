@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod benchmark;
+mod conformance;
 mod external;
+mod release;
+mod runtime_compare;
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     hint::black_box,
     io,
@@ -12,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pagelet::epub::{open_book_ir, open_spine_item_chapter_ir};
+use pagelet::epub::{open_book, open_book_ir, open_spine_item_chapter_ir};
 use pagelet_testkit::{FixtureKind, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
 fn main() -> ExitCode {
@@ -38,9 +42,11 @@ fn run(args: Vec<String>) -> Result<(), XtaskError> {
         }
         "golden" => run_golden(&args[1..]),
         "corpus" => run_corpus(&args[1..]),
+        "w3c" => conformance::run_w3c(&args[1..]),
+        "epubcheck" => conformance::run_epubcheck(&args[1..]),
         "manifests" => run_manifests(&args[1..]),
         "bench" => run_bench(&args[1..]),
-        "release" => print_command_help("release", "verify and publish the pagelet crate"),
+        "release" => release::run(&args[1..]),
         "external" => external::run(&args[1..]),
         other => Err(XtaskError::Usage(format!("unknown xtask command: {other}"))),
     }
@@ -240,6 +246,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
 fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
     let mut profile = "smoke".to_owned();
     let mut required = env_flag("PAGELET_CORPUS_REQUIRED");
+    let mut json = None;
+    let mut report = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -252,6 +260,18 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
                 profile = value.clone();
             }
             "--required" => required = true,
+            "--json" => {
+                index += 1;
+                json = Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                    XtaskError::Usage("--json requires a value".into())
+                })?));
+            }
+            "--report" => {
+                index += 1;
+                report = Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                    XtaskError::Usage("--report requires a value".into())
+                })?));
+            }
             "-h" | "--help" | "help" => {
                 print_corpus_help();
                 return Ok(());
@@ -264,6 +284,10 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
     }
 
     validate_corpus_profile(&profile)?;
+    let json =
+        json.unwrap_or_else(|| Path::new("target/pagelet-corpus").join(format!("{profile}.json")));
+    let report =
+        report.unwrap_or_else(|| Path::new("target/pagelet-corpus").join(format!("{profile}.md")));
     let root = env::var_os("PAGELET_CORPUS_ROOT").map(PathBuf::from);
     let manifest = env::var_os("PAGELET_CORPUS_MANIFEST")
         .map(PathBuf::from)
@@ -276,15 +300,16 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
                 root.display()
             )));
         }
-    } else if required {
-        return Err(XtaskError::Command(
-            "PAGELET_CORPUS_ROOT is required but not set".into(),
-        ));
     }
 
     let manifest_text = fs::read_to_string(&manifest)?;
     let books = parse_corpus_manifest(&manifest, &manifest_text)?;
     let selected = select_corpus_books(&books, &profile);
+    if required && root.is_none() && selected.iter().any(|book| book.license != "generated") {
+        return Err(XtaskError::Command(
+            "PAGELET_CORPUS_ROOT is required for selected non-generated corpus cases".into(),
+        ));
+    }
     if selected.is_empty() {
         if required {
             return Err(XtaskError::Command(format!(
@@ -295,38 +320,61 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
             "corpus profile={profile} manifest={} selected=0",
             manifest.display()
         );
+        write_corpus_reports(&profile, &manifest, &json, &report, &[])?;
         return Ok(());
     }
 
-    let mut failures = Vec::new();
+    let mut results = Vec::with_capacity(selected.len());
     for book in &selected {
-        match corpus_book_bytes(book, root.as_deref()) {
+        let result = match corpus_book_bytes(book, root.as_deref()) {
             Ok(bytes) => match validate_corpus_book(book, &bytes) {
-                Ok(summary) => println!(
-                    "corpus case={} status=ok chapters_checked={} visible_chars={}",
-                    book.id, summary.chapters_checked, summary.visible_chars
-                ),
-                Err(error) => failures.push(format!("{}: {error}", book.id)),
+                Ok(summary) => CorpusCaseResult {
+                    id: book.id.clone(),
+                    status: "pass",
+                    categories: book.categories.clone(),
+                    features: book.features.clone(),
+                    chapters_checked: summary.chapters_checked,
+                    visible_chars: summary.visible_chars,
+                    diagnostics: summary.diagnostics,
+                },
+                Err(error) => CorpusCaseResult::failed(book, error.to_string()),
             },
             Err(error) => {
                 if book.license == "generated" || required {
-                    failures.push(format!("{}: {error}", book.id));
+                    CorpusCaseResult::failed(book, error.to_string())
                 } else {
-                    println!("corpus case={} status=skipped reason={error}", book.id);
+                    CorpusCaseResult::skipped(book, error.to_string())
                 }
             }
-        }
+        };
+        println!(
+            "corpus case={} status={} chapters_checked={} visible_chars={} diagnostics={}",
+            result.id,
+            result.status,
+            result.chapters_checked,
+            result.visible_chars,
+            result.diagnostics.len()
+        );
+        results.push(result);
     }
 
     println!(
         "corpus profile={profile} root={} manifest={} selected={}",
-        root.as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<generated-only>".to_owned()),
+        if root.is_some() {
+            "<configured>"
+        } else {
+            "<generated-only>"
+        },
         manifest.display(),
         selected.len()
     );
+    write_corpus_reports(&profile, &manifest, &json, &report, &results)?;
 
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|result| result.status == "fail")
+        .map(|result| format!("{}: {}", result.id, result.diagnostics.join("; ")))
+        .collect();
     if failures.is_empty() {
         Ok(())
     } else {
@@ -339,11 +387,118 @@ fn run_corpus(args: &[String]) -> Result<(), XtaskError> {
 
 fn validate_corpus_profile(profile: &str) -> Result<(), XtaskError> {
     match profile {
-        "smoke" | "full" | "robustness" | "locale" | "regression" => Ok(()),
+        "smoke" | "full" | "robustness" | "locale" | "layout" | "regression" | "stress"
+        | "benchmark" => Ok(()),
         other => Err(XtaskError::Usage(format!(
             "unknown corpus profile: {other}"
         ))),
     }
+}
+
+fn write_corpus_reports(
+    profile: &str,
+    manifest: &Path,
+    json_path: &Path,
+    report_path: &Path,
+    results: &[CorpusCaseResult],
+) -> Result<(), XtaskError> {
+    let passed = results
+        .iter()
+        .filter(|result| result.status == "pass")
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| result.status == "fail")
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|result| result.status == "skipped")
+        .count();
+    let mut json = format!(
+        "{{\n  \"schema_version\": 1,\n  \"profile\": \"{}\",\n  \"manifest\": \"{}\",\n  \"passed\": {passed},\n  \"failed\": {failed},\n  \"skipped\": {skipped},\n  \"results\": [\n",
+        escape_json(profile),
+        escape_json(&manifest.display().to_string())
+    );
+    for (index, result) in results.iter().enumerate() {
+        json.push_str(&format!(
+            "    {{\"id\": \"{}\", \"status\": \"{}\", \"categories\": {}, \"features\": {}, \"chapters_checked\": {}, \"visible_chars\": {}, \"diagnostics\": {}}}{}\n",
+            escape_json(&result.id),
+            result.status,
+            json_string_array(&result.categories),
+            json_string_array(&result.features),
+            result.chapters_checked,
+            result.visible_chars,
+            json_string_array(&result.diagnostics),
+            if index + 1 == results.len() { "" } else { "," }
+        ));
+    }
+    json.push_str("  ]\n}\n");
+    atomic_write(json_path, json.as_bytes())?;
+
+    let tested = passed + failed;
+    let pass_rate = if tested == 0 {
+        0.0
+    } else {
+        passed as f64 * 100.0 / tested as f64
+    };
+    let mut diagnostics = BTreeMap::<String, usize>::new();
+    for diagnostic in results.iter().flat_map(|result| result.diagnostics.iter()) {
+        *diagnostics.entry(diagnostic.clone()).or_default() += 1;
+    }
+    let mut top: Vec<_> = diagnostics.into_iter().collect();
+    top.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut markdown = format!(
+        "# EPUB corpus dashboard\n\n- Profile: `{profile}`\n- Pass rate: `{passed}/{tested}` ({pass_rate:.1}%)\n- Skipped: `{skipped}`\n\n| Case | Status | Categories | Features | Chapters | Visible chars | Diagnostics |\n|---|---:|---|---|---:|---:|---|\n"
+    );
+    for result in results {
+        markdown.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} | {} | {} |\n",
+            result.id,
+            result.status,
+            result.categories.join(", "),
+            result.features.join(", "),
+            result.chapters_checked,
+            result.visible_chars,
+            markdown_cell(&result.diagnostics.join("; "))
+        ));
+    }
+    markdown.push_str("\n## Top diagnostics\n\n");
+    if top.is_empty() {
+        markdown.push_str("No diagnostics.\n");
+    } else {
+        markdown.push_str("| Count | Diagnostic |\n|---:|---|\n");
+        for (diagnostic, count) in top.into_iter().take(10) {
+            markdown.push_str(&format!("| {count} | {} |\n", markdown_cell(&diagnostic)));
+        }
+    }
+    atomic_write(report_path, markdown.as_bytes())?;
+    println!("corpus JSON report: {}", json_path.display());
+    println!("corpus Markdown report: {}", report_path.display());
+    Ok(())
+}
+
+fn json_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
 }
 
 fn parse_corpus_manifest(path: &Path, text: &str) -> Result<Vec<CorpusBook>, XtaskError> {
@@ -374,6 +529,7 @@ fn parse_corpus_manifest(path: &Path, text: &str) -> Result<Vec<CorpusBook>, Xta
             "license" => book.license = Some(toml_string(path, line_number, value.trim())?),
             "expected" => book.expected = Some(toml_string(path, line_number, value.trim())?),
             "categories" => book.categories = parse_toml_string_array(path, line_number, value)?,
+            "features" => book.features = parse_toml_string_array(path, line_number, value)?,
             _ => {}
         }
     }
@@ -461,8 +617,8 @@ fn corpus_book_bytes(book: &CorpusBook, root: Option<&Path>) -> Result<Vec<u8>, 
             let actual = sha256_hex(&bytes);
             if actual != expected {
                 return Err(XtaskError::Command(format!(
-                    "{} sha256 mismatch: expected {expected}, got {actual}",
-                    path.display()
+                    "corpus {} sha256 mismatch: expected {expected}, got {actual}",
+                    book.id
                 )));
             }
         }
@@ -473,6 +629,16 @@ fn corpus_book_bytes(book: &CorpusBook, root: Option<&Path>) -> Result<Vec<u8>, 
 fn generated_corpus_fixture(book: &CorpusBook) -> Option<pagelet_testkit::Fixture> {
     let kind = match book.id.as_str() {
         "generated/minimal-epub3" => FixtureKind::MinimalEpub3,
+        "generated/epub2-with-ncx" => FixtureKind::Epub2WithNcx,
+        "generated/fallback-chain" => FixtureKind::FallbackChain,
+        "generated/footnote-collision" => FixtureKind::FootnoteCollision,
+        "generated/path-case-collision" => FixtureKind::PathCaseCollision,
+        "generated/css-cascade" => FixtureKind::CssCascade,
+        "generated/malformed-xhtml" => FixtureKind::MalformedXhtml,
+        "generated/huge-image" => FixtureKind::HugeImage,
+        "generated/rtl" => FixtureKind::Rtl,
+        "generated/data-uri" => FixtureKind::DataUri,
+        "generated/duplicate-ids" => FixtureKind::DuplicateIds,
         "generated/pathological" => FixtureKind::ZipBombLike,
         _ => return None,
     };
@@ -480,6 +646,14 @@ fn generated_corpus_fixture(book: &CorpusBook) -> Option<pagelet_testkit::Fixtur
 }
 
 fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary, XtaskError> {
+    let mut diagnostics = open_book(bytes.to_vec())
+        .map(|book| {
+            book.diagnostics
+                .into_iter()
+                .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let book_ir = match open_book_ir(bytes.to_vec()) {
         Ok(ir) if book.expected != "invalid" => ir,
         Ok(_) => {
@@ -491,6 +665,7 @@ fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary
             return Ok(CorpusSummary {
                 chapters_checked: 0,
                 visible_chars: 0,
+                diagnostics: vec!["expected invalid input was rejected".into()],
             });
         }
         Err(error) => return Err(XtaskError::Command(error.to_string())),
@@ -506,11 +681,20 @@ fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary
         let chapter = open_spine_item_chapter_ir(bytes.to_vec(), index)
             .map_err(|error| XtaskError::Command(error.to_string()))?;
         visible_chars = visible_chars.saturating_add(chapter.visible_text().chars().count());
+        diagnostics.extend(
+            chapter
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message)),
+        );
         if visible_chars > 0 {
             break;
         }
     }
-    if visible_chars == 0 && book.expected != "invalid" {
+    if visible_chars == 0
+        && book.expected != "invalid"
+        && !book.features.iter().any(|feature| feature == "image-only")
+    {
         return Err(XtaskError::Command(
             "no visible chapter text extracted".into(),
         ));
@@ -518,6 +702,7 @@ fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary
     Ok(CorpusSummary {
         chapters_checked,
         visible_chars,
+        diagnostics,
     })
 }
 
@@ -544,6 +729,7 @@ fn manifest_lint() -> Result<(), XtaskError> {
         "tests/spec/requirements.toml",
         "tests/spec/support-matrix.toml",
         "tests/spec/dart-compatibility.toml",
+        "tests/conformance/w3c-mapping.toml",
         "perf/performance-budgets.toml",
     ];
     for file in files {
@@ -551,6 +737,7 @@ fn manifest_lint() -> Result<(), XtaskError> {
         require_schema_version(file, &text)?;
     }
     external::lint_manifest(Path::new("tests/corpus-manifest.toml"))?;
+    conformance::lint_mapping()?;
     read_perf_budget_manifest(Path::new("perf/performance-budgets.toml"))?;
     validate_quoted_values(
         "tests/corpus-manifest.toml",
@@ -581,11 +768,65 @@ fn manifest_lint() -> Result<(), XtaskError> {
             "RejectedForSecurity",
         ],
     )?;
+    lint_compatibility_ledger()?;
+    lint_w3c_references()?;
     println!("manifest lint passed");
     Ok(())
 }
 
+fn lint_w3c_references() -> Result<(), XtaskError> {
+    let mapping = fs::read_to_string("tests/conformance/w3c-mapping.toml")?;
+    let requirements = fs::read_to_string("tests/spec/requirements.toml")?;
+    let features = fs::read_to_string("tests/spec/support-matrix.toml")?;
+    for (key, source) in [("requirement_id", &requirements), ("feature_id", &features)] {
+        let prefix = format!("{key} = ");
+        for line in mapping.lines().map(str::trim) {
+            let Some(value) = line.strip_prefix(&prefix) else {
+                continue;
+            };
+            let id = value.trim_matches('"');
+            if !source.contains(&format!("id = \"{id}\"")) {
+                return Err(XtaskError::Command(format!(
+                    "W3C mapping references unknown {key}: {id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lint_compatibility_ledger() -> Result<(), XtaskError> {
+    let matrix_path = "tests/spec/support-matrix.toml";
+    let matrix = fs::read_to_string(matrix_path)?;
+    let ledger = fs::read_to_string("docs/compatibility.md")?;
+    let mut ids = Vec::new();
+    for line in matrix.lines().map(str::trim) {
+        let Some(value) = line.strip_prefix("id = ") else {
+            continue;
+        };
+        let id = value.trim_matches('"');
+        if !ids.iter().any(|existing| existing == &id) {
+            ids.push(id);
+        }
+    }
+    let missing: Vec<_> = ids
+        .into_iter()
+        .filter(|id| !ledger.contains(&format!("| `{id}` |")))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(XtaskError::Command(format!(
+            "docs/compatibility.md is missing support-matrix features: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
 fn run_bench(args: &[String]) -> Result<(), XtaskError> {
+    if matches!(args.first().map(String::as_str), Some("compare-runtime")) {
+        return runtime_compare::run(&args[1..]);
+    }
     if matches!(args.first().map(String::as_str), Some("report")) {
         return benchmark::run(&args[1..]).map_err(XtaskError::Command);
     }
@@ -940,15 +1181,6 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-fn print_command_help(name: &str, summary: &str) -> Result<(), XtaskError> {
-    println!("cargo xtask {name}");
-    println!();
-    println!("{summary}.");
-    println!();
-    println!("This command group is reserved for upcoming pagelet automation tasks.");
-    Ok(())
-}
-
 fn print_help() {
     println!("pagelet xtask");
     println!();
@@ -958,6 +1190,8 @@ fn print_help() {
     println!("Commands:");
     println!("  golden     Check or update normalized golden files");
     println!("  corpus     Run configured EPUB corpus profiles");
+    println!("  w3c        Run mapped W3C EPUB tests");
+    println!("  epubcheck  Validate generated fixture classifications");
     println!("  manifests  Lint checked-in test manifests");
     println!("  bench      Run benchmark profiles and reports");
     println!("  release    Verify and publish the pagelet crate");
@@ -974,7 +1208,7 @@ fn print_golden_help() {
 
 fn print_corpus_help() {
     println!("Usage:");
-    println!("  cargo xtask corpus --profile smoke|full|robustness|locale|regression [--required]");
+    println!("  cargo xtask corpus --profile smoke|full|robustness|locale|layout|regression|stress|benchmark [--required] [--json <path>] [--report <path>]");
 }
 
 fn print_manifests_help() {
@@ -986,6 +1220,7 @@ fn print_bench_help() {
     println!("Usage:");
     println!("  cargo xtask bench [fixtures] --profile smoke|full [--iterations <n>]");
     println!("  cargo xtask bench report [options]");
+    println!("  cargo xtask bench compare-runtime --baseline <dart.csv> --candidate <rust.csv>");
     println!();
     println!("Run `cargo xtask bench report --help` for lifecycle report and baseline options.");
 }
@@ -1016,6 +1251,7 @@ struct CorpusBook {
     license: String,
     expected: String,
     categories: Vec<String>,
+    features: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -1026,33 +1262,101 @@ struct CorpusBookDraft {
     license: Option<String>,
     expected: Option<String>,
     categories: Vec<String>,
+    features: Vec<String>,
 }
 
 impl CorpusBookDraft {
     fn finish(self, path: &Path) -> Result<CorpusBook, XtaskError> {
+        let required = |name: &str, value: Option<String>| {
+            value.ok_or_else(|| {
+                XtaskError::Command(format!("{} [[books]] requires {name}", path.display()))
+            })
+        };
+        let id = required("id", self.id)?;
+        let book_path = required("path", self.path)?;
+        for (name, value) in [("id", &id), ("path", &book_path)] {
+            let candidate = Path::new(value);
+            if candidate.is_absolute()
+                || candidate
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(XtaskError::Command(format!(
+                    "{} corpus {name} must be a safe relative value: {value}",
+                    path.display()
+                )));
+            }
+        }
+        let license = required("license", self.license)?;
+        let sha256 = required("sha256", self.sha256)?;
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(XtaskError::Command(format!(
+                "{} corpus {id} sha256 must be 64 hexadecimal characters",
+                path.display()
+            )));
+        }
+        if license != "generated" && sha256.bytes().all(|byte| byte == b'0') {
+            return Err(XtaskError::Command(format!(
+                "{} corpus {id} requires a real sha256",
+                path.display()
+            )));
+        }
+        if self.categories.is_empty() || self.features.is_empty() {
+            return Err(XtaskError::Command(format!(
+                "{} corpus {id} requires categories and features",
+                path.display()
+            )));
+        }
         Ok(CorpusBook {
-            id: self.id.ok_or_else(|| {
-                XtaskError::Command(format!("{} [[books]] requires id", path.display()))
-            })?,
-            path: self.path.ok_or_else(|| {
-                XtaskError::Command(format!("{} [[books]] requires path", path.display()))
-            })?,
-            sha256: self.sha256,
-            license: self.license.ok_or_else(|| {
-                XtaskError::Command(format!("{} [[books]] requires license", path.display()))
-            })?,
-            expected: self.expected.ok_or_else(|| {
-                XtaskError::Command(format!("{} [[books]] requires expected", path.display()))
-            })?,
+            id,
+            path: book_path,
+            sha256: Some(sha256),
+            license,
+            expected: required("expected", self.expected)?,
             categories: self.categories,
+            features: self.features,
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct CorpusSummary {
     chapters_checked: usize,
     visible_chars: usize,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CorpusCaseResult {
+    id: String,
+    status: &'static str,
+    categories: Vec<String>,
+    features: Vec<String>,
+    chapters_checked: usize,
+    visible_chars: usize,
+    diagnostics: Vec<String>,
+}
+
+impl CorpusCaseResult {
+    fn failed(book: &CorpusBook, diagnostic: String) -> Self {
+        Self::new(book, "fail", diagnostic)
+    }
+
+    fn skipped(book: &CorpusBook, diagnostic: String) -> Self {
+        Self::new(book, "skipped", diagnostic)
+    }
+
+    fn new(book: &CorpusBook, status: &'static str, diagnostic: String) -> Self {
+        Self {
+            id: book.id.clone(),
+            status,
+            categories: book.categories.clone(),
+            features: book.features.clone(),
+            chapters_checked: 0,
+            visible_chars: 0,
+            diagnostics: vec![diagnostic],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1486,10 +1790,11 @@ features = ["package"]
 [[books]]
 id = "private/regression"
 path = "book.epub"
-sha256 = "abc"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 license = "private-ci"
 expected = "valid"
 categories = ["regression"]
+features = ["regression"]
 "#,
         )
         .expect("manifest");

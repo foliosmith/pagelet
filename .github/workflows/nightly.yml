@@ -1,0 +1,117 @@
+name: Nightly hardening
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+    - cron: "17 19 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: Full public conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/pagelet-external
+          key: pagelet-conformance-${{ hashFiles('tests/corpus-manifest.toml') }}
+      - run: cargo xtask external sync --locked
+      - run: cargo xtask external verify
+      - run: cargo xtask w3c --profile all --required
+      - run: cargo xtask epubcheck --fixtures valid,invalid --required
+      - run: cargo xtask corpus --profile full --required
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-conformance
+          path: |
+            target/pagelet-conformance/*.json
+            target/pagelet-conformance/*.md
+            target/pagelet-corpus/*.json
+            target/pagelet-corpus/*.md
+
+  private-corpus:
+    name: Private corpus
+    if: vars.PAGELET_PRIVATE_CORPUS_ENABLED == 'true'
+    runs-on: [self-hosted, pagelet-private-corpus]
+    env:
+      PAGELET_CORPUS_ROOT: ${{ vars.PAGELET_PRIVATE_CORPUS_ROOT }}
+      PAGELET_CORPUS_REQUIRED: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: cargo xtask corpus --profile full --required
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-private-corpus-summary
+          path: |
+            target/pagelet-corpus/*.json
+            target/pagelet-corpus/*.md
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_SECONDS: ${{ github.event.schedule == '17 19 * * 0' && '300' || '30' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - smoke
+          - ocf_decode
+          - ocf_paths
+          - xhtml_fast
+          - xhtml_differential
+          - css_parse
+          - css_cascade
+          - footnote_resolver
+          - image_header
+          - layout_typed_ir
+          - text_offsets
+          - wire_decode
+          - ffi_sequence
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly-2026-08-30
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly-2026-08-30 fuzz run ${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_SECONDS }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  rust-safety:
+    name: Miri and address sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly-2026-08-30
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly-2026-08-30 miri test -p pagelet --lib ffi::buffer::tests
+      - run: cargo +nightly-2026-08-30 miri test -p pagelet --lib ffi::tests
+      - name: Address sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: cargo +nightly-2026-08-30 test -p pagelet --lib --target x86_64-unknown-linux-gnu
+
+  release-build:
+    name: Release build size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p pagelet --release --all-features
+      - run: ls -lh target/release/libpagelet.*

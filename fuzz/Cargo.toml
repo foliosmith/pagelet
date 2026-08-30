@@ -84,6 +84,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "text_offsets"
+path = "fuzz_targets/text_offsets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wire_decode"
 path = "fuzz_targets/wire_decode.rs"
 test = false

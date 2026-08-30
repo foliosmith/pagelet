@@ -12,9 +12,16 @@ mod tests {
     use pagelet::{
         core::CancellationToken,
         epub::{open_book, resolve_resource_path, NavigationSource, OpenOptions},
+        layout::{
+            anchor_to_page, paginate_chapter_with_options, validate_layout_invariants,
+            LayoutOptions,
+        },
         text::{DefaultTextBackend, TextBackend},
     };
-    use pagelet_testkit::{FixtureEntry, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
+    use pagelet_testkit::{
+        FixtureEntry, GeneratorLimits, GoldenDocument, GoldenSectionName, PropertyGenerator,
+        ValidEpubBuilder,
+    };
 
     use super::*;
 
@@ -101,6 +108,51 @@ mod tests {
             error.code(),
             pagelet::core::DiagnosticCode::ResourceLimitExceeded
         );
+    }
+
+    #[test]
+    fn generated_unicode_layout_properties_are_replayable() {
+        for seed in 0..32 {
+            let mut generator = PropertyGenerator::with_limits(seed, GeneratorLimits::smoke());
+            let context = generator.failure_context("unicode layout invariants");
+            let generated = generator.unicode_text();
+            let fixture = ValidEpubBuilder::epub3(format!("property-{seed}"))
+                .xhtml(
+                    "EPUB/chapter-1.xhtml",
+                    "Property",
+                    &format!("<p>{}</p>", escape_xml(&generated.text)),
+                )
+                .build();
+            let chapter = pagelet::epub::open_first_chapter_ir(fixture.bytes().to_vec())
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let backend = DefaultTextBackend::new();
+            let options = LayoutOptions::default();
+            let first = paginate_chapter_with_options(&chapter, &backend, options)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let replay = paginate_chapter_with_options(&chapter, &backend, options)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+
+            validate_layout_invariants(&chapter, &first.pages)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            assert_eq!(
+                first
+                    .pages
+                    .iter()
+                    .map(|page| page.fingerprint)
+                    .collect::<Vec<_>>(),
+                replay
+                    .pages
+                    .iter()
+                    .map(|page| page.fingerprint)
+                    .collect::<Vec<_>>(),
+                "{context}"
+            );
+            for page in &first.pages {
+                if let Some(anchor) = page.start_anchor {
+                    assert!(anchor_to_page(&first.pages, anchor).is_some(), "{context}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -217,5 +269,14 @@ mod tests {
                 b"png bytes".to_vec(),
             ))
             .build()
+    }
+
+    fn escape_xml(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
     }
 }

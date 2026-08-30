@@ -271,14 +271,15 @@ fn collect_with_process_peak(options: &BenchReportOptions) -> Result<Snapshot, S
     let child_path = temp_dir.join(format!(".measure-{}.csv", std::process::id()));
     let executable = env::current_exe().map_err(io_error)?;
     let child_args = options.child_args(&child_path);
-    let profiled = profile_command(&executable, &child_args);
+    let profiled = profile_command(&executable, &child_args).and_then(|peak_rss| {
+        (peak_rss != 0)
+            .then_some(peak_rss)
+            .ok_or_else(|| "process profiler returned zero peak RSS".to_owned())
+    });
 
     let (mut snapshot, peak_rss) = match profiled {
         Ok(peak_rss) => {
             let snapshot = read_snapshot(&child_path)?;
-            if peak_rss == 0 {
-                return Err("process profiler returned zero peak RSS".into());
-            }
             (snapshot, peak_rss)
         }
         Err(error) if options.baseline.is_none() && options.record_baseline.is_none() => {

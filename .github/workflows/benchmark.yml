@@ -1,6 +1,8 @@
 name: Benchmark
 
 on:
+  schedule:
+    - cron: "47 18 * * *"
   pull_request:
     paths:
       - ".github/workflows/benchmark.yml"
@@ -45,6 +47,7 @@ jobs:
           --profile smoke
           --samples 5
           --runner github-hosted-observe
+          --incremental-cases
 
       - name: Upload observation report
         uses: actions/upload-artifact@v4
@@ -74,6 +77,7 @@ jobs:
           --samples 30
           --runner pagelet-macmini-m2pro
           --baseline perf/baselines/macos-aarch64-m2pro.csv
+          --incremental-cases
 
       - name: Upload pinned report
         if: always()

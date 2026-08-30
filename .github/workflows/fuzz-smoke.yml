@@ -12,19 +12,35 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   smoke:
-    name: Parser and layout smoke
+    name: ${{ matrix.target }} smoke
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - smoke
+          - ocf_decode
+          - ocf_paths
+          - xhtml_fast
+          - xhtml_differential
+          - css_parse
+          - css_cascade
+          - footnote_resolver
+          - image_header
+          - layout_typed_ir
+          - text_offsets
+          - wire_decode
+          - ffi_sequence
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@nightly-2026-08-30
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -32,8 +48,5 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
-      - name: List registered fuzz targets
-        run: cargo fuzz list
-
-      - name: Build fuzz-adjacent modules
-        run: cargo test -p pagelet --all-features
+      - name: Run bounded fuzz target
+        run: cargo +nightly-2026-08-30 fuzz run ${{ matrix.target }} -- -max_total_time=15

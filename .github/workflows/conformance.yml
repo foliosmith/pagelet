@@ -6,6 +6,8 @@ on:
       - ".github/workflows/conformance.yml"
       - "crates/**"
       - "tests/**"
+      - "tools/xtask/**"
+      - "docs/compatibility.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -15,8 +17,8 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  generated-fixtures:
-    name: Generated fixtures
+  mapped-conformance:
+    name: Mapped W3C and EPUBCheck
     runs-on: ubuntu-latest
 
     steps:
@@ -29,8 +31,33 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Test workspace
-        run: cargo test --workspace --all-features
+      - name: Cache pinned external suites
+        uses: actions/cache@v4
+        with:
+          path: target/pagelet-external
+          key: pagelet-conformance-${{ hashFiles('tests/corpus-manifest.toml') }}
 
-      - name: Check pagelet conformance hooks
-        run: cargo test -p pagelet --all-features
+      - name: Sync and verify pinned suites
+        run: |
+          cargo xtask external sync --locked
+          cargo xtask external verify
+
+      - name: Run mapped W3C tests
+        run: cargo xtask w3c --profile required --required
+
+      - name: Validate generated fixtures with EPUBCheck
+        run: cargo xtask epubcheck --fixtures valid,invalid --required
+
+      - name: Run generated corpus dashboard
+        run: cargo xtask corpus --profile full --required
+
+      - name: Upload conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagelet-conformance
+          path: |
+            target/pagelet-conformance/*.json
+            target/pagelet-conformance/*.md
+            target/pagelet-corpus/*.json
+            target/pagelet-corpus/*.md

@@ -391,11 +391,13 @@ impl RawEpubBuilder {
         ))
     }
 
-    /// Build deterministic ZIP bytes from entries exactly as provided.
+    /// Build deterministic ZIP bytes with the EPUB mimetype entry first.
     #[must_use]
     pub fn build(mut self) -> Fixture {
-        self.entries
-            .sort_by(|left, right| left.path.cmp(&right.path));
+        self.entries.sort_by(|left, right| {
+            (left.path.as_ref() != "mimetype", left.path.as_ref())
+                .cmp(&(right.path.as_ref() != "mimetype", right.path.as_ref()))
+        });
         let bytes = write_stored_zip(&self.entries);
         Fixture {
             id: self.id,
@@ -545,8 +547,14 @@ fn package_document(builder: &ValidEpubBuilder) -> String {
         ""
     };
 
+    let modified = if builder.package_version == PackageVersion::Epub3 {
+        r#"<meta property="dcterms:modified">2026-01-01T00:00:00Z</meta>"#
+    } else {
+        ""
+    };
+
     format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="{version}" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:pagelet:{}</dc:identifier><dc:title>{}</dc:title><dc:language>en</dc:language></metadata><manifest>{manifest}</manifest><spine{spine_attrs}>{spine}</spine></package>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="{version}" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:pagelet:{}</dc:identifier><dc:title>{}</dc:title><dc:language>en</dc:language>{modified}</metadata><manifest>{manifest}</manifest><spine{spine_attrs}>{spine}</spine></package>"#,
         builder.id,
         escape_xml(&builder.title)
     )
@@ -558,7 +566,7 @@ fn container_xml() -> String {
 
 fn nav_document(title: &str) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{}</title></head><body><nav epub:type="toc"><ol><li><a href="chapter-1.xhtml">Start</a></li></ol></nav></body></html>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{}</title></head><body><nav epub:type="toc"><ol><li><a href="chapter-1.xhtml">Start</a></li></ol></nav></body></html>"#,
         escape_xml(title)
     )
 }
@@ -682,6 +690,7 @@ mod tests {
             assert!(fixture.contains_entry("mimetype"));
             assert!(fixture.contains_entry("META-INF/container.xml"));
             assert!(fixture.contains_entry("EPUB/package.opf"));
+            assert_eq!(fixture.entries[0].path.as_ref(), "mimetype");
         }
     }
 

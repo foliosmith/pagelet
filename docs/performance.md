@@ -25,7 +25,8 @@ Markdown report under `target/pagelet-bench/`:
 cargo run --release -p xtask -- bench report \
   --profile full \
   --runner pagelet-macmini-m2pro \
-  --baseline perf/baselines/macos-aarch64-m2pro.csv
+  --baseline perf/baselines/macos-aarch64-m2pro.csv \
+  --incremental-cases
 ```
 
 The pinned suite uses one deterministic `small-novel` EPUB and fixed layout/text
@@ -63,10 +64,47 @@ cargo run --release -p xtask -- bench report \
   --runner pagelet-macmini-m2pro \
   --record-baseline perf/baselines/macos-aarch64-m2pro.csv \
   --replace-baseline \
-  --reason "explain the accepted hardware or algorithm change"
+  --reason "explain the accepted hardware or algorithm change" \
+  --incremental-cases
 ```
 
 Shared GitHub-hosted runners upload observation-only reports. The blocking job
 targets the self-hosted labels `macOS`, `ARM64`, and `pagelet-perf-m2pro`; set the
 repository variable `PAGELET_PERF_GATE_ENABLED=true` only after that runner is
 registered and reserved for performance work.
+
+## Dart/Rust Same-Boundary Comparison
+
+Cache investment is gated by a same-machine, same-fixture comparison instead
+of assumptions. Capture the Rust candidate with `--incremental-cases`, and
+export the Dart baseline as CSV with the same runner, OS, architecture,
+fixture ID, fixture SHA-256 and metric units:
+
+```text
+schema_version,1
+runtime,dart
+runner_id,pagelet-macmini-m2pro
+os,macos
+arch,aarch64
+profile,full
+fixture_id,small-novel
+fixture_sha256,<same fixture hash>
+samples,30
+metric,unit,p50,p95
+peak_rss_bytes,bytes,<value>,<value>
+first_page_ready,ns,<value>,<value>
+height_only_repack,ns,<value>,<value>
+```
+
+Then compare arbitrary compatible files:
+
+```sh
+cargo xtask bench compare-runtime \
+  --baseline path/to/dart.csv \
+  --candidate target/pagelet-bench/current.csv
+```
+
+The gate records the stage targets: at least 40% lower peak RSS, 2x faster
+first page, and 5x faster warm height-only repagination. The seven-layer cache,
+eviction, persistent cache and prefetch tasks remain deferred until this report
+identifies a measured gap.

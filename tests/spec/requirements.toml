@@ -15,3 +15,27 @@ summary = "Resource-limit and malformed-input cases are explicit diagnostics, no
 source = "pagelet security model"
 tests = ["fixture:zip-bomb-like", "fixture:malformed-xhtml"]
 gates = ["cargo xtask corpus --profile robustness"]
+
+[[requirements]]
+id = "REQ-EPUB-NAV-001"
+area = "navigation"
+summary = "Preserve EPUB 3 nav and EPUB 2 NCX hierarchy and targets."
+source = "EPUB 3.3 navigation document; EPUB 2 NCX"
+tests = ["w3c:nav-spine_in-spine", "fixture:epub2-with-ncx"]
+gates = ["cargo xtask w3c --profile required --required"]
+
+[[requirements]]
+id = "REQ-EPUB-CONTENT-001"
+area = "content"
+summary = "Map supported XHTML semantics and visible text into ChapterIR without losing source ranges."
+source = "EPUB 3.3 content documents"
+tests = ["w3c:cnt-xhtml-support", "fuzz:xhtml_differential", "property:layout-invariants"]
+gates = ["cargo test --workspace", "cargo xtask w3c --profile required --required"]
+
+[[requirements]]
+id = "REQ-EPUB-CSS-001"
+area = "style"
+summary = "Apply the documented CSS subset and expose unsupported rendering gaps."
+source = "EPUB 3.3 CSS profile"
+tests = ["fixture:css-cascade", "w3c:css-epub-writing-mode"]
+gates = ["cargo test -p pagelet --all-features"]

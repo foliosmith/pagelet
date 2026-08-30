@@ -30,3 +30,93 @@ license = "generated"
 expected = "warning"
 categories = ["robustness"]
 features = ["zip-bomb-like", "malformed-xhtml", "duplicate-ids"]
+
+[[books]]
+id = "generated/epub2-with-ncx"
+path = "generated/epub2-with-ncx.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["smoke"]
+features = ["opf-2", "ncx"]
+
+[[books]]
+id = "generated/fallback-chain"
+path = "generated/fallback-chain.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["layout"]
+features = ["fallback"]
+
+[[books]]
+id = "generated/footnote-collision"
+path = "generated/footnote-collision.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["layout"]
+features = ["footnotes"]
+
+[[books]]
+id = "generated/path-case-collision"
+path = "generated/path-case-collision.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["robustness"]
+features = ["path-case"]
+
+[[books]]
+id = "generated/css-cascade"
+path = "generated/css-cascade.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["layout"]
+features = ["css"]
+
+[[books]]
+id = "generated/malformed-xhtml"
+path = "generated/malformed-xhtml.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "warning"
+categories = ["robustness"]
+features = ["malformed-xhtml"]
+
+[[books]]
+id = "generated/huge-image"
+path = "generated/huge-image.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["layout", "stress"]
+features = ["images", "image-only", "large-resource"]
+
+[[books]]
+id = "generated/rtl"
+path = "generated/rtl.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "valid"
+categories = ["locale"]
+features = ["rtl", "arabic"]
+
+[[books]]
+id = "generated/data-uri"
+path = "generated/data-uri.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "warning"
+categories = ["robustness"]
+features = ["data-uri", "image-only"]
+
+[[books]]
+id = "generated/duplicate-ids"
+path = "generated/duplicate-ids.epub"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+license = "generated"
+expected = "warning"
+categories = ["robustness", "regression"]
+features = ["duplicate-ids"]

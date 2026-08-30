@@ -35,10 +35,22 @@ project security model requires:
 ## Unsafe Code
 
 Core parsing and layout crates must use `#![forbid(unsafe_code)]`. Unsafe code
-is limited to audited adapter or memory-mapping boundaries and must carry a
-specific `SAFETY:` explanation.
+is currently limited to `crates/pagelet/src/ffi/native.rs`. Every unsafe block
+must carry a nearby `SAFETY:` explanation, and every public unsafe C ABI
+function must document its caller obligations under `# Safety`. The release
+policy verifier rejects unsafe code outside that boundary.
 
 ## Dependency Checks
 
-License and source policy is enforced with `cargo deny`. Advisory and audit
-checks are added in a later CI task.
+License and source policy is enforced with `cargo deny`; RustSec advisories are
+checked with `cargo audit`. Both run in normal CI and the release gate. Selected
+wire, handle and buffer tests also run under fuzzing, Miri and the nightly
+address-sanitizer job.
+
+Run the local policy checks with:
+
+```sh
+cargo deny check
+cargo audit
+cargo xtask release verify
+```

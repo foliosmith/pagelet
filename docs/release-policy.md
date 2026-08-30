@@ -17,3 +17,17 @@ Breaking schema changes require explicit migration or invalidation behavior.
 Before publishing, run formatting, all-target checks, tests, documentation,
 bench smoke, package verification, license checks, and compatibility ledger
 updates. Do not publish internal module boundaries as separate crates.
+
+`cargo xtask release verify` checks the single-publishable-crate rule, unsafe
+boundary, manifests, pinned external artifacts, golden files and generated
+corpus. `cargo xtask release dry-run` additionally runs
+`cargo publish -p pagelet --dry-run --locked` without requiring a crates.io
+token. Formal publishing is intentionally explicit:
+
+```sh
+cargo xtask release publish --version 0.1.0
+```
+
+It requires a clean checkout at the exact `v0.1.0` tag and a matching
+`CHANGELOG.md` release heading. If crates.io accepted a bad release, follow the
+tool's recovery message and yank that exact version; never reuse a version.
