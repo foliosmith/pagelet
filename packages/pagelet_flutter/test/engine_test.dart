@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pagelet_flutter/pagelet_flutter.dart';
 import 'package:pagelet_flutter/src/engine.dart' show PageletEngineTesting;
@@ -147,6 +146,37 @@ void main() {
 
       expect(() => book.resources.read(7), throwsFormatException);
     });
+
+    test('maps page coordinates to the native UTF-8 hit-test result', () {
+      final native = _FakeNativeApi(
+        hitTestResult: const PageletNativeHitTestResult(
+          status: PageletStatus.ok,
+          statusCode: 0,
+          internalErrorId: 0,
+          found: true,
+          affinity: 1,
+          nodeId: 7,
+          utf8ByteOffset: 9,
+          fragmentId: 88,
+        ),
+      );
+      final engine = PageletEngineTesting.create(native);
+      final layout =
+          engine.openBook('/books/example.epub').openChapter(0).createLayout(
+                const PageletLayoutOptions(
+                  viewportWidth: 320,
+                  viewportHeight: 480,
+                ),
+              );
+
+      final hit = layout.hitTest(2, const Offset(1.5, 2));
+
+      expect(native.hitTests, <(int, int, int, int)>[(4, 2, 96, 128)]);
+      expect(hit!.nodeId, 7);
+      expect(hit.utf8ByteOffset, 9);
+      expect(hit.fragmentId, 88);
+      expect(hit.affinity, PageTextAffinity.downstream);
+    });
   });
 }
 
@@ -154,6 +184,7 @@ final class _FakeNativeApi implements PageletNativeApi {
   _FakeNativeApi({
     this.openPathResult,
     this.resourceIdOffset = 0,
+    this.hitTestResult,
     List<PageletNativeStatusResult>? disposeResults,
   }) : _disposeResults = disposeResults ?? <PageletNativeStatusResult>[];
 
@@ -166,11 +197,13 @@ final class _FakeNativeApi implements PageletNativeApi {
   int _nextHandle = 1;
   final PageletNativeHandleResult? openPathResult;
   final int resourceIdOffset;
+  final PageletNativeHitTestResult? hitTestResult;
   final List<PageletNativeStatusResult> _disposeResults;
   final List<int> createdEngineHandles = <int>[];
   final List<(int, String)> openedPaths = <(int, String)>[];
   final List<(int, int)> openedFileDescriptors = <(int, int)>[];
   final List<(int, int)> resourceReads = <(int, int)>[];
+  final List<(int, int, int, int)> hitTests = <(int, int, int, int)>[];
   final List<int> disposedHandles = <int>[];
 
   @override
@@ -228,6 +261,33 @@ final class _FakeNativeApi implements PageletNativeApi {
   ) {
     return layoutRequest(0, 0, 1);
   }
+
+  @override
+  PageletNativeHitTestResult hitTest(
+    int layout,
+    int pageIndex,
+    int x,
+    int y,
+  ) {
+    hitTests.add((layout, pageIndex, x, y));
+    return hitTestResult ??
+        const PageletNativeHitTestResult(
+          status: PageletStatus.ok,
+          statusCode: 0,
+          internalErrorId: 0,
+          found: false,
+          affinity: 0,
+          nodeId: 0,
+          utf8ByteOffset: 0,
+          fragmentId: 0,
+        );
+  }
+
+  @override
+  PageletNativeStatusResult requestCancel(int request) => okStatus;
+
+  @override
+  int debugLiveBufferCount() => 0;
 
   @override
   PageletNativeResourceResult resourceRead(int book, int resourceId) {

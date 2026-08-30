@@ -7,6 +7,7 @@ export 'src/engine.dart'
         ChapterSession,
         LayoutSession,
         PageletEngine,
+        PageletHitTestResult,
         PageletLayoutOptions,
         PageletLayoutResult,
         PageletLayoutState,

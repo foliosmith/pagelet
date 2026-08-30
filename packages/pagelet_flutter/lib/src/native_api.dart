@@ -108,6 +108,28 @@ final class PageletNativeLayoutResult {
   final Uint8List bytes;
 }
 
+final class PageletNativeHitTestResult {
+  const PageletNativeHitTestResult({
+    required this.status,
+    required this.statusCode,
+    required this.internalErrorId,
+    required this.found,
+    required this.affinity,
+    required this.nodeId,
+    required this.utf8ByteOffset,
+    required this.fragmentId,
+  });
+
+  final PageletStatus status;
+  final int statusCode;
+  final int internalErrorId;
+  final bool found;
+  final int affinity;
+  final int nodeId;
+  final int utf8ByteOffset;
+  final int fragmentId;
+}
+
 /// Narrow native surface required by the engine and book wrappers.
 ///
 /// The interface is intentionally internal to the package facade. It also
@@ -140,6 +162,17 @@ abstract interface class PageletNativeApi {
     int request,
     Uint8List measuredBatch,
   );
+
+  PageletNativeHitTestResult hitTest(
+    int layout,
+    int pageIndex,
+    int x,
+    int y,
+  );
+
+  PageletNativeStatusResult requestCancel(int request);
+
+  int debugLiveBufferCount();
 
   /// Copies one publication resource into host-owned memory.
   PageletNativeResourceResult resourceRead(int book, int resourceId);
@@ -177,6 +210,16 @@ final class FfiPageletNativeApi implements PageletNativeApi {
         _layoutSubmitMeasurements = library.lookupFunction<
                 _LayoutSubmitMeasurementsNative, _LayoutSubmitMeasurementsDart>(
             'pagelet_layout_submit_measurements'),
+        _hitTest = library.lookupFunction<_HitTestNative, _HitTestDart>(
+          'pagelet_hit_test',
+        ),
+        _requestCancel =
+            library.lookupFunction<_RequestCancelNative, _RequestCancelDart>(
+          'pagelet_request_cancel',
+        ),
+        _debugLiveBufferCount = library.lookupFunction<
+            _DebugLiveBufferCountNative,
+            _DebugLiveBufferCountDart>('pagelet_debug_live_buffer_count'),
         _resourceRead =
             library.lookupFunction<_ResourceReadNative, _ResourceReadDart>(
           'pagelet_resource_read',
@@ -213,6 +256,9 @@ final class FfiPageletNativeApi implements PageletNativeApi {
   final _LayoutSessionCreateDart _layoutSessionCreate;
   final _LayoutRequestDart _layoutRequest;
   final _LayoutSubmitMeasurementsDart _layoutSubmitMeasurements;
+  final _HitTestDart _hitTest;
+  final _RequestCancelDart _requestCancel;
+  final _DebugLiveBufferCountDart _debugLiveBufferCount;
   final _ResourceReadDart _resourceRead;
   final _BufferCopyDart _bufferCopy;
   final _BufferFreeDart _bufferFree;
@@ -301,6 +347,37 @@ final class FfiPageletNativeApi implements PageletNativeApi {
       (slice) => _layoutResult(_layoutSubmitMeasurements(request, slice)),
     );
   }
+
+  @override
+  PageletNativeHitTestResult hitTest(
+    int layout,
+    int pageIndex,
+    int x,
+    int y,
+  ) {
+    final result = _hitTest(layout, pageIndex, x, y);
+    if (result.found > 1) {
+      throw const FormatException('Native hit-test found flag is invalid.');
+    }
+    return PageletNativeHitTestResult(
+      status: PageletStatus.fromCode(result.status),
+      statusCode: result.status,
+      internalErrorId: result.internalErrorId,
+      found: result.found == 1,
+      affinity: result.affinity,
+      nodeId: result.nodeId,
+      utf8ByteOffset: result.utf8ByteOffset,
+      fragmentId: result.fragmentId,
+    );
+  }
+
+  @override
+  PageletNativeStatusResult requestCancel(int request) {
+    return _statusResult(_requestCancel(request));
+  }
+
+  @override
+  int debugLiveBufferCount() => _debugLiveBufferCount();
 
   @override
   PageletNativeResourceResult resourceRead(int book, int resourceId) {
@@ -637,6 +714,38 @@ final class _NativeCopyResult extends Struct {
   external int required;
 }
 
+final class _NativeHitTestResult extends Struct {
+  @Uint32()
+  external int status;
+
+  @Uint32()
+  external int statusPadding;
+
+  @Uint64()
+  external int internalErrorId;
+
+  @Uint8()
+  external int found;
+
+  @Uint8()
+  external int affinity;
+
+  @Array(6)
+  external Array<Uint8> padding;
+
+  @Uint32()
+  external int nodeId;
+
+  @Uint32()
+  external int utf8ByteOffset;
+
+  @Uint32()
+  external int fragmentId;
+
+  @Uint32()
+  external int tailPadding;
+}
+
 typedef _EngineCreateNative = _NativeHandleResult Function();
 typedef _EngineCreateDart = _NativeHandleResult Function();
 typedef _BookOpenPathNative = _NativeHandleResult Function(
@@ -663,6 +772,14 @@ typedef _LayoutSubmitMeasurementsNative = _NativeLayoutResult Function(
     Uint64 request, _NativeByteSlice measured);
 typedef _LayoutSubmitMeasurementsDart = _NativeLayoutResult Function(
     int request, _NativeByteSlice measured);
+typedef _HitTestNative = _NativeHitTestResult Function(
+    Uint64 layout, Uint32 pageIndex, Int64 x, Int64 y);
+typedef _HitTestDart = _NativeHitTestResult Function(
+    int layout, int pageIndex, int x, int y);
+typedef _RequestCancelNative = _NativeStatusResult Function(Uint64 request);
+typedef _RequestCancelDart = _NativeStatusResult Function(int request);
+typedef _DebugLiveBufferCountNative = Size Function();
+typedef _DebugLiveBufferCountDart = int Function();
 typedef _ResourceReadNative = _NativeResourceResult Function(
     Uint64 book, Uint32 resourceId);
 typedef _ResourceReadDart = _NativeResourceResult Function(

@@ -1,9 +1,11 @@
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
+import 'dart:ui';
 
 import 'errors.dart';
 import 'native_api.dart';
+import 'page_scene_decoder.dart' show PageTextAffinity;
 
 part 'book_session.dart';
 part 'chapter_session.dart';
@@ -124,6 +126,10 @@ final class PageletEngineTesting {
   /// Creates an engine over a custom native API.
   static PageletEngine create(PageletNativeApi nativeApi) {
     return PageletEngine._fromNativeApi(nativeApi);
+  }
+
+  static int debugLiveBufferCount(PageletEngine engine) {
+    return engine._nativeApi.debugLiveBufferCount();
   }
 }
 

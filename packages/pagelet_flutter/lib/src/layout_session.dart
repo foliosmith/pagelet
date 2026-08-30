@@ -46,6 +46,20 @@ final class PageletLayoutResult {
   final Uint8List bytes;
 }
 
+final class PageletHitTestResult {
+  const PageletHitTestResult({
+    required this.nodeId,
+    required this.utf8ByteOffset,
+    required this.fragmentId,
+    required this.affinity,
+  });
+
+  final int nodeId;
+  final int utf8ByteOffset;
+  final int fragmentId;
+  final PageTextAffinity affinity;
+}
+
 /// Owns one native layout session under a [ChapterSession].
 final class LayoutSession {
   LayoutSession._(this._chapter, this._handle);
@@ -87,6 +101,57 @@ final class LayoutSession {
         measuredBatch,
       ),
       'layout_submit_measurements',
+    );
+  }
+
+  PageletHitTestResult? hitTest(int pageIndex, Offset position) {
+    _ensureOpen();
+    if (pageIndex < 0 || pageIndex > _maximumUint32) {
+      throw RangeError.range(pageIndex, 0, _maximumUint32, 'pageIndex');
+    }
+    final result = _chapter._book._engine._nativeApi.hitTest(
+      _handle,
+      pageIndex,
+      _layoutUnitRaw(position.dx, 'x'),
+      _layoutUnitRaw(position.dy, 'y'),
+    );
+    if (result.status != PageletStatus.ok) {
+      throw PageletException(
+        operation: 'hit_test',
+        status: result.status,
+        statusCode: result.statusCode,
+        internalErrorId: result.internalErrorId,
+      );
+    }
+    if (!result.found) {
+      return null;
+    }
+    if (result.affinity < 0 ||
+        result.affinity >= PageTextAffinity.values.length) {
+      throw FormatException(
+        'Native text affinity ${result.affinity} is invalid.',
+      );
+    }
+    return PageletHitTestResult(
+      nodeId: result.nodeId,
+      utf8ByteOffset: result.utf8ByteOffset,
+      fragmentId: result.fragmentId,
+      affinity: PageTextAffinity.values[result.affinity],
+    );
+  }
+
+  void cancelRequest(int requestHandle) {
+    _ensureOpen();
+    if (requestHandle <= 0) {
+      throw RangeError.value(
+        requestHandle,
+        'requestHandle',
+        'must be positive',
+      );
+    }
+    _requireSuccess(
+      _chapter._book._engine._nativeApi.requestCancel(requestHandle),
+      'request_cancel',
     );
   }
 
