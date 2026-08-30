@@ -3,16 +3,24 @@
 Flutter host bindings for the native `pagelet` EPUB parsing and pagination
 engine.
 
-The first adapter slice owns the engine and book-session lifecycle. Layout,
-host text measurement, page-scene decoding, and resource loading are added by
-the following Milestone 4 tasks.
+The adapter owns the engine and book-session lifecycle and provides batched
+Flutter paragraph measurement. Layout-session wrappers, page-scene decoding,
+and resource loading are added by the following Milestone 4 tasks.
 
 ```dart
 final engine = PageletEngine(libraryPath: '/path/to/libpagelet.dylib');
 final book = engine.openBook('/path/to/book.epub');
 
 try {
-  // Create chapter and layout sessions in the subsequent adapter slices.
+  final measurement = TextMeasureBridge(
+    fontFingerprint: myRegisteredFontSetFingerprint,
+  ).measureBatch(nativeMeasureBatchBytes);
+  try {
+    // Submit measurement.wireBytes once, then render with the retained
+    // measurement.paragraphs TextPainter instances.
+  } finally {
+    measurement.dispose();
+  }
 } finally {
   book.dispose();
   engine.dispose();
