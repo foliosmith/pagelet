@@ -1,0 +1,38 @@
+name: Flutter adapter smoke
+
+on:
+  pull_request:
+    paths:
+      - "packages/pagelet_flutter/**"
+      - ".github/workflows/flutter-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: android
+          - os: macos-latest
+            target: ios
+          - os: macos-latest
+            target: macos
+          - os: windows-latest
+            target: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'android'
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.6
+          channel: stable
+          cache: true
+      - run: dart packages/pagelet_flutter/tool/build_smoke.dart ${{ matrix.target }}

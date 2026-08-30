@@ -10,6 +10,10 @@ geometry, and copies publication resources into Dart memory on demand.
 The [`example/`](example/) reader connects the native chapter/layout lifecycle,
 Flutter measurement, page-scene decoding, and responsive `PageView` painting.
 
+`dart tool/build_smoke.dart macos` builds a temporary host app. CI runs the same
+smoke for Android, iOS, macOS, and Windows without committing generated runner
+projects.
+
 ```dart
 final engine = PageletEngine(libraryPath: '/path/to/libpagelet.dylib');
 final book = engine.openBook('/path/to/book.epub');
