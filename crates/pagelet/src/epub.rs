@@ -1645,6 +1645,27 @@ pub fn parse_css(input: &str, limits: ResourceLimits) -> Result<CssStylesheet, P
             continue;
         }
 
+        if input.as_bytes().get(cursor) == Some(&b'@') {
+            let tail = &input[cursor..];
+            let semicolon = tail.find(';');
+            let open = tail.find('{');
+            if semicolon.is_some_and(|end| open.is_none_or(|brace| end < brace)) {
+                cursor += semicolon.expect("checked CSS at-rule terminator") + 1;
+                continue;
+            }
+            let Some(open) = open else {
+                break;
+            };
+            let open = cursor + open;
+            let Some(close) = matching_css_brace(&input, open) else {
+                return Err(PageletError::Parse(ParseError::new(
+                    "unterminated CSS at-rule",
+                )));
+            };
+            cursor = close + 1;
+            continue;
+        }
+
         let Some(open_relative) = input[cursor..].find('{') else {
             break;
         };
@@ -1813,12 +1834,16 @@ fn parse_css_selectors(
             ));
         }
         let mut parts = Vec::new();
+        let mut supported = true;
         for compound in raw.split_whitespace() {
             if let Some(selector) = parse_css_simple_selector(compound) {
                 parts.push(selector);
+            } else {
+                supported = false;
+                break;
             }
         }
-        if !parts.is_empty() {
+        if supported && !parts.is_empty() {
             selectors.push(CssSelector {
                 specificity: css_specificity(&parts),
                 parts,
@@ -1826,6 +1851,43 @@ fn parse_css_selectors(
         }
     }
     Ok(selectors)
+}
+
+fn matching_css_brace(input: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, character) in input[open..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_css_simple_selector(input: &str) -> Option<CssSimpleSelector> {
@@ -3443,22 +3505,22 @@ impl ChapterBuilder<'_> {
                             self.collect_inline(*child, style, accumulator)?;
                         }
                         if let Some(href) = element.attr("href") {
-                            if accumulator.text.len() == before {
-                                accumulator.append_collapsible(href, style, source_range);
+                            if accumulator.text.len() > before {
+                                accumulator.links.push(LinkDraft {
+                                    href: Arc::from(href),
+                                    text_range: Some(
+                                        u32::try_from(before).unwrap_or(u32::MAX)
+                                            ..u32::try_from(accumulator.text.len())
+                                                .unwrap_or(u32::MAX),
+                                    ),
+                                    source_range: Some(source_range),
+                                    kind: if is_noteref_element(&element) {
+                                        document::LinkKind::Footnote
+                                    } else {
+                                        document::LinkKind::Internal
+                                    },
+                                });
                             }
-                            accumulator.links.push(LinkDraft {
-                                href: Arc::from(href),
-                                text_range: Some(
-                                    u32::try_from(before).unwrap_or(u32::MAX)
-                                        ..u32::try_from(accumulator.text.len()).unwrap_or(u32::MAX),
-                                ),
-                                source_range: Some(source_range),
-                                kind: if is_noteref_element(&element) {
-                                    document::LinkKind::Footnote
-                                } else {
-                                    document::LinkKind::Internal
-                                },
-                            });
                         }
                     }
                     _ => {
@@ -5052,6 +5114,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_inline_anchor_does_not_become_visible_link_text() {
+        let fixture = crate::testkit::EpubFixtureBuilder::epub3(
+            crate::testkit::FixtureKind::MinimalEpub3,
+            "Empty inline anchor",
+        )
+        .add_xhtml(
+            "EPUB/chapter-1.xhtml",
+            "Chapter 1",
+            r##"<p>Before <span id="cb1-1"><a href="#cb1-1" aria-hidden="true"></a>code</span> after.</p>"##,
+        )
+        .build();
+        let chapter = open_first_chapter_ir(fixture.bytes().to_vec()).expect("chapter ir");
+
+        assert!(chapter.visible_text().contains("Before code after."));
+        assert!(!chapter.visible_text().contains("#cb1-1"));
+        assert!(chapter.links.is_empty());
+        assert!(chapter.anchors.get("EPUB/chapter-1.xhtml#cb1-1").is_some());
+    }
+
+    #[test]
     fn compatible_mode_salvages_malformed_xhtml_without_panic() {
         let bytes = crate::testkit::GeneratedEpubFixture::preset(
             crate::testkit::FixtureKind::MalformedXhtml,
@@ -5117,6 +5199,44 @@ mod tests {
         assert_eq!(style_value(&computed, "padding-right"), Some("7px"));
         assert_eq!(style_value(&computed, "padding-bottom"), Some("6px"));
         assert_eq!(style_value(&computed, "padding-left"), Some("7px"));
+    }
+
+    #[test]
+    fn unsupported_css_at_rules_and_selectors_fail_closed() {
+        let stylesheet = parse_css(
+            r#"
+            @media print {
+              pre > code.sourceCode { white-space: pre-wrap; }
+              pre > code.sourceCode > span { text-indent: -5em; }
+            }
+            pre > code.sourceCode > span:empty { height: 1.2em; }
+            code.sourceCode { font-size: 12px; }
+            "#,
+            ResourceLimits::default(),
+        )
+        .expect("parse css");
+        let inherited = document::ComputedStyle::new();
+        let pre = CssElementSnapshot {
+            name: "pre".to_owned(),
+            ..CssElementSnapshot::default()
+        };
+        let code = CssElementSnapshot {
+            name: "code".to_owned(),
+            classes: vec!["sourceCode".to_owned()],
+            ..CssElementSnapshot::default()
+        };
+        let span = CssElementSnapshot {
+            name: "span".to_owned(),
+            ..CssElementSnapshot::default()
+        };
+
+        let code_style =
+            cascade_css_for_element(&code, std::slice::from_ref(&pre), &stylesheet, &inherited);
+        let span_style = cascade_css_for_element(&span, &[pre, code], &stylesheet, &inherited);
+
+        assert_eq!(style_value(&code_style, "font-size"), Some("12px"));
+        assert_eq!(style_value(&code_style, "height"), None);
+        assert_eq!(style_value(&span_style, "text-indent"), None);
     }
 
     #[test]
