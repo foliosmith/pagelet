@@ -14,3 +14,4 @@ C ABI, wire protocol, cache schema, parser algorithm, and pagination algorithm.
 - Added mapped W3C, EPUBCheck, corpus dashboard, property/fuzz, nightly, and release-gate automation.
 - Added same-boundary Dart/Rust performance comparison tooling and an incremental M2 Pro baseline.
 - Fixed generated EPUB fixtures to keep `mimetype` first and emit EPUBCheck-valid package/navigation metadata.
+- Added feature-gated OpenType font parsing as the first NativeShaping boundary.

@@ -5,10 +5,11 @@ runtime dependencies that require attribution or redistribution notes.
 
 ## Current State
 
-The public `pagelet` crate uses `miniz_oxide 0.8.9` under `MIT OR Apache-2.0`.
-Private development automation uses `sha2 0.10.9` under `MIT OR Apache-2.0`;
-its transitive Rust dependencies are pinned in `Cargo.lock` and checked by
-`cargo deny`.
+The public `pagelet` crate uses `miniz_oxide 0.8.9` and optionally
+[`ttf-parser 0.25.1`](https://github.com/harfbuzz/ttf-parser) under
+`MIT OR Apache-2.0`. Private development automation uses `sha2 0.10.9` under
+`MIT OR Apache-2.0`; transitive Rust dependencies are pinned in `Cargo.lock`
+and checked by `cargo deny`.
 
 ## External Standards Artifacts
 

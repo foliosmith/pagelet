@@ -4,6 +4,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::core::{CancellationToken, FontId, LayoutUnit, PageletError};
 
+#[cfg(feature = "native-shaping")]
+pub mod native;
+
 /// Stable text backend identifier.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TextBackendId(pub u64);

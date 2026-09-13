@@ -15,10 +15,11 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 default = []
-native-shaping = []
+native-shaping = ["dep:ttf-parser"]
 
 [dependencies]
 miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+ttf-parser = { version = "0.25.1", optional = true, default-features = false, features = ["std"] }
 
 [[bench]]
 name = "fixture_generation"
