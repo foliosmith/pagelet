@@ -1,6 +1,7 @@
 /// Flutter host bindings for the pagelet EPUB pagination engine.
 library;
 
+export 'src/book_summary.dart';
 export 'src/engine.dart'
     show
         BookSession,

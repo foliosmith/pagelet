@@ -8,6 +8,18 @@ final class BookSession {
   final int _handle;
   final Set<ChapterSession> _chapters = <ChapterSession>{};
   bool _isDisposed = false;
+  PageletBookSummary? _summary;
+
+  /// Reads and caches metadata, reading order, navigation, and diagnostics.
+  PageletBookSummary get summary {
+    _ensureOpen();
+    return _summary ??= PageletBookSummary.decode(
+      _requireBytes(
+        _engine._nativeApi.bookSummary(_handle),
+        'book_summary',
+      ),
+    );
+  }
 
   /// Lazily reads publication resources owned by this book.
   late final PageletResourceLoader resources = PageletResourceLoader._(this);

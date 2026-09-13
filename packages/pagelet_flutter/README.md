@@ -6,6 +6,8 @@ engine.
 The adapter owns the engine and book-session lifecycle, provides batched
 Flutter paragraph measurement, decodes versioned page scenes into Flutter-ready
 geometry, and copies publication resources into Dart memory on demand.
+Opened books expose typed metadata, spine order, navigation, and diagnostics
+for host-side shadow-parser comparisons.
 
 The [`example/`](example/) reader connects the native chapter/layout lifecycle,
 Flutter measurement, page-scene decoding, and responsive `PageView` painting.
@@ -17,6 +19,7 @@ projects.
 ```dart
 final engine = PageletEngine(libraryPath: '/path/to/libpagelet.dylib');
 final book = engine.openBook('/path/to/book.epub');
+final summary = book.summary;
 final cover = book.resources.read(coverResourceId);
 
 try {

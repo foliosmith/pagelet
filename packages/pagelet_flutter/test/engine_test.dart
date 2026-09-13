@@ -139,6 +139,47 @@ void main() {
       expect(() => book.resources.read(7), throwsStateError);
     });
 
+    test('reads and caches typed book metadata and navigation', () {
+      final native = _FakeNativeApi();
+      final engine = PageletEngineTesting.create(native);
+      final book = engine.openBook('/books/example.epub');
+
+      final summary = book.summary;
+
+      expect(summary.title, 'Fixture Book');
+      expect(summary.language, 'en');
+      expect(summary.spine.single.idref, 'chapter');
+      expect(summary.navigation.source, 'epub3-nav');
+      expect(summary.navigation.toc.single.label, 'Chapter 1');
+      expect(summary.navigation.toc.single.children.single.href, 'note.xhtml');
+      expect(summary.diagnostics, isEmpty);
+      expect(identical(book.summary, summary), isTrue);
+      expect(native.summaryReads, <int>[2]);
+    });
+
+    test('preserves native book summary failures', () {
+      final native = _FakeNativeApi(
+        summaryResult: PageletNativeBytesResult(
+          status: PageletStatus.internal,
+          statusCode: 11,
+          internalErrorId: 44,
+          bytes: Uint8List(0),
+        ),
+      );
+      final book = PageletEngineTesting.create(
+        native,
+      ).openBook('/books/example.epub');
+
+      expect(
+        () => book.summary,
+        throwsA(
+          isA<PageletException>()
+              .having((error) => error.operation, 'operation', 'book_summary')
+              .having((error) => error.internalErrorId, 'error id', 44),
+        ),
+      );
+    });
+
     test('rejects a native resource id mismatch', () {
       final native = _FakeNativeApi(resourceIdOffset: 1);
       final engine = PageletEngineTesting.create(native);
@@ -183,6 +224,7 @@ void main() {
 final class _FakeNativeApi implements PageletNativeApi {
   _FakeNativeApi({
     this.openPathResult,
+    this.summaryResult,
     this.resourceIdOffset = 0,
     this.hitTestResult,
     List<PageletNativeStatusResult>? disposeResults,
@@ -196,6 +238,7 @@ final class _FakeNativeApi implements PageletNativeApi {
 
   int _nextHandle = 1;
   final PageletNativeHandleResult? openPathResult;
+  final PageletNativeBytesResult? summaryResult;
   final int resourceIdOffset;
   final PageletNativeHitTestResult? hitTestResult;
   final List<PageletNativeStatusResult> _disposeResults;
@@ -203,6 +246,7 @@ final class _FakeNativeApi implements PageletNativeApi {
   final List<(int, String)> openedPaths = <(int, String)>[];
   final List<(int, int)> openedFileDescriptors = <(int, int)>[];
   final List<(int, int)> resourceReads = <(int, int)>[];
+  final List<int> summaryReads = <int>[];
   final List<(int, int, int, int)> hitTests = <(int, int, int, int)>[];
   final List<int> disposedHandles = <int>[];
 
@@ -223,6 +267,18 @@ final class _FakeNativeApi implements PageletNativeApi {
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd) {
     openedFileDescriptors.add((engine, fd));
     return _okHandle(_nextHandle++);
+  }
+
+  @override
+  PageletNativeBytesResult bookSummary(int book) {
+    summaryReads.add(book);
+    return summaryResult ??
+        PageletNativeBytesResult(
+          status: PageletStatus.ok,
+          statusCode: 0,
+          internalErrorId: 0,
+          bytes: Uint8List.fromList(utf8.encode(_summaryJson)),
+        );
   }
 
   @override
@@ -320,4 +376,26 @@ final class _FakeNativeApi implements PageletNativeApi {
       handle: handle,
     );
   }
+
+  static const _summaryJson = '''
+{
+  "rootfile": "EPUB/package.opf",
+  "package_version": "3.0",
+  "identifier": "fixture-id",
+  "title": "Fixture Book",
+  "language": "en",
+  "spine": [{"idref": "chapter", "linear": true}],
+  "navigation": {
+    "source": "epub3-nav",
+    "toc": [{
+      "label": "Chapter 1",
+      "href": "chapter.xhtml",
+      "children": [{"label": "Note", "href": "note.xhtml", "children": []}]
+    }],
+    "page_list": [],
+    "landmarks": []
+  },
+  "diagnostics": []
+}
+''';
 }

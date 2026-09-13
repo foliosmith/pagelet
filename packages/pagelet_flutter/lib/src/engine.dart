@@ -3,6 +3,7 @@ import 'dart:ffi';
 import 'dart:typed_data';
 import 'dart:ui';
 
+import 'book_summary.dart';
 import 'errors.dart';
 import 'native_api.dart';
 import 'page_scene_decoder.dart' show PageTextAffinity;
@@ -164,6 +165,21 @@ int _requireHandle(
 void _requireSuccess(PageletNativeStatusResult result, String operation) {
   if (result.status == PageletStatus.ok) {
     return;
+  }
+  throw PageletException(
+    operation: operation,
+    status: result.status,
+    statusCode: result.statusCode,
+    internalErrorId: result.internalErrorId,
+  );
+}
+
+Uint8List _requireBytes(
+  PageletNativeBytesResult result,
+  String operation,
+) {
+  if (result.status == PageletStatus.ok) {
+    return result.bytes;
   }
   throw PageletException(
     operation: operation,

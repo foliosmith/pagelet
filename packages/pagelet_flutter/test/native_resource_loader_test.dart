@@ -8,13 +8,17 @@ void main() {
   final epubPath = Platform.environment['PAGELET_RESOURCE_EPUB_PATH'];
 
   test(
-    'reads an EPUB resource through the real owned-buffer C ABI',
+    'reads book metadata and a resource through the real owned-buffer C ABI',
     () {
       final engine = PageletEngine(libraryPath: libraryPath!);
       try {
         final book = engine.openBook(epubPath!);
+        final summary = book.summary;
         final resource = book.resources.read(0);
 
+        expect(summary.rootfile, isNotEmpty);
+        expect(summary.spine, isNotEmpty);
+        expect(summary.navigation.toc, isNotEmpty);
         expect(resource.id, 0);
         expect(resource.path, isNotEmpty);
         expect(resource.mediaType, isNotEmpty);

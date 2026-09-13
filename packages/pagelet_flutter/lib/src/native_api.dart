@@ -49,6 +49,21 @@ final class PageletNativeStatusResult {
   final int internalErrorId;
 }
 
+/// Host-owned bytes copied from one native buffer result.
+final class PageletNativeBytesResult {
+  const PageletNativeBytesResult({
+    required this.status,
+    required this.statusCode,
+    required this.internalErrorId,
+    required this.bytes,
+  });
+
+  final PageletStatus status;
+  final int statusCode;
+  final int internalErrorId;
+  final Uint8List bytes;
+}
+
 /// Host-owned resource data copied from native buffers.
 final class PageletNativeResourceResult {
   const PageletNativeResourceResult({
@@ -145,6 +160,9 @@ abstract interface class PageletNativeApi {
   /// Opens an EPUB from a borrowed POSIX file descriptor.
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd);
 
+  /// Copies the opened book summary JSON into host-owned bytes.
+  PageletNativeBytesResult bookSummary(int book);
+
   PageletNativeHandleResult chapterOpen(int book, int spineIndex);
 
   PageletNativeHandleResult layoutSessionCreate(
@@ -196,6 +214,10 @@ final class FfiPageletNativeApi implements PageletNativeApi {
         _bookOpenFileDescriptor = library.lookupFunction<
             _BookOpenFileDescriptorNative,
             _BookOpenFileDescriptorDart>('pagelet_book_open_fd'),
+        _bookSummary =
+            library.lookupFunction<_BookSummaryNative, _BookSummaryDart>(
+          'pagelet_book_summary',
+        ),
         _chapterOpen =
             library.lookupFunction<_ChapterOpenNative, _ChapterOpenDart>(
           'pagelet_chapter_open',
@@ -252,6 +274,7 @@ final class FfiPageletNativeApi implements PageletNativeApi {
   final _EngineCreateDart _engineCreate;
   final _BookOpenPathDart _bookOpenPath;
   final _BookOpenFileDescriptorDart _bookOpenFileDescriptor;
+  final _BookSummaryDart _bookSummary;
   final _ChapterOpenDart _chapterOpen;
   final _LayoutSessionCreateDart _layoutSessionCreate;
   final _LayoutRequestDart _layoutRequest;
@@ -294,6 +317,11 @@ final class FfiPageletNativeApi implements PageletNativeApi {
   @override
   PageletNativeHandleResult bookOpenFileDescriptor(int engine, int fd) {
     return _handleResult(_bookOpenFileDescriptor(engine, fd));
+  }
+
+  @override
+  PageletNativeBytesResult bookSummary(int book) {
+    return _bytesResult(_bookSummary(book));
   }
 
   @override
@@ -484,6 +512,31 @@ final class FfiPageletNativeApi implements PageletNativeApi {
     }
   }
 
+  PageletNativeBytesResult _bytesResult(_NativeBufferResult result) {
+    final status = PageletStatus.fromCode(result.status);
+    if (status != PageletStatus.ok) {
+      return PageletNativeBytesResult(
+        status: status,
+        statusCode: result.status,
+        internalErrorId: result.internalErrorId,
+        bytes: Uint8List(0),
+      );
+    }
+    try {
+      final bytes = _copyBuffer(result.buffer);
+      _releaseBuffers(<_NativeBuffer>[result.buffer], checkStatus: true);
+      return PageletNativeBytesResult(
+        status: status,
+        statusCode: result.status,
+        internalErrorId: result.internalErrorId,
+        bytes: bytes,
+      );
+    } catch (_) {
+      _releaseBuffers(<_NativeBuffer>[result.buffer], checkStatus: false);
+      rethrow;
+    }
+  }
+
   T _withByteSlice<T>(Uint8List bytes, T Function(_NativeByteSlice) body) {
     final data = bytes.isEmpty ? nullptr : calloc<Uint8>(bytes.length);
     if (bytes.isNotEmpty) {
@@ -654,6 +707,19 @@ final class _NativeHandleResult extends Struct {
   external int handle;
 }
 
+final class _NativeBufferResult extends Struct {
+  @Uint32()
+  external int status;
+
+  @Uint32()
+  external int statusPadding;
+
+  @Uint64()
+  external int internalErrorId;
+
+  external _NativeBuffer buffer;
+}
+
 final class _NativeResourceResult extends Struct {
   @Uint32()
   external int status;
@@ -756,6 +822,8 @@ typedef _BookOpenFileDescriptorNative = _NativeHandleResult Function(
     Uint64 engine, Int32 fd);
 typedef _BookOpenFileDescriptorDart = _NativeHandleResult Function(
     int engine, int fd);
+typedef _BookSummaryNative = _NativeBufferResult Function(Uint64 book);
+typedef _BookSummaryDart = _NativeBufferResult Function(int book);
 typedef _ChapterOpenNative = _NativeHandleResult Function(
     Uint64 book, Uint64 spineIndex);
 typedef _ChapterOpenDart = _NativeHandleResult Function(
