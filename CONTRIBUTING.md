@@ -13,9 +13,11 @@ cargo check --workspace
 cargo fmt --all -- --check
 ```
 
-Enable the local pre-push guard once per clone:
+Install the Windows standard library for cross-target checks and enable the local
+pre-push guard once per clone:
 
 ```sh
+rustup target add x86_64-pc-windows-msvc
 git config core.hooksPath .githooks
 ```
 
@@ -26,6 +28,12 @@ scripts/validate-before-push.sh
 ```
 
 If any validation command fails, Git aborts the push.
+
+The guard runs native checks and a Windows Clippy check. Cargo's `--all-targets`
+includes libraries, binaries, tests, examples, and benchmarks for the selected
+platform; it does not check every operating system. The Windows check catches
+conditional-compilation errors without a Windows linker. Runtime tests on Linux,
+macOS, and Windows still run in CI.
 
 When `cargo-deny` is installed, validate license policy with:
 

@@ -1,10 +1,10 @@
 //! C ABI shims for the typed control plane and owned byte buffers.
 #![allow(unsafe_code)]
 
-use std::{fs::File, path::Path, slice, str, sync::OnceLock};
+use std::{path::Path, slice, str, sync::OnceLock};
 
 #[cfg(unix)]
-use std::os::fd::BorrowedFd;
+use std::{fs::File, os::fd::BorrowedFd};
 
 use crate::{
     cli,

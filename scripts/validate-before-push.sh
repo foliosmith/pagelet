@@ -15,6 +15,7 @@ run() {
 run cargo fmt --all -- --check
 run cargo check --workspace --all-targets --all-features
 run cargo clippy --workspace --all-targets --all-features -- -D warnings
+run cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
 run cargo test --workspace --all-features
 run cargo doc --workspace --all-features --no-deps
 
