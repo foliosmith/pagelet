@@ -75,6 +75,73 @@ registered and reserved for performance work.
 
 ## Dart/Rust Same-Boundary Comparison
 
+### Real-book parser observations
+
+`tests/private-corpus.toml` pins five local publications by anonymous ID and
+SHA-256. Supply the named files under `PAGELET_CORPUS_ROOT`; EPUB bytes remain
+outside Git. These are private local copies, not a redistribution license.
+The opt-in private nightly job now uses this manifest rather than the generated
+public fixtures. Its existing isolated runner must have an authorized read-only
+corpus mount before enabling `PAGELET_PRIVATE_CORPUS_ENABLED`.
+
+```sh
+PAGELET_CORPUS_ROOT="$PWD/private/corpus" \
+PAGELET_CORPUS_MANIFEST=tests/private-corpus.toml \
+cargo xtask corpus --profile full --required \
+  --json target/pagelet-corpus/real-world.json \
+  --report target/pagelet-corpus/real-world.md
+
+python3 tools/runtime_baseline.py \
+  --flow-read /path/to/flow_read \
+  --root private/corpus --runner local-m2pro --samples 30 \
+  --output target/pagelet-bench/real-books-new-run
+```
+
+The collector requires Python 3.11+, macOS process accounting, Dart, and an
+already-resolved Flow Read checkout containing `epub_reader_core`. It compiles
+the existing Dart parser to AOT using that checkout's package configuration,
+without changing its dependencies or files, and builds pagelet's release
+collector. Every sample runs in a fresh process; runtime order alternates.
+The output directory must be new. It retains raw stdout/stderr, all samples,
+source/binary fingerprints, JSON summaries and a Markdown report. Missing RSS,
+invalid input, empty or nondeterministic parse results fail the run.
+
+`real-book-parse-v1` times parsing from preloaded EPUB bytes through all content
+and Unicode scalar counting, excluding disk reads and process startup. Peak RSS
+includes the complete process. Filesystem caches are uncontrolled. Rust retains
+linear-spine ChapterIR; Dart eagerly builds reader blocks and image data. Their
+chapter/text counts are reported separately because these are different models.
+These observations must not be fed into the first-page/height-only comparison
+gate or interpreted as equivalent rendering performance.
+
+The corpus dashboard now checks every linear spine, rather than stopping at the
+first nonempty chapter. A parse pass does not establish rendering conformance.
+RTL, footnote-heavy, malformed-readable and other remaining real-world categories
+still need independently identified publications; generated fixtures do not
+count as those real-world samples.
+
+The 2026-09-26 Apple M2 Pro run completed all 300 fresh-process samples (30 per
+runtime per book). Its compact, content-free snapshot is
+[`real-books-macos-aarch64-20260926.json`](../perf/baselines/real-books-macos-aarch64-20260926.json).
+The full corpus check parsed 645 linear spine items across all five books.
+
+| Fixture | Dart parse p95 (ms) | Rust parse p95 (ms) | Dart peak RSS p95 (MiB) | Rust peak RSS p95 (MiB) |
+|---|---:|---:|---:|---:|
+| english-novel | 86.15 | 94.73 | 70.92 | 20.25 |
+| large-novel | 3235.67 | 857.19 | 191.88 | 116.56 |
+| cjk-novel | 356.33 | 619.69 | 128.69 | 55.56 |
+| short-stories | 384.22 | 216.11 | 79.17 | 30.44 |
+| technical-cjk | 246.55 | 2480.58 | 121.70 | 59.41 |
+
+This local runner was not reserved for performance work. All five publications
+have differing extracted text counts. The technical book is especially divergent:
+Dart reports 196,811 Unicode scalars in 18 chapters, while Rust reports 53,993
+in 19 spine items. These differences need content-model/coverage investigation
+before treating timing or memory ratios as equivalent-work improvements.
+The run neither passes the layout gate nor justifies layered-cache work.
+
+### Layout comparison gate
+
 Cache investment is gated by a same-machine, same-fixture comparison instead
 of assumptions. Capture the Rust candidate with `--incremental-cases`, and
 export the Dart baseline as CSV with the same runner, OS, architecture,

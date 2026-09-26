@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "profile": "real-book-parse-v1",
+  "measured_at": "2026-09-26T01:40:03.954777+00:00",
+  "runner": "local-m2pro",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "cpu": "Apple M2 Pro",
+  "samples_per_runtime": 30,
+  "scope": "EPUB bytes already loaded; parse all content and count Unicode scalars. Cold process per sample; filesystem cache uncontrolled. RSS is whole process. Dart eagerly builds reader blocks/images; Rust retains linear spine ChapterIR. Not equivalent rendering, first-page or warm-repagination evidence.",
+  "pagelet": {
+    "commit": "a507f9471e34405aec4b11dde9d0958606fff89a",
+    "dirty": true
+  },
+  "flow_read": {
+    "commit": "be58766df6bf1f9c5b2d47870dc28e7021e32b61",
+    "dirty": true
+  },
+  "dart_version": "Dart SDK version: 3.12.2 (stable) (Tue Jun 9 01:11:39 2026 -0700) on \"macos_arm64\"",
+  "rust_version": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "binary_sha256": {
+    "dart": "1c0084819e2a6cd07028792780b185749d362dec3ba2d85ee94407b7f657f442",
+    "rust": "a7df1ac3584a52820f1d3e1bd3b2f3d526c7a45ae86ae97ed086b5cfa4d4ce18"
+  },
+  "dart_source_sha256": {
+    "packages/epub_reader_core/lib/epub_reader_core.dart": "28a36b4deadd120a878d0aee31a1ef7752943ba5a3032ce22e0d6be5fddab603",
+    "packages/epub_reader_core/lib/src/epub_models.dart": "00808b052d8bf841014e5f95b8a2fff55d547ed0bee00c6e1a73dddd94ff6983",
+    "packages/epub_reader_core/lib/src/epub_parser.dart": "db788830351f831d45b427cfe6551f3cd4e68e1f17cd2690a043392e6f9e8684"
+  },
+  "manifest_sha256": "2563726ef124292379329932c41826272372078ebed1aaa57534bfa60ec8fc40",
+  "fixtures": [
+    {
+      "id": "private/english-novel",
+      "sha256": "d123bd21a2b1f683f55e3774387b6881c31d63fc6ddae7afc1693bbf293b6963",
+      "status": "observed",
+      "summary": {
+        "dart": {
+          "parse_ns": {
+            "p50": 70873167,
+            "p95": 86149334
+          },
+          "peak_rss_bytes": {
+            "p50": 73695232,
+            "p95": 74366976
+          }
+        },
+        "rust": {
+          "parse_ns": {
+            "p50": 75177000,
+            "p95": 94730208
+          },
+          "peak_rss_bytes": {
+            "p50": 20889600,
+            "p95": 21233664
+          }
+        }
+      },
+      "content_counts": {
+        "dart": {
+          "chapters": 7,
+          "visible_chars": 283979
+        },
+        "rust": {
+          "chapters": 7,
+          "visible_chars": 282277
+        }
+      }
+    },
+    {
+      "id": "private/large-novel",
+      "sha256": "603a0218f29d9d0d8696bfa5012747608f79085251a4917f7279851f0605ab46",
+      "status": "observed",
+      "summary": {
+        "dart": {
+          "parse_ns": {
+            "p50": 1720941667,
+            "p95": 3235673792
+          },
+          "peak_rss_bytes": {
+            "p50": 198606848,
+            "p95": 201195520
+          }
+        },
+        "rust": {
+          "parse_ns": {
+            "p50": 741296625,
+            "p95": 857191792
+          },
+          "peak_rss_bytes": {
+            "p50": 121700352,
+            "p95": 122224640
+          }
+        }
+      },
+      "content_counts": {
+        "dart": {
+          "chapters": 318,
+          "visible_chars": 7398747
+        },
+        "rust": {
+          "chapters": 320,
+          "visible_chars": 7363195
+        }
+      }
+    },
+    {
+      "id": "private/cjk-novel",
+      "sha256": "9bde8406f2b3fe0ec97274ad204955666067437f0fbfea6a2310f3b384ba24d3",
+      "status": "observed",
+      "summary": {
+        "dart": {
+          "parse_ns": {
+            "p50": 334897167,
+            "p95": 356334834
+          },
+          "peak_rss_bytes": {
+            "p50": 132300800,
+            "p95": 134938624
+          }
+        },
+        "rust": {
+          "parse_ns": {
+            "p50": 493032834,
+            "p95": 619688583
+          },
+          "peak_rss_bytes": {
+            "p50": 57655296,
+            "p95": 58261504
+          }
+        }
+      },
+      "content_counts": {
+        "dart": {
+          "chapters": 129,
+          "visible_chars": 775149
+        },
+        "rust": {
+          "chapters": 196,
+          "visible_chars": 722253
+        }
+      }
+    },
+    {
+      "id": "private/short-stories",
+      "sha256": "7f6a0f55f5090f28eb191716a04e7983ea35568cee0d6c7a1e3200f30ad5b158",
+      "status": "observed",
+      "summary": {
+        "dart": {
+          "parse_ns": {
+            "p50": 286610583,
+            "p95": 384218542
+          },
+          "peak_rss_bytes": {
+            "p50": 82264064,
+            "p95": 83017728
+          }
+        },
+        "rust": {
+          "parse_ns": {
+            "p50": 180950584,
+            "p95": 216114458
+          },
+          "peak_rss_bytes": {
+            "p50": 31440896,
+            "p95": 31916032
+          }
+        }
+      },
+      "content_counts": {
+        "dart": {
+          "chapters": 103,
+          "visible_chars": 1591141
+        },
+        "rust": {
+          "chapters": 103,
+          "visible_chars": 1585131
+        }
+      }
+    },
+    {
+      "id": "private/technical-cjk",
+      "sha256": "c98360b6e65837ddd5a7c5b3dba2daf4421f4d47f6b37cfb3fcdf4a97730d41f",
+      "status": "observed",
+      "summary": {
+        "dart": {
+          "parse_ns": {
+            "p50": 225598292,
+            "p95": 246545625
+          },
+          "peak_rss_bytes": {
+            "p50": 126222336,
+            "p95": 127614976
+          }
+        },
+        "rust": {
+          "parse_ns": {
+            "p50": 2364958833,
+            "p95": 2480584083
+          },
+          "peak_rss_bytes": {
+            "p50": 61014016,
+            "p95": 62291968
+          }
+        }
+      },
+      "content_counts": {
+        "dart": {
+          "chapters": 18,
+          "visible_chars": 196811
+        },
+        "rust": {
+          "chapters": 19,
+          "visible_chars": 53993
+        }
+      }
+    }
+  ],
+  "flow_lock_sha256": "85b212fed7f66ab5850915e4f8b810cf47b389936b727328c1fc73575bf29f41",
+  "raw_artifacts": "target/pagelet-bench/real-books-20260926-verified/",
+  "acceptance": "observation-only; different content models; not the layout performance gate"
+}

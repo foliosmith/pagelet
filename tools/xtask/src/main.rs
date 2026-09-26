@@ -16,7 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pagelet::epub::{open_book, open_book_ir, open_spine_item_chapter_ir};
 use pagelet_testkit::{FixtureKind, GoldenDocument, GoldenSectionName, ValidEpubBuilder};
 
 fn main() -> ExitCode {
@@ -646,20 +645,12 @@ fn generated_corpus_fixture(book: &CorpusBook) -> Option<pagelet_testkit::Fixtur
 }
 
 fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary, XtaskError> {
-    let mut diagnostics = open_book(bytes.to_vec())
-        .map(|book| {
-            book.diagnostics
-                .into_iter()
-                .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let book_ir = match open_book_ir(bytes.to_vec()) {
-        Ok(ir) if book.expected != "invalid" => ir,
+    let session = match pagelet::engine::Engine::new().open_bytes(bytes.to_vec()) {
+        Ok(session) if book.expected != "invalid" => session,
         Ok(_) => {
             return Err(XtaskError::Command(
                 "expected invalid corpus case opened successfully".into(),
-            ));
+            ))
         }
         Err(_) if book.expected == "invalid" => {
             return Ok(CorpusSummary {
@@ -670,15 +661,22 @@ fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary
         }
         Err(error) => return Err(XtaskError::Command(error.to_string())),
     };
+    let mut diagnostics = session
+        .summary()
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message))
+        .collect::<Vec<_>>();
 
     let mut chapters_checked = 0_usize;
     let mut visible_chars = 0_usize;
-    for (index, spine) in book_ir.spine.iter().enumerate() {
+    for (index, spine) in session.summary().package.spine.iter().enumerate() {
         if !spine.linear {
             continue;
         }
         chapters_checked += 1;
-        let chapter = open_spine_item_chapter_ir(bytes.to_vec(), index)
+        let chapter = session
+            .open_spine_item(index)
             .map_err(|error| XtaskError::Command(error.to_string()))?;
         visible_chars = visible_chars.saturating_add(chapter.visible_text().chars().count());
         diagnostics.extend(
@@ -687,9 +685,6 @@ fn validate_corpus_book(book: &CorpusBook, bytes: &[u8]) -> Result<CorpusSummary
                 .iter()
                 .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message)),
         );
-        if visible_chars > 0 {
-            break;
-        }
     }
     if visible_chars == 0
         && book.expected != "invalid"
@@ -824,6 +819,12 @@ fn lint_compatibility_ledger() -> Result<(), XtaskError> {
 }
 
 fn run_bench(args: &[String]) -> Result<(), XtaskError> {
+    if matches!(args.first().map(String::as_str), Some("parse-sample")) {
+        let [_, path] = args else {
+            return Err(XtaskError::Usage("bench parse-sample <epub>".into()));
+        };
+        return benchmark::parse_sample(Path::new(path)).map_err(XtaskError::Command);
+    }
     if matches!(args.first().map(String::as_str), Some("compare-runtime")) {
         return runtime_compare::run(&args[1..]);
     }
@@ -1769,6 +1770,22 @@ mod tests {
     fn corpus_profiles_are_validated() {
         assert!(validate_corpus_profile("smoke").is_ok());
         assert!(validate_corpus_profile("bogus").is_err());
+    }
+
+    #[test]
+    fn corpus_dashboard_checks_chapters_after_the_first_text() {
+        let fixture = ValidEpubBuilder::epub3("full-corpus")
+            .xhtml("EPUB/one.xhtml", "One", "<p>alpha</p>")
+            .xhtml("EPUB/two.xhtml", "Two", "<p>beta</p>")
+            .build();
+        let books = parse_corpus_manifest(
+            Path::new("tests/private-corpus.toml"),
+            &fs::read_to_string("../../tests/private-corpus.toml").expect("manifest"),
+        )
+        .expect("books");
+        let summary = validate_corpus_book(&books[0], fixture.bytes()).expect("corpus");
+        assert_eq!(summary.chapters_checked, 2);
+        assert!(summary.visible_chars >= 9);
     }
 
     #[test]

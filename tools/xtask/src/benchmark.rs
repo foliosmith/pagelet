@@ -33,6 +33,45 @@ const DEFAULT_REGRESSION_PCT: u64 = 10;
 const FIXTURE_ID: &str = "small-novel";
 const LOCAL_RUNNER_ID: &str = "local-unpinned";
 
+pub(crate) fn parse_sample(path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(other_error)?;
+    let started = Instant::now();
+    let (book, chapters, visible_chars) = parse_book(bytes)?;
+    let parse_ns = elapsed_ns(started);
+    black_box(&book);
+    println!(
+        "{{\"parse_ns\":{parse_ns},\"chapters\":{chapters},\"visible_chars\":{visible_chars}}}"
+    );
+    Ok(())
+}
+
+fn parse_book(bytes: Vec<u8>) -> Result<(pagelet::engine::BookSession, usize, usize), String> {
+    let book = Engine::new().open_bytes(bytes).map_err(pagelet_error)?;
+    let mut chapters = 0;
+    let mut visible_chars = 0;
+    for (index, spine) in book.summary().package.spine.iter().enumerate() {
+        if spine.linear {
+            let chapter = book.open_spine_item(index).map_err(pagelet_error)?;
+            visible_chars += chapter.visible_text().chars().count();
+            chapters += 1;
+        }
+    }
+    Ok((book, chapters, visible_chars))
+}
+
+#[cfg(test)]
+#[test]
+fn parse_baseline_consumes_every_spine_and_rejects_invalid_input() {
+    let fixture = ValidEpubBuilder::epub3("parse-baseline")
+        .xhtml("EPUB/one.xhtml", "One", "<p>alpha</p>")
+        .xhtml("EPUB/two.xhtml", "Two", "<p>beta</p>")
+        .build();
+    let (_, chapters, chars) = parse_book(fixture.bytes().to_vec()).expect("full parse");
+    assert_eq!(chapters, 2);
+    assert!(chars >= 9);
+    assert!(parse_book(b"invalid epub".to_vec()).is_err());
+}
+
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let options = BenchReportOptions::parse(args)?;
     if options.help {

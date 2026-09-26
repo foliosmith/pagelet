@@ -1,0 +1,46 @@
+schema_version = 1
+
+[[books]]
+id = "private/english-novel"
+path = "english-novel.epub"
+sha256 = "d123bd21a2b1f683f55e3774387b6881c31d63fc6ddae7afc1693bbf293b6963"
+license = "private-local-only"
+expected = "valid"
+categories = ["benchmark", "real-world"]
+features = ["package", "xhtml", "latin", "images"]
+
+[[books]]
+id = "private/large-novel"
+path = "large-novel.epub"
+sha256 = "603a0218f29d9d0d8696bfa5012747608f79085251a4917f7279851f0605ab46"
+license = "private-local-only"
+expected = "valid"
+categories = ["benchmark", "real-world"]
+features = ["package", "xhtml", "latin", "images"]
+
+[[books]]
+id = "private/cjk-novel"
+path = "cjk-novel.epub"
+sha256 = "9bde8406f2b3fe0ec97274ad204955666067437f0fbfea6a2310f3b384ba24d3"
+license = "private-local-only"
+expected = "valid"
+categories = ["benchmark", "real-world"]
+features = ["package", "xhtml", "cjk", "images"]
+
+[[books]]
+id = "private/short-stories"
+path = "short-stories.epub"
+sha256 = "7f6a0f55f5090f28eb191716a04e7983ea35568cee0d6c7a1e3200f30ad5b158"
+license = "private-local-only"
+expected = "valid"
+categories = ["benchmark", "real-world"]
+features = ["package", "xhtml", "latin", "images"]
+
+[[books]]
+id = "private/technical-cjk"
+path = "technical-cjk.epub"
+sha256 = "c98360b6e65837ddd5a7c5b3dba2daf4421f4d47f6b37cfb3fcdf4a97730d41f"
+license = "private-local-only"
+expected = "valid"
+categories = ["benchmark", "real-world"]
+features = ["package", "xhtml", "cjk", "images"]
