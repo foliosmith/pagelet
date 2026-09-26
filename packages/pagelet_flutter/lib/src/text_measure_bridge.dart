@@ -578,8 +578,9 @@ List<_MeasuredCluster> _clusters(
       }
       final lineIndex = _lineIndexForY(lines, (top + bottom) / 2);
       final lineLeft = lines.isEmpty ? 0.0 : lines[lineIndex].left;
-      final xStart = left - lineLeft;
-      final xEnd = right - lineLeft;
+      // RTL trailing whitespace may precede the line origin; ink bounds remain signed.
+      final xStart = (left - lineLeft).clamp(0.0, double.infinity);
+      final xEnd = (right - lineLeft).clamp(0.0, double.infinity);
       clusters.add(
         _MeasuredCluster(
           textStart: offsets.byteForUtf16(utf16Start),
