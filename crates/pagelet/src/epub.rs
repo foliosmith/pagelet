@@ -2561,6 +2561,14 @@ fn chapter_ir_from_xhtml(
         &mut referenced_footnote_keys,
     );
 
+    let mut parents = vec![None; tree.nodes.len()];
+    for (parent, node) in tree.nodes.iter().enumerate() {
+        if let Some(element) = node.element() {
+            for child in &element.children {
+                parents[*child] = Some(parent);
+            }
+        }
+    }
     let mut builder = ChapterBuilder {
         document_href: href,
         base_dir,
@@ -2575,6 +2583,7 @@ fn chapter_ir_from_xhtml(
         computed_styles: BTreeMap::new(),
         font_contexts: BTreeMap::new(),
         tree: &tree,
+        parents,
     };
     builder.build()
 }
@@ -2626,6 +2635,7 @@ struct ChapterBuilder<'a> {
     computed_styles: BTreeMap<usize, (StyleId, document::ComputedStyle)>,
     font_contexts: BTreeMap<usize, ResolvedFontContext>,
     tree: &'a XhtmlDocument,
+    parents: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3335,18 +3345,7 @@ impl ChapterBuilder<'_> {
     }
 
     fn parent_node(&self, child_id: usize) -> Option<usize> {
-        self.parent_node_from(self.tree.root, child_id)
-    }
-
-    fn parent_node_from(&self, current: usize, child_id: usize) -> Option<usize> {
-        let element = self.tree.node(current)?.element()?;
-        if element.children.contains(&child_id) {
-            return Some(current);
-        }
-        element
-            .children
-            .iter()
-            .find_map(|child| self.parent_node_from(*child, child_id))
+        self.parents.get(child_id).copied().flatten()
     }
 
     fn resolve_footnotes(&mut self) -> Result<(), PageletError> {
@@ -4524,7 +4523,7 @@ fn text_after_tag(input: &str, tag: &XmlStartTag, local_name: &str) -> Option<St
             }
         })
         .or_else(|| rest.split(&end_tag).next())?;
-    Some(unescape_xml(&strip_tags(raw)))
+    Some(strip_tags(raw))
 }
 
 fn strip_tags(input: &str) -> String {
@@ -4542,12 +4541,42 @@ fn strip_tags(input: &str) -> String {
 }
 
 fn unescape_xml(input: &str) -> String {
-    input
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    let mut out = String::with_capacity(input.len());
+    let mut parts = input.split('&');
+    out.push_str(parts.next().unwrap_or_default());
+    for part in parts {
+        let decoded = part.split_once(';').and_then(|(entity, rest)| {
+            let character = match entity {
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                _ => {
+                    let (digits, radix) = if let Some(hex) = entity.strip_prefix("#x") {
+                        (hex, 16)
+                    } else {
+                        (entity.strip_prefix('#')?, 10)
+                    };
+                    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
+                        return None;
+                    }
+                    u32::from_str_radix(digits, radix).ok()
+                        .filter(|value| matches!(*value, 9 | 10 | 13 | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF))
+                        .and_then(char::from_u32)
+                }
+            }?;
+            Some((character, rest))
+        });
+        if let Some((character, rest)) = decoded {
+            out.push(character);
+            out.push_str(rest);
+        } else {
+            out.push('&');
+            out.push_str(part);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

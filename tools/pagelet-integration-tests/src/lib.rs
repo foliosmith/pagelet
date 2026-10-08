@@ -75,6 +75,47 @@ mod tests {
     }
 
     #[test]
+    fn chapter_text_includes_readable_descendants_of_unsupported_elements() {
+        let fixture = ValidEpubBuilder::epub3("unsupported-text")
+            .xhtml(
+                "EPUB/chapter-1.xhtml",
+                "Chapter",
+                "<p>Before</p><pre><code><span>const x = 1;</span></code></pre><custom><p>Tail</p></custom><script>hidden script</script><style>p { color: red; }</style><template><p>hidden template</p></template><p>After</p>",
+            )
+            .build();
+        let book = pagelet::engine::Engine::new()
+            .open_bytes(fixture.bytes().to_vec())
+            .expect("open");
+        let chapter = book.open_spine_item(0).expect("chapter");
+        assert_eq!(chapter.visible_text(), "Before\nconst x = 1;\nTail\nAfter");
+    }
+
+    #[test]
+    fn xml_character_references_decode_once_in_text_attributes_and_metadata() {
+        let fixture = ValidEpubBuilder::epub3("literal &lt;")
+            .xhtml(
+                "EPUB/chapter-1.xhtml",
+                "Chapter",
+                "<p id=\"a&#49;\">&#39;&#x4E2D;&#x1F642; &amp;#39; &#0; &#xD800; &#x110000; &unknown; &#xZZ;</p><p><a href=\"#a&#49;\">jump</a></p>",
+            )
+            .build();
+        let book = pagelet::engine::Engine::new()
+            .open_bytes(fixture.bytes().to_vec())
+            .expect("open");
+        let chapter = book.open_spine_item(0).expect("chapter");
+        assert_eq!(
+            chapter.visible_text(),
+            "'中🙂 &#39; &#0; &#xD800; &#x110000; &unknown; &#xZZ;\njump"
+        );
+        assert!(chapter.anchors.get("EPUB/chapter-1.xhtml#a1").is_some());
+        assert_eq!(chapter.links[0].fragment.as_deref(), Some("a1"));
+        assert_eq!(
+            book.summary().package.metadata.title.as_deref(),
+            Some("literal &lt;")
+        );
+    }
+
+    #[test]
     fn path_security_property_rejects_container_escape() {
         let cases = [
             ("", "../evil.xhtml"),

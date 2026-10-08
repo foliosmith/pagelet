@@ -140,6 +140,38 @@ in 19 spine items. These differences need content-model/coverage investigation
 before treating timing or memory ratios as equivalent-work improvements.
 The run neither passes the layout gate nor justifies layered-cache work.
 
+### 2026-10-08 parser corrections
+
+The refreshed [snapshot](../perf/baselines/real-books-macos-aarch64-20261008.json)
+contains another 300 process samples on the same local M2 Pro. The September
+snapshot remains historical evidence, not the current parser baseline.
+
+Three causes were corrected: visible-text traversal skipped readable children
+of unsupported elements; XML numeric character references remained literal;
+and style resolution repeatedly scanned the entire XHTML tree to find parents.
+Non-content elements remain excluded and metadata is decoded exactly once.
+
+| Fixture | Dart parse p95 (ms) | Rust parse p95 (ms) | Dart peak RSS p95 (MiB) | Rust peak RSS p95 (MiB) |
+|---|---:|---:|---:|---:|
+| english-novel | 73.35 | 57.00 | 71.36 | 20.28 |
+| large-novel | 1669.28 | 571.59 | 191.27 | 116.48 |
+| cjk-novel | 338.63 | 254.04 | 131.42 | 55.98 |
+| short-stories | 286.87 | 139.31 | 79.11 | 30.34 |
+| technical-cjk | 226.21 | 254.10 | 120.95 | 59.92 |
+
+For the technical book, Rust text increased from 53,993 to 199,715 scalars.
+An independent XML body-text extraction matched all 19 spine items exactly
+when whitespace was removed (174,916 non-whitespace scalars). This checks the
+text sequence, not whitespace layout, CSS visibility or rendered pixels.
+Dart still reports 18 chapters and 196,811 scalars; models remain distinct.
+
+Rust technical-book parse p95 decreased from the historical 2,480.58 ms to
+254.10 ms. The current Dart observation is 226.21 ms. These unreserved local
+runs are evidence of the improvement, not a pinned-runner release gate.
+The parser compatibility version advances to 6 for cache invalidation; that
+metadata-only change followed sampling and is recorded in the snapshot.
+First-page and height-only repagination acceptance remain outstanding.
+
 ### Layout comparison gate
 
 Cache investment is gated by a same-machine, same-fixture comparison instead

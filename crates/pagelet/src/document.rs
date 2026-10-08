@@ -516,31 +516,17 @@ impl ChapterIr {
         match node {
             DocumentNode::Paragraph(text) => self.push_block_text(text, out),
             DocumentNode::Heading(node) => self.push_block_text(&node.content, out),
-            DocumentNode::List(node) => {
-                for child in &node.children {
-                    self.push_visible_text(*child, out);
-                }
-            }
-            DocumentNode::ListItem(node) => {
-                for child in &node.children {
-                    self.push_visible_text(*child, out);
-                }
-            }
-            DocumentNode::BlockQuote(node)
-            | DocumentNode::Figure(node)
-            | DocumentNode::Table(node)
-            | DocumentNode::Container(node) => {
-                for child in &node.children {
-                    self.push_visible_text(*child, out);
-                }
-            }
-            DocumentNode::Footnote(node) => {
-                for child in &node.children {
-                    self.push_visible_text(*child, out);
-                }
-            }
             DocumentNode::ForcedBreak => out.push('\n'),
-            DocumentNode::Image(_) | DocumentNode::Divider | DocumentNode::Unsupported(_) => {}
+            DocumentNode::Unsupported(node)
+                if matches!(
+                    node.element.rsplit(':').next(),
+                    Some("head" | "script" | "style" | "title" | "meta" | "link" | "template")
+                ) => {}
+            _ => {
+                for child in node.children() {
+                    self.push_visible_text(*child, out);
+                }
+            }
         }
     }
 
