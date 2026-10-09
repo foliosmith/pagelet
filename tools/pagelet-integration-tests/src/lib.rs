@@ -80,7 +80,7 @@ mod tests {
             .xhtml(
                 "EPUB/chapter-1.xhtml",
                 "Chapter",
-                "<p>Before</p><pre><code><span>const x = 1;</span></code></pre><custom><p>Tail</p></custom><script>hidden script</script><style>p { color: red; }</style><template><p>hidden template</p></template><p>After</p>",
+                "<p>Before</p><pre><code><span>const x = 1;</span></code></pre><custom><p>Tail</p></custom><p>After</p>",
             )
             .build();
         let book = pagelet::engine::Engine::new()
@@ -88,6 +88,49 @@ mod tests {
             .expect("open");
         let chapter = book.open_spine_item(0).expect("chapter");
         assert_eq!(chapter.visible_text(), "Before\nconst x = 1;\nTail\nAfter");
+    }
+
+    #[test]
+    fn non_content_elements_do_not_reach_page_scenes() {
+        let fixture = ValidEpubBuilder::epub3("non-content")
+            .xhtml(
+                "EPUB/chapter-1.xhtml",
+                "Chapter",
+                r##"<script>hidden-block</script><style>p { color: red; }</style><template><p>hidden-template</p></template><p>Before <script>hidden-inline</script><style>hidden-style</style><template>hidden-inline-template</template>After <a epub:type="noteref" href="notes.xhtml#fn1">1</a></p>"##,
+            )
+            .xhtml(
+                "EPUB/notes.xhtml",
+                "Notes",
+                r##"<aside epub:type="footnote" id="fn1"><p>Visible note.</p><script>hidden-note-script</script><template><p>hidden-note-template</p></template></aside>"##,
+            )
+            .build();
+        let book = pagelet::engine::Engine::new()
+            .open_bytes(fixture.bytes().to_vec())
+            .expect("open");
+        let chapter = book.open_spine_item(0).expect("chapter");
+        let document = paginate_chapter_with_options(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutOptions::default(),
+        )
+        .expect("paginate");
+        let scenes = document
+            .pages
+            .iter()
+            .map(|page| page.to_normalized_json())
+            .collect::<String>();
+        for excluded in [
+            "hidden-",
+            "color: red",
+            "unsupported:script",
+            "unsupported:style",
+            "unsupported:template",
+        ] {
+            assert!(!scenes.contains(excluded), "page contains {excluded}");
+        }
+        assert!(scenes.contains("Before After"));
+        assert!(scenes.contains("Visible note."));
+        assert_eq!(chapter.visible_text(), "Before After 1\nVisible note.");
     }
 
     #[test]

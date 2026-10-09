@@ -2848,6 +2848,9 @@ impl ChapterBuilder<'_> {
         node_id: usize,
         element: &XhtmlElement,
     ) -> Result<Option<NodeId>, PageletError> {
+        if is_non_content_element(element.local_name()) {
+            return Ok(None);
+        }
         let source_range = self.tree.node(node_id).map(|node| node.source_range);
         let style = self.style_for_node(node_id)?;
         let converted = match element.local_name() {
@@ -3482,6 +3485,9 @@ impl ChapterBuilder<'_> {
                 accumulator.append_collapsible(&value, inherited_style, source_range);
             }
             XhtmlNodeKind::Element(element) => {
+                if is_non_content_element(element.local_name()) {
+                    return Ok(());
+                }
                 let style = self.style_for_node(node_id)?;
                 if let Some(id) = xhtml_element_id(&element) {
                     accumulator.anchors.push(AnchorDraft {
@@ -4063,6 +4069,13 @@ fn find_xhtml_element_by_id(tree: &XhtmlDocument, node_id: usize, id: &str) -> O
         .find_map(|child| find_xhtml_element_by_id(tree, *child, id))
 }
 
+fn is_non_content_element(name: &str) -> bool {
+    matches!(
+        name,
+        "head" | "script" | "style" | "title" | "meta" | "link" | "template"
+    )
+}
+
 fn collect_visible_xhtml_text(tree: &XhtmlDocument, node_id: usize, out: &mut String) {
     let Some(node) = tree.node(node_id) else {
         return;
@@ -4079,10 +4092,7 @@ fn collect_visible_xhtml_text(tree: &XhtmlDocument, node_id: usize, out: &mut St
             out.push_str(text);
         }
         XhtmlNodeKind::Element(element) => {
-            if matches!(
-                element.local_name(),
-                "head" | "script" | "style" | "title" | "meta" | "link"
-            ) {
+            if is_non_content_element(element.local_name()) {
                 return;
             }
             for child in &element.children {

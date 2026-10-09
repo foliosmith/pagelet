@@ -25,9 +25,9 @@ corpus. `cargo xtask release dry-run` additionally runs
 token. Formal publishing is intentionally explicit:
 
 ```sh
-cargo xtask release publish --version 0.1.0
+cargo xtask release publish --version 0.2.0
 ```
 
-It requires a clean checkout at the exact `v0.1.0` tag and a matching
+It requires a clean checkout at the exact `v0.2.0` tag and a matching
 `CHANGELOG.md` release heading. If crates.io accepted a bad release, follow the
 tool's recovery message and yank that exact version; never reuse a version.

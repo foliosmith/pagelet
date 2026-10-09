@@ -41,7 +41,7 @@ cargo deny check licenses
 ```
 
 The minimum supported Rust version is declared in `Cargo.toml` and currently
-set to Rust 1.80. The local development toolchain is pinned by
+set to Rust 1.95.0. The local development toolchain is pinned by
 `rust-toolchain.toml`.
 
 ## External Standards Tools

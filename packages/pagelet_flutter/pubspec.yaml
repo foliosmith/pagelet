@@ -1,6 +1,6 @@
 name: pagelet_flutter
 description: Flutter host bindings for the pagelet EPUB pagination engine.
-version: 0.1.0
+version: 0.2.0
 publish_to: none
 
 environment:

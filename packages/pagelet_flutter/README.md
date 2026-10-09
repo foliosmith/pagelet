@@ -16,6 +16,12 @@ Flutter measurement, page-scene decoding, and responsive `PageView` painting.
 smoke for Android, iOS, macOS, and Windows without committing generated runner
 projects.
 
+Build acceptance passed on Android, iOS Simulator, macOS, and Windows with
+Flutter 3.44.6 on 2026-09-26: [CI run 36208205756](https://github.com/foliosmith/pagelet/actions/runs/36208205756)
+at commit `b0b8fffad675b85af1c30796bdf7e8caba3c2b2f`.
+This checks debug compilation of the adapter host app; it does not validate
+native library packaging, symbol loading, device execution, or signed releases.
+
 ```dart
 final engine = PageletEngine(libraryPath: '/path/to/libpagelet.dylib');
 final book = engine.openBook('/path/to/book.epub');
