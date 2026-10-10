@@ -7,6 +7,11 @@ C ABI, wire protocol, cache schema, parser algorithm, and pagination algorithm.
 
 ## Unreleased
 
+### Fixed
+
+- Preserve images and links inside paragraphs, headings and inline containers in page scenes, including their source order and surrounding text.
+- Advance parser compatibility to 8 so derived caches containing the previously missing images are rebuilt.
+
 ## 0.2.0 - 2026-10-09
 
 ### Changed

@@ -2741,6 +2741,19 @@ impl ChapterBuilder<'_> {
         Ok(out)
     }
 
+    fn contains_image(&self, node_id: usize) -> bool {
+        self.tree
+            .node(node_id)
+            .and_then(XhtmlNode::element)
+            .is_some_and(|element| {
+                matches!(element.local_name(), "img" | "image")
+                    || element
+                        .children
+                        .iter()
+                        .any(|child| self.contains_image(*child))
+            })
+    }
+
     fn is_inline_flow_node(&self, node_id: usize) -> bool {
         let Some(node) = self.tree.node(node_id) else {
             return false;
@@ -2748,9 +2761,6 @@ impl ChapterBuilder<'_> {
         match &node.kind {
             XhtmlNodeKind::Text(_) => true,
             XhtmlNodeKind::Element(element) => {
-                if element.local_name() == "a" && self.sole_image_child(node_id).is_some() {
-                    return false;
-                }
                 matches!(
                     element.local_name(),
                     "a" | "abbr"
@@ -2779,7 +2789,7 @@ impl ChapterBuilder<'_> {
                         | "u"
                         | "var"
                         | "wbr"
-                )
+                ) && !self.contains_image(node_id)
             }
         }
     }
@@ -2854,6 +2864,62 @@ impl ChapterBuilder<'_> {
         let source_range = self.tree.node(node_id).map(|node| node.source_range);
         let style = self.style_for_node(node_id)?;
         let converted = match element.local_name() {
+            "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "a" | "span" | "em" | "strong"
+            | "b" | "i"
+                if self.contains_image(node_id) =>
+            {
+                let children = self.convert_flow_children(node_id, style)?;
+                if let Some(level) = element
+                    .local_name()
+                    .strip_prefix('h')
+                    .and_then(|value| value.parse::<u8>().ok())
+                {
+                    for child in &children {
+                        if let Some(node) = self.chapter.nodes.get_mut(*child) {
+                            if let document::DocumentNode::Paragraph(content) = node {
+                                *node = document::DocumentNode::Heading(document::HeadingNode {
+                                    level,
+                                    content: content.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if element.local_name() == "a" {
+                    if let Some(href) = element.attr("href") {
+                        let mut pending = children.clone();
+                        while let Some(child) = pending.pop() {
+                            let Some(node) = self.chapter.nodes.get(child) else {
+                                continue;
+                            };
+                            if !node.children().is_empty() {
+                                pending.extend_from_slice(node.children());
+                                continue;
+                            }
+                            self.chapter.links.push(resolve_link(
+                                self.document_href,
+                                &self.base_dir,
+                                child,
+                                LinkDraft {
+                                    href: Arc::from(href),
+                                    text_range: None,
+                                    source_range,
+                                    kind: if is_noteref_element(element) {
+                                        document::LinkKind::Footnote
+                                    } else {
+                                        document::LinkKind::Internal
+                                    },
+                                },
+                                self.resources,
+                            ));
+                        }
+                    }
+                }
+                Some(self.push_node(
+                    document::DocumentNode::Container(document::ContainerNode { children, style }),
+                    source_range,
+                )?)
+            }
             "html" | "body" | "section" | "article" | "main" | "div" | "nav" => {
                 let children = self.convert_flow_children(node_id, style)?;
                 Some(self.push_node(
@@ -2912,9 +2978,6 @@ impl ChapterBuilder<'_> {
                 Some(self.footnote_node(node_id, element, style)?)
             }
             "aside" if is_footnote_element(element) => None,
-            "a" if self.sole_image_child(node_id).is_some() => {
-                self.linked_image_anchor_node(node_id, element)?
-            }
             "a" | "span" | "em" | "strong" | "b" | "i" => {
                 self.inline_element_text_node(node_id, style)?
             }
@@ -2956,67 +3019,6 @@ impl ChapterBuilder<'_> {
         let node_id =
             self.push_inline_text_node(DocumentNodeKind::Paragraph, content, source_range, style)?;
         Ok(Some(node_id))
-    }
-
-    fn sole_image_child(&self, tree_node_id: usize) -> Option<usize> {
-        let element = self.tree.node(tree_node_id)?.element()?;
-        let mut image_child = None;
-        for child_id in &element.children {
-            let child = self.tree.node(*child_id)?;
-            match &child.kind {
-                XhtmlNodeKind::Text(text) if text.chars().all(is_collapsible_xhtml_whitespace) => {}
-                XhtmlNodeKind::Element(child_element)
-                    if matches!(child_element.local_name(), "img" | "image")
-                        && image_child.is_none() =>
-                {
-                    image_child = Some(*child_id);
-                }
-                _ => return None,
-            }
-        }
-        image_child
-    }
-
-    fn linked_image_anchor_node(
-        &mut self,
-        tree_node_id: usize,
-        anchor: &XhtmlElement,
-    ) -> Result<Option<NodeId>, PageletError> {
-        let Some(image_tree_id) = self.sole_image_child(tree_node_id) else {
-            return Ok(None);
-        };
-        let Some(image_tree_node) = self.tree.node(image_tree_id) else {
-            return Ok(None);
-        };
-        let image_source_range = image_tree_node.source_range;
-        let XhtmlNodeKind::Element(image_element) = image_tree_node.kind.clone() else {
-            return Ok(None);
-        };
-        let image_style = self.style_for_node(image_tree_id)?;
-        let image_node = self.image_node(&image_element, Some(image_source_range), image_style)?;
-        self.register_element_anchor(&image_element, image_node, Some(image_source_range));
-
-        if let Some(href) = anchor.attr("href") {
-            let anchor_source_range = self.tree.node(tree_node_id).map(|node| node.source_range);
-            self.chapter.links.push(resolve_link(
-                self.document_href,
-                &self.base_dir,
-                image_node,
-                LinkDraft {
-                    href: Arc::from(href),
-                    text_range: None,
-                    source_range: anchor_source_range,
-                    kind: if is_noteref_element(anchor) {
-                        document::LinkKind::Footnote
-                    } else {
-                        document::LinkKind::Internal
-                    },
-                },
-                self.resources,
-            ));
-        }
-
-        Ok(Some(image_node))
     }
 
     fn block_text_node(

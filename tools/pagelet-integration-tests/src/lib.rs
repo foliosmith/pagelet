@@ -134,6 +134,58 @@ mod tests {
     }
 
     #[test]
+    fn images_inside_text_containers_reach_pages_in_source_order() {
+        let fixture = ValidEpubBuilder::epub3("inline-images")
+            .xhtml(
+                "EPUB/chapter-1.xhtml",
+                "Chapter",
+                r##"<h2 id="target">Title <span><img src="cover.png" alt="heading-image"/></span> tail</h2><p>Before <a href="#target">linked <strong><img src="cover.png" alt="linked-image"/></strong> after</a> end.</p>Outside <em><img src="cover.png" alt="inline-image"/> trailing</em>"##,
+            )
+            .entry(FixtureEntry::new("EPUB/cover.png", "image/png", b"png bytes".to_vec()))
+            .build();
+        let book = pagelet::engine::Engine::new()
+            .open_bytes(fixture.bytes().to_vec())
+            .expect("open");
+        let chapter = book.open_spine_item(0).expect("chapter");
+        let document = paginate_chapter_with_options(
+            &chapter,
+            &DefaultTextBackend::new(),
+            LayoutOptions::default(),
+        )
+        .expect("paginate");
+        let images = document
+            .pages
+            .iter()
+            .flat_map(|page| &page.fragments)
+            .filter(|fragment| fragment.kind == pagelet::layout::SceneFragmentKind::Image)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.text.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("heading-image"),
+                Some("linked-image"),
+                Some("inline-image")
+            ]
+        );
+        assert!(document
+            .pages
+            .iter()
+            .flat_map(|page| &page.links)
+            .any(|link| link.node_id == images[1].node_id && link.href.as_ref() == "#target"));
+        assert!(chapter.nodes.iter_with_ids().any(|(_, node)| matches!(node,
+            pagelet::document::DocumentNode::Heading(heading)
+                if heading.level == 2)));
+        for text in [
+            "Title", "tail", "Before", "linked", "after", "end.", "Outside", "trailing",
+        ] {
+            assert!(chapter.visible_text().contains(text), "missing {text}");
+        }
+    }
+
+    #[test]
     fn xml_character_references_decode_once_in_text_attributes_and_metadata() {
         let fixture = ValidEpubBuilder::epub3("literal &lt;")
             .xhtml(
